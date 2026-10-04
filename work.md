@@ -1244,13 +1244,51 @@ dump 映像 ASLR 在 `0x7FF781290000`（`0xEF850` → `0x7FF78137F850`）；lift
    lifter.exe D:\sogen\dr\vmptest\add_test_fixed4.exe 0x140007210 --mem-dump D:\sogen\dr\vmptest\entry_7210.dmp
    ```
 3. **再从 `0x7210` 抬**：RSP 仍具体。期望 `[0x1400EF850]` 是堆指针、`[heap+0x58]` 能读到表项。
-验收（COW + dirty qword dump，exit 0）：**24240 blocks / 209049 insns**（真机 30270）。`[EF850]` 已是堆指针。旧蹦床间接跳诊断消失。新卡点：`Unresolved ROP @0x14032281c`（日志 `0x4032281c`）。ret 目标是 `load i32 [%memory + 1076960216 + 4*(x&255)]` 再 xor `2080459474` 的嵌套链（≥16 层同一表，rdag 300 节点未到叶子）。`1076960216=0x40311BD8`＝`0x140311BD8` 的低 32 位。`computePossibleValues` 打出 `max_unknown:0`。优化 `output.ll` 收成 `ret undef`；看 `output_no_opts.ll`。`buffer` 仍深拷。
+验收（分层 cache + dirty qword dump，exit 0）：**24240 blocks / 209049 insns**（真机 30270）。`[EF850]` 已是堆指针。旧蹦床间接跳诊断消失。卡点见 **7.10**。`buffer` 仍深拷。
 5. `foldOrigin` 仍不可信（6.4）。
 
 实现：`RuntimeMemDump.hpp`、`FileReader` overlay、`--mem-dump`、`vmpdrtrace -dumpmem` 已接线。`795f21b` 不还原。无 dump 时 policy 与 13291 路径相同。
 
-`InstructionCache` 按 opcode 一张 `shared_ptr<CacheMap>` 写时复制：`insert` 只克隆当前那张表。`buffer` 仍深拷。
+`InstructionCache` 见 **7.9**。`buffer` 仍深拷。
 
+## 7.9 为什么这次 ~13s（24240 块）
+
+同一样本、同一入口、同一 dump，三次墙钟：
+
+| 版 | 时间 | 结果 |
+|---|---|---|
+| `1caa185` `uniqueMap` 整表 COW | ~90s（后来本机 ~62s `bad_alloc`） | 24240 或 OOM |
+| 分层但 restore **全链 flatten** | ~325s | 24240 |
+| 分层 + 备份**共享 index** | **~13s**（lift 10.7s） | 24240，仍卡 `0x32281c` |
+
+Unflatten 每个新块都 `branch_backup` 一份 `InstructionCache`。folder（尤其 `zext`）每个 `getOrCreate` 都 lookup/insert。24240 块 × 每块大量 zext，cache 才是热路径。
+
+**90s / OOM：** `uniqueMap` 在 `use_count()>1` 时 `SmallDenseMap` **整表拷一份**。每个备份块各持一张几乎完整的历史表，内存随块数线性炸；拷本身也贵。第一次 insert 在 `createZExtFolder` 上 `std::bad_alloc`。
+
+**325s：** 改成链表分层，备份只分享指针、新 key 写当前层，OOM 没了。但 `flat` **不随备份走**，`load_backup` 后 `flatReady=0`，下一次 lookup 从根把几千层 **merge 成一张新表**。restore 次数 × 历史 key 数 ≈ O(n²)，所以比整表拷还慢。
+
+**13s：** 备份同时分享已经累加好的 `index`（到 `indexAt` 为止是完整的）。lookup = `hot` → 最多扫 `indexAt` 之后新增的几层 → `index`。restore 不用重建。`index` 仍被备份引用时隔 32 层才 COW 一份，避免每块一张全表。语义仍是写时分叉，只是热路径不再拷、也不再扫整条历史。
+
+块数没变，所以不是少抬了。`buffer` 仍深拷，只是没落在这条热路径上。
+
+## 7.10 卡点 `Unresolved ROP @0x14032281c`
+
+这不是 dispatcher 没走完。在此之前的 `ret` 弹出的是栈上的**具体 RIP**（`rsp=0x14fc58` 那条 VM 帧），和 DR 对齐，所以能抬到 24240。
+
+卡住的这条 `ret` 在 **`0x14032281c`**（日志截断成 `0x4032281c`）。`rsp=0x14fe70`（相对 `STACKP=0x14fea0` 只低 0x30），**不是** VM 调度帧。弹出的「返回地址」不是 `[rsp]` 里的常量，而是一条还没折完的 SSA：
+
+- 重复形态：`xor i32 (load i32 [%memory + 1076960216 + 4*(x & 255)]), 2080459474`
+- `1076960216 = 0x40311BD8` = `0x140311BD8` 的低 32 位（映像里的字节表，dump 里有）
+- `2080459474` 是固定 round key；中间还夹 `not` / `add` / 截断扩展
+- `[rdag]` 300 个节点封顶，叶子仍是同一张表的 `load`，没有落到 `ConstantInt`
+
+`solvePath` 要的是**一个**具体 RIP。这条 DAG **唯一确定**（嵌套 load 对着 CONCRETE/dump 逐层取值只会得到一个 i32），但现有求解走不通：
+
+1. **`getPossibleValues` 把 `max_unknown==0` 当成失败**（`GEPTracker.ipp` 与 `>=10` 一起 `return {}`）。日志里一串 `max_unknown : 0` 就是它：KnownBits 认为没有未知位，函数却交空集，调用方当 PATH_unsolved。
+2. **嵌套 `load` 的 GEP 偏移不是常量**（`base + 4*(x&255)`，`x` 又是上一层 xor/load）。`computePossibleValues` / `solveLoad` 只在偏移已是 `ConstantInt` 时 `retrieveCombinedValue`；不会沿 use-def 把内层 load 先读成数再折外层。
+3. **不能按 `x&255` 枚举 256 路**。那是控制流分叉，每臂深拷 `buffer`，会 OOM。正确是 **unique-fold**：只对这条解不出的 `ret` 弹出值做整数 DAG 求值（const / cast / binop / 对 `%memory` 的 load），得到 **一个** RIP 再入队。不要在 lift 期对所有同类 load 做同样的折（会把已经对齐的 dispatcher `ret` 走歪）；不要把 `addrToBB` 里 `.pdata` outline 空壳当回边（会收成几十块）。
+
+所以：dump 已经把表字节备齐了，缺的是 **ret 目标这条嵌套表链的单值求值**，不是再 overlay、也不是从 `0x4FD849` 抬。
 
 ## 7.8 诊断基础设施（默认关闭，零输出）
 

@@ -25,6 +25,7 @@
 #include <fstream>
 #include <sstream>
 #include <llvm/ADT/DenseMap.h>
+#include <llvm/ADT/SmallVector.h>
 #include <llvm/Analysis/AliasAnalysis.h>
 #include <llvm/Analysis/DomConditionCache.h>
 #include <llvm/Analysis/DomTreeUpdater.h>
@@ -106,30 +107,126 @@ private:
   using CacheMap = llvm::SmallDenseMap<InstructionKey, Value*, 4,
                                        InstructionKey::InstructionKeyInfo>;
 
-  std::array<std::shared_ptr<CacheMap>, 100> opcodeCaches;
+  struct Layer {
+    CacheMap map;
+    std::shared_ptr<Layer> prev;
+  };
 
-  CacheMap& uniqueMap(uint8_t opcode) {
-    auto& slot = opcodeCaches[opcode];
-    if (!slot) {
-      slot = std::make_shared<CacheMap>();
-    } else if (slot.use_count() > 1) {
-      slot = std::make_shared<CacheMap>(*slot);
+  static constexpr unsigned kCowDeltaLayers = 32;
+
+  std::array<std::shared_ptr<Layer>, 100> opcodeCaches;
+  std::array<CacheMap, 100> hot;
+  std::array<std::shared_ptr<CacheMap>, 100> index;
+  std::array<std::shared_ptr<Layer>, 100> indexAt;
+
+  static void mergeInto(CacheMap& dest, const CacheMap& src) {
+    for (const auto& kv : src) {
+      dest[kv.first] = kv.second;
     }
-    return *slot;
+  }
+
+  unsigned deltaDepth(uint8_t opcode) const {
+    unsigned depth = 0;
+    Layer* stop = indexAt[opcode].get();
+    for (Layer* p = opcodeCaches[opcode].get(); p && p != stop; p = p->prev.get()) {
+      ++depth;
+    }
+    return depth;
+  }
+
+  void cowIndex(uint8_t opcode) {
+    llvm::SmallVector<Layer*, 16> newer;
+    Layer* stop = indexAt[opcode].get();
+    for (Layer* p = opcodeCaches[opcode].get(); p && p != stop; p = p->prev.get()) {
+      newer.push_back(p);
+    }
+    auto next = index[opcode] ? std::make_shared<CacheMap>(*index[opcode])
+                              : std::make_shared<CacheMap>();
+    for (int i = static_cast<int>(newer.size()) - 1; i >= 0; --i) {
+      mergeInto(*next, newer[i]->map);
+    }
+    index[opcode] = std::move(next);
+    indexAt[opcode] = opcodeCaches[opcode];
+  }
+
+  void publish() {
+    for (unsigned op = 0; op < opcodeCaches.size(); ++op) {
+      if (hot[op].empty()) {
+        continue;
+      }
+      auto layer = std::make_shared<Layer>();
+      layer->map = std::move(hot[op]);
+      layer->prev = opcodeCaches[op];
+      if (!index[op]) {
+        index[op] = std::make_shared<CacheMap>(layer->map);
+        indexAt[op] = layer;
+      } else if (index[op].use_count() == 1) {
+        mergeInto(*index[op], layer->map);
+        indexAt[op] = layer;
+      }
+      opcodeCaches[op] = std::move(layer);
+      if (index[op] && index[op].use_count() > 1 &&
+          deltaDepth(static_cast<uint8_t>(op)) >= kCowDeltaLayers) {
+        cowIndex(static_cast<uint8_t>(op));
+      }
+    }
   }
 
 public:
+  InstructionCache() = default;
+
+  InstructionCache(const InstructionCache& other) {
+    const_cast<InstructionCache&>(other).publish();
+    opcodeCaches = other.opcodeCaches;
+    index = other.index;
+    indexAt = other.indexAt;
+  }
+
+  InstructionCache(InstructionCache&& other) noexcept = default;
+
+  InstructionCache& operator=(const InstructionCache& other) {
+    if (this != &other) {
+      const_cast<InstructionCache&>(other).publish();
+      opcodeCaches = other.opcodeCaches;
+      index = other.index;
+      indexAt = other.indexAt;
+      for (auto& h : hot) {
+        h.clear();
+      }
+    }
+    return *this;
+  }
+
+  InstructionCache& operator=(InstructionCache&& other) noexcept = default;
+
   void insert(uint8_t opcode, const InstructionKey& key, Value* value) {
-    uniqueMap(opcode)[key] = value;
+    hot[opcode][key] = value;
+    if (index[opcode] && index[opcode].use_count() == 1) {
+      (*index[opcode])[key] = value;
+    }
   }
 
   Value* lookup(uint8_t opcode, const InstructionKey& key) const {
-    const auto& slot = opcodeCaches[opcode];
-    if (!slot) {
-      return nullptr;
+    const auto& hotMap = hot[opcode];
+    auto it = hotMap.find(key);
+    if (it != hotMap.end()) {
+      return it->second;
     }
-    auto it = slot->find(key);
-    return it != slot->end() ? it->second : nullptr;
+    Layer* stop = indexAt[opcode].get();
+    for (Layer* p = opcodeCaches[opcode].get(); p && p != stop;
+         p = p->prev.get()) {
+      auto lit = p->map.find(key);
+      if (lit != p->map.end()) {
+        return lit->second;
+      }
+    }
+    if (index[opcode]) {
+      auto iit = index[opcode]->find(key);
+      if (iit != index[opcode]->end()) {
+        return iit->second;
+      }
+    }
+    return nullptr;
   }
 };
 
