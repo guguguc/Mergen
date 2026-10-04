@@ -2,6 +2,7 @@
 #define FILEREADER_HPP
 
 #include "nt/nt_headers.hpp"
+#include "RuntimeMemDump.hpp"
 #include <algorithm>
 #include <assert.h>
 #include <coff/section_header.hpp>
@@ -89,6 +90,7 @@ concept FileRead = requires(T t) {
 template <typename Derived> class FileReader {
 protected:
   uint8_t* FileBase;
+  RuntimeMemoryOverlay runtimeOverlay;
 
 public:
   FileReader() {
@@ -102,8 +104,13 @@ public:
     return static_cast<Derived*>(this)->address_to_mapped_address_impl(rva);
   }
   bool readMemory(uint64_t rva, unsigned count, uint64_t& out) {
+    if (runtimeOverlay.read(rva, count, out)) {
+      return true;
+    }
     return static_cast<Derived*>(this)->readMemory_impl(rva, count, out);
   }
+  RuntimeMemoryOverlay& memoryOverlay() { return runtimeOverlay; }
+  const RuntimeMemoryOverlay& memoryOverlay() const { return runtimeOverlay; }
   const char* getName(uint64_t offset) {
     return static_cast<Derived*>(this)->getName_impl(offset);
   }
@@ -113,7 +120,11 @@ public:
   // Non-immutable file zeros are indistinguishable from slots rewritten after
   // mapping. Refuse the whole load, including 1-4 byte slices of an 8-byte
   // zero qword. Bytecode zeros that sit inside a nonzero qword still promote.
+  // Dump-backed bytes are process memory at the lift RVA, including valid zeros.
   bool shouldPromoteFileValue(uint64_t va, unsigned byteSize, uint64_t value) {
+    if (runtimeOverlay.covers(va, byteSize)) {
+      return true;
+    }
     if (isImmutableImageAddress(va)) {
       return true;
     }

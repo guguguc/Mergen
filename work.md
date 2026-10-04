@@ -216,6 +216,7 @@ D:\DynamoRIO\bin64\drrun.exe -c D:\sogen\dr\vmpdrtrace5.dll ^
 - 与 DR **连续一致 13280 块**；唯一地址 3275
 - `output_no_opts.ll`：`br i1 = 0`，仍是 1 个函数 + 循环
 - 假 `0x58` = 文件 0 + 正确偏移；堆指针在 `0x7210` 前由 `0x88AFE2` 写入。按博客仍从 `0x7210` 抬，不从 `0x4FD849` 起抬。
+- `shouldPromoteFileValue` / `mergen.stale_file_zero` **保留，不还原**（`795f21b`）。IR 已是 `%stale.file + 88`，不再把槽读成 `0`。停在 13291 是因为 **`[heap+0x58]` 的表在堆上、进函数前已填好**，空合成页不够。
 
 ## 6. 卡点（已定位到 IR 行）
 
@@ -1200,15 +1201,55 @@ Aftermath Labs《Static Devirtualization of Themida》2026-05-09 把 **VMP 也�
 - `LifterClass_Concolic.hpp` — buffer 回退
 - `CustomPasses.hpp` — `GEPLoadPass`
 
+### 7.6.35 堆表在 exe 段外；空合成页会再停
+
+`ef850_7210`（`-entry 0x140007210`，`trackmem` 从入口才记）：
+
+| | |
+|---|---|
+| 进 `0x7210` 时 `[image+0xEF850]` | `0x2910ceee250`（堆，不在 ImageBase） |
+| 写手 `0x88AFE2` | 只把 **指针** 写入映像 RVA `0xEF850`（`.rZu0` 脏页；磁盘仍是 0） |
+| `[heap, heap+0x1000)` 入口后到关键读 | **0 次写** |
+| 第一次碰 `heap+0x58` | **读**，`0x34ed0e mov ecx,[r11]`，seq 111337 |
+| 该次 `[R11]` | `0x2910c50dc57`（另一块堆，差约 10MB，非 0） |
+
+运行前写了两层：指针在映像节里，**表在 HeapAlloc 出来的堆上**。只符号 `0xEF850`、只种空 `heapBase`、只读 PE 节，第一次 `load [heap+0x58]` 仍是 0/符号。
+
+### 7.6.36 入口 dump 的地址空间（硬约束，未实现）
+
+dump 映像 ASLR 在 `0x7FF781290000`（`0xEF850` → `0x7FF78137F850`）；lifter 映像永远是 PE `ImageBase=0x140000000`（`0xEF850` → `0x1400EF850`）。堆是第三套 VA（本样本 `0x2910…`）。
+
+页进 lifter 稀疏 map 的规则：
+
+| dump 页 | 映射 |
+|---|---|
+| `[dump_base, dump_base+SizeOfImage)` | 字节放到 **`ImageBase+RVA`**；需要时 **alias** 同一页到 `dump_base+RVA`（堆里若还有 dump 空间映像指针） |
+| 其余 RW（堆） | **原 VA 原样** |
+
+格子里的 qword **不要当地址 rebase**（`[0xEF850]` 是堆指针）。不要把 lifter `ImageBase` 改成 `0x7FF…`，不要把堆滑到 `0x1400…`，不要灌死样本堆地址。碰撞只查 `ImageBase…+SizeOfImage`、`STACKP` 窗口、`tebBase=0x7FFD0000`。
+
 ## 7.7 下一步（按优先级）
 
-**可交接状态：16:05 仍 13291。博客路径 = 继续从 `0x7210` 抬，不从 `0x4FD849` 起抬。
-promotion 已接线但未改变块数。不要 overlay。**
+**先前代码不还原。** `795f21b`（可执行未知节 CONCRETE、`shouldPromoteFileValue`、composed 0 → `stale.file`）继续留着：没有它会回到 `0+0x58`。主 lift 仍从 `0x7210`，不从 `0x4FD849`。不要整节 SYMBOLIC，不要 overlay 一个堆常量。
 
-1. 查 `0x1400EF850` 的 qword load 在 16:05 二进制里仍变成具体 0 的那条路径（`retrieveCombinedValue` / `solveLoad` / folder），让它变成符号而不是 `0`。
-2. 再从 `0x7210` 重抬：块数往上且字节码跳仍 concretize → 堆槽只是数据；一停在符号跳、块数掉 → 派发绑在堆对象上，那时才考虑假堆或 OEP 快照。
-3. 不要整节 SYMBOLIC；不要灌当前样本堆地址。
-4. `foldOrigin` 仍不可信（6.4）。
+需要做的是 **入口内存快照当初始 RAM**（不是跟 trace 抬、不是还原脚本）：
+
+1. **DR**：第一次执行到 lift RVA 时 dump 已提交 RW（主模块映像页 + `MEM_PRIVATE` 堆）。不要 dump ntdll。格式 `MRGNDMP1`：`dump_image_base`、`SizeOfImage`、若干 `(va, size, prot, bytes)`。
+   ```
+   D:\sogen\dr\build_vmpdrtrace7.bat
+   D:\DynamoRIO\bin64\drrun.exe -c D:\sogen\dr\vmpdrtrace7.dll -entry 0x140007210 -dumpmem D:\sogen\dr\vmptest\entry_7210.dmp -dumpmem-exit -- D:\sogen\dr\vmptest\add_test_fixed4.exe
+   ```
+3. dump 映像先把落在 `[dump_base, dump_base+SizeOfImage)` 的 qword 折成 `ImageBase+RVA`，再和 PE 比。脏判断按 **整颗 qword**：任一字节不同则 8 字节全 overlay（避免 `0xEF850` 堆指针高位 0 留洞导致 `covers(va,8)` 失败）。CONCRETE = 这些 dirty span + 从中走到的堆（再一跳）。
+   ```
+   lifter.exe D:\sogen\dr\vmptest\add_test_fixed4.exe 0x140007210 --mem-dump D:\sogen\dr\vmptest\entry_7210.dmp
+   ```
+3. **再从 `0x7210` 抬**：RSP 仍具体。期望 `[0x1400EF850]` 是堆指针、`[heap+0x58]` 能读到表项。
+4. 验收：块数是否越过 13291；间接跳是否仍 concretize。失败再查 dump 是否漏页 / alias 是否缺。
+5. `foldOrigin` 仍不可信（6.4）。
+
+实现：`RuntimeMemDump.hpp`、`FileReader` overlay、`--mem-dump`、`vmpdrtrace -dumpmem` 已接线。`795f21b` 不还原。无 dump 时 policy 与 13291 路径相同。
+
+第一次 dump 把 `0x7FF*` 系统/ntdll 页也收进来（1613 段 / 256MB），lifter `branch_backup` 在 `jnbe` 上 `bad_alloc`。已改 `dump_want_region`：主模块全收；可写 `DATA` 仅 `VA < 0x7FF000000000`。第二次 dump ~20MB 仍把全部用户堆/栈标 CONCRETE，再次 `bad_alloc`。现改为只 CONCRETE 映像 + 指针可达堆。
 
 
 ## 7.8 诊断基础设施（默认关闭，零输出）

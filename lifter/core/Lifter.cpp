@@ -21,6 +21,7 @@
 #include "TestInstructions.h"
 #include "Semantics.ipp"
 #include "Utils.h"
+#include <cstdlib>
 #include <coff/line_number.hpp>
 #include <cstdint>
 #include <fstream>
@@ -195,10 +196,12 @@ void installCrashHandler() {
 
 bool InitFunction_and_LiftInstructions(const uint64_t runtime_address,
                                        std::vector<uint8_t>&& fileData,
-                                       const std::vector<uint64_t>& outlineAddresses) {
+                                       const std::vector<uint64_t>& outlineAddresses,
+                                       const std::string& memDumpPath) {
   std::string stageError;
   auto stageContext =
-      prepareLifterStageContext(runtime_address, fileData, stageError);
+      prepareLifterStageContext(runtime_address, fileData, stageError,
+                                memDumpPath);
   if (!stageContext.has_value()) {
     std::cerr << stageError << std::endl;
     return false;
@@ -281,9 +284,17 @@ int main(int argc, char* argv[]) {
   return testInit(suiteFilter);
 #endif
   const auto& outlineAddrs = parseResult.outlineAddresses;
+  std::string memDumpPath = parseResult.memDumpPath;
+  if (memDumpPath.empty()) {
+    if (const char* env = std::getenv("MERGEN_MEM_DUMP")) {
+      memDumpPath = env;
+    }
+  }
   return runLifterApplication(args,
-      [&outlineAddrs](uint64_t runtime_address, std::vector<uint8_t>&& fileData) {
+      [&outlineAddrs, memDumpPath](uint64_t runtime_address,
+                                   std::vector<uint8_t>&& fileData) {
         return InitFunction_and_LiftInstructions(runtime_address,
-                                                  std::move(fileData), outlineAddrs);
+                                                  std::move(fileData),
+                                                  outlineAddrs, memDumpPath);
       });
 }

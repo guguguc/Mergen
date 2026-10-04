@@ -127,6 +127,7 @@ void printHelp() {
             << "  --concretize-unsafe-reads Concretizes potentially unsafe "
                "reads to writable sections\n"
             << "  --outline <addrs>         Comma-separated addresses to outline (not inline)\n"
+            << "  --mem-dump <file>         Process RW snapshot at the lift RVA\n"
             << "  --                        Stop option parsing\n";
 }
 
@@ -186,6 +187,23 @@ ParseResult parseArguments(const std::vector<std::string>& args,
             result.errors.push_back("Invalid outline address: " + token);
           }
         }
+        continue;
+      }
+      if (arg == "--mem-dump" || arg.rfind("--mem-dump=", 0) == 0) {
+        std::string value;
+        if (arg.rfind("--mem-dump=", 0) == 0) {
+          value = arg.substr(11);
+          if (value.empty()) {
+            result.errors.push_back("--mem-dump= requires a value after '='");
+            continue;
+          }
+        } else if (index + 1 < args.size()) {
+          value = args[++index];
+        } else {
+          result.errors.push_back("--mem-dump requires an argument");
+          continue;
+        }
+        result.memDumpPath = value;
         continue;
       }
 

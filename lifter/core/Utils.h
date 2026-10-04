@@ -94,6 +94,7 @@ namespace argparser {
     bool enableDebug = false;
     bool concretizeUnsafeReads = false;
     std::vector<uint64_t> outlineAddresses;
+    std::string memDumpPath;
     std::vector<std::string> errors;
 
     [[nodiscard]] bool ok() const { return errors.empty(); }

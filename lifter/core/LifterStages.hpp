@@ -10,6 +10,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <iostream>
 
 struct LifterStageContext {
   std::unique_ptr<lifterConcolic<>> lifter;
@@ -215,7 +216,8 @@ inline std::string formatRuntimeContextFailure(RuntimeImageContextError error,
 
 inline std::optional<LifterStageContext>
 prepareLifterStageContext(uint64_t runtimeAddress, std::vector<uint8_t>& fileData,
-                         std::string& outError) {
+                         std::string& outError,
+                         const std::string& memDumpPath = {}) {
   if (fileData.empty()) {
     outError = "Input file is empty";
     return std::nullopt;
@@ -233,6 +235,16 @@ prepareLifterStageContext(uint64_t runtimeAddress, std::vector<uint8_t>& fileDat
                                                  runtimeAddress);
   auto ctx = *runtimeResult.context;
   configureDefaultMemoryPolicy(lifter.get(), ctx.stackReserve);
+  if (!memDumpPath.empty()) {
+    std::string dumpErr;
+    if (!loadRuntimeMemDump(lifter->file, memDumpPath, dumpErr)) {
+      outError = dumpErr;
+      return std::nullopt;
+    }
+    applyRuntimeDumpMemoryPolicy(lifter.get());
+    std::cerr << "[mem-dump] loaded " << lifter->file.memoryOverlay().getSpans().size()
+              << " spans from " << memDumpPath << "\n";
+  }
   return LifterStageContext{.lifter = std::move(lifter),
                             .runtimeContext = ctx};
 }

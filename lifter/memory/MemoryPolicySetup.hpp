@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <iostream>
 
 inline void configureDefaultMemoryPolicy(lifterConcolic<>* lifter,
                                          uint64_t stackReserve = 0x1000) {
@@ -58,4 +59,25 @@ inline void configureDefaultMemoryPolicy(lifterConcolic<>* lifter,
   lifter->memoryPolicy.addRange(STACKP_VALUE - clampedReserve,
                                 STACKP_VALUE + clampedReserve,
                                 MemoryAccessMode::CONCRETE);
+}
+
+inline void applyRuntimeDumpMemoryPolicy(lifterConcolic<>* lifter) {
+  const auto& overlay = lifter->file.memoryOverlay();
+  const auto keep = selectDumpConcreteSpans(overlay);
+  const auto& spans = overlay.getSpans();
+  uint64_t concreteBytes = 0;
+  size_t concreteSpans = 0;
+  for (size_t i = 0; i < spans.size(); ++i) {
+    if (!keep[i] || spans[i].bytes.empty()) {
+      continue;
+    }
+    const uint64_t start = spans[i].va;
+    const uint64_t end = start + spans[i].bytes.size();
+    lifter->memoryPolicy.addRange(start, end, MemoryAccessMode::CONCRETE);
+    lifter->markMemPaged(start, end);
+    concreteBytes += spans[i].bytes.size();
+    ++concreteSpans;
+  }
+  std::cerr << "[mem-dump] concrete spans " << concreteSpans << "/"
+            << spans.size() << " bytes " << concreteBytes << "\n";
 }
