@@ -1244,12 +1244,12 @@ dump 映像 ASLR 在 `0x7FF781290000`（`0xEF850` → `0x7FF78137F850`）；lift
    lifter.exe D:\sogen\dr\vmptest\add_test_fixed4.exe 0x140007210 --mem-dump D:\sogen\dr\vmptest\entry_7210.dmp
    ```
 3. **再从 `0x7210` 抬**：RSP 仍具体。期望 `[0x1400EF850]` 是堆指针、`[heap+0x58]` 能读到表项。
-4. 验收：块数是否越过 13291；间接跳是否仍 concretize。失败再查 dump 是否漏页 / alias 是否缺。
+验收（COW + dirty qword dump，exit 0）：**24240 blocks / 209049 insns**（真机 30270）。`[EF850]` 已是堆指针。旧蹦床间接跳诊断消失。新卡点：`Unresolved ROP @0x14032281c`（日志 `0x4032281c`）。ret 目标是 `load i32 [%memory + 1076960216 + 4*(x&255)]` 再 xor `2080459474` 的嵌套链（≥16 层同一表，rdag 300 节点未到叶子）。`1076960216=0x40311BD8`＝`0x140311BD8` 的低 32 位。`computePossibleValues` 打出 `max_unknown:0`。优化 `output.ll` 收成 `ret undef`；看 `output_no_opts.ll`。`buffer` 仍深拷。
 5. `foldOrigin` 仍不可信（6.4）。
 
 实现：`RuntimeMemDump.hpp`、`FileReader` overlay、`--mem-dump`、`vmpdrtrace -dumpmem` 已接线。`795f21b` 不还原。无 dump 时 policy 与 13291 路径相同。
 
-第一次 dump 把 `0x7FF*` 系统/ntdll 页也收进来（1613 段 / 256MB），lifter `branch_backup` 在 `jnbe` 上 `bad_alloc`。已改 `dump_want_region`：主模块全收；可写 `DATA` 仅 `VA < 0x7FF000000000`。第二次 dump ~20MB 仍把全部用户堆/栈标 CONCRETE，再次 `bad_alloc`。现改为只 CONCRETE 映像 + 指针可达堆。
+`InstructionCache` 按 opcode 一张 `shared_ptr<CacheMap>` 写时复制：`insert` 只克隆当前那张表。`buffer` 仍深拷。
 
 
 ## 7.8 诊断基础设施（默认关闭，零输出）

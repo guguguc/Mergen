@@ -106,52 +106,31 @@ private:
   using CacheMap = llvm::SmallDenseMap<InstructionKey, Value*, 4,
                                        InstructionKey::InstructionKeyInfo>;
 
-  std::array<CacheMap, 100> opcodeCaches;
+  std::array<std::shared_ptr<CacheMap>, 100> opcodeCaches;
+
+  CacheMap& uniqueMap(uint8_t opcode) {
+    auto& slot = opcodeCaches[opcode];
+    if (!slot) {
+      slot = std::make_shared<CacheMap>();
+    } else if (slot.use_count() > 1) {
+      slot = std::make_shared<CacheMap>(*slot);
+    }
+    return *slot;
+  }
 
 public:
   void insert(uint8_t opcode, const InstructionKey& key, Value* value) {
-    // Insert the key-value pair into the cache for the given opcode
-    opcodeCaches[opcode][key] = value;
+    uniqueMap(opcode)[key] = value;
   }
 
   Value* lookup(uint8_t opcode, const InstructionKey& key) const {
-    const auto& cache = opcodeCaches[opcode];
-    auto it = cache.find(key);
-    return it != cache.end() ? it->second : nullptr;
-  }
-  InstructionCache() = default;
-  InstructionCache(InstructionCache& other) {
-    for (size_t i = 0; i < opcodeCaches.size(); ++i) {
-      opcodeCaches[i].reserve(other.opcodeCaches[i].size());
-      for (auto& kv : other.opcodeCaches[i]) {
-        opcodeCaches[i].try_emplace(kv.first, kv.second);
-      }
+    const auto& slot = opcodeCaches[opcode];
+    if (!slot) {
+      return nullptr;
     }
-  };
-  InstructionCache(const InstructionCache& other) {
-    // we want to copy each SmallDenseMap individually
-    for (size_t i = 0; i < opcodeCaches.size(); ++i) {
-      // reserve because its faster
-      opcodeCaches[i].reserve(other.opcodeCaches[i].size());
-      for (auto& kv : other.opcodeCaches[i]) {
-        opcodeCaches[i].try_emplace(kv.first, kv.second);
-      }
-    }
+    auto it = slot->find(key);
+    return it != slot->end() ? it->second : nullptr;
   }
-  InstructionCache& operator=(const InstructionCache& other) {
-    if (this == &other)
-      return *this;
-    for (size_t i = 0; i < opcodeCaches.size(); ++i) {
-      opcodeCaches[i].clear();
-      opcodeCaches[i].reserve(other.opcodeCaches[i].size());
-      for (auto& kv : other.opcodeCaches[i]) {
-        opcodeCaches[i].try_emplace(kv.first, kv.second);
-      }
-    }
-    return *this;
-  }
-  InstructionCache(InstructionCache&&) = default;
-  InstructionCache& operator=(InstructionCache&&) = default;
 };
 
 
