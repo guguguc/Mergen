@@ -69,9 +69,10 @@ cmd /c "lifter.exe D:\sogen\dr\vmptest\add_test_fixed4.exe 0x140007210 > run.out
 # 产物: output.ll / output_no_opts.ll / output_diagnostics.json
 ```
 
-期望（当前状态）：`13291 blocks (1 completed, 2 unreachable), 128252 instructions (0 unsupported)`，
-0 error，但**停在 13291 块**（真机 30270），诊断里两条 warning：
+期望（当前状态，**16:05** `lifter.exe`）：`13291 blocks (1 completed, 2 unreachable), 128252 instructions (0 unsupported)`，
+0 error，仍**停在 13291 块**（真机 30270），诊断：
 `Unresolved indirect jump @0x140323cc0`、`Unresolved ROP chain @0x1403da685`。
+range policy / `shouldPromoteFileValue` 已接线，块数与改前相同。构建只用 `D:\sogen\tools\rebuild_mergen_msvc_dbg.cmd`。
 
 **B. DynamoRIO（真机真值）**
 
@@ -95,7 +96,9 @@ Start-Process -FilePath $DR -ArgumentList $argl -WorkingDirectory $PWD -Wait
   <https://aftermathlabs.net/blog/09/05/2026/>
   —— 本文的 **lift → concretize → continue**、*Constant Promotion*、
   *configurable range policy*、以及「从跳转目标反向走 IR DAG 找最后一次模块 load」
-  这套判据都出自这里。
+  都出自这里。文中 VMP 也能还原：从**被虚拟化的函数**起抬（不是 `AddressOfEntryPoint`），
+  RSP 具体、VM 栈在 native 栈上 store-forward；Themida 的 context 才在映像里。
+  细节与本样本差异见 7.6.34。
 - Aftermath Labs《Static Devirtualization of Tencent VM》2026-07-31
   <https://aftermathlabs.net/blog/31/07/2026/>
 - NaC-L《Lifting》<https://nac-l.github.io/2025/01/25/lifting_0.html>
@@ -157,7 +160,8 @@ D:\DynamoRIO\bin64\drrun.exe -c D:\sogen\dr\vmpdrtrace5.dll ^
 
 | 项 | 值 |
 |---|---|
-| 客户函数 entry | `0x140007210` |
+| PE `AddressOfEntryPoint` | `0x1404FD849`（`.rZu2` 壳 stub；TLS 空） |
+| 客户函数 entry（lift 起点） | `0x140007210`（`.text`；prologue 后 `jmp 0x1401f0efb`） |
 | 真实 `add_only` | `0x140007231 lea eax,[rbx+rdi]`（`a=ECX`,`b=EDX`），被 `jmp 0x1401f0efb` 跳过 |
 | VM entry | `0x1401f0efb`（= RVA `0x1f0efb`） |
 | dispatcher | `0x1403a5ff4` |
@@ -202,11 +206,16 @@ D:\DynamoRIO\bin64\drrun.exe -c D:\sogen\dr\vmpdrtrace5.dll ^
 
 改动本身**行为中性部分**已验证（块数/指令数/`[vip]` 一致）。
 
+7. **range policy / 不提升入口前改写的 8 字节 0**（见 7.6.31–7.6.32）
+   `MemoryPolicySetup.hpp`、`FileReader.hpp`、`GEPTracker.ipp`、`LifterClass_Concolic.hpp`、`CustomPasses.hpp`。
+   无 overlay、无按节名灌值。16:05 重跑块数仍 13291。
+
 ## 5. 现状
 
-- `output_diagnostics.json`：`13291 blocks (1 completed, 2 unreachable), ... 0 unsupported`，**0 error**
+- `output_diagnostics.json`（16:05）：`13291 blocks (1 completed, 2 unreachable), 128252 instructions`，**0 error**
 - 与 DR **连续一致 13280 块**；唯一地址 3275
 - `output_no_opts.ll`：`br i1 = 0`，仍是 1 个函数 + 循环
+- 假 `0x58` = 文件 0 + 正确偏移；堆指针在 `0x7210` 前由 `0x88AFE2` 写入。按博客仍从 `0x7210` 抬，不从 `0x4FD849` 起抬。
 
 ## 6. 卡点（已定位到 IR 行）
 
@@ -1116,25 +1125,91 @@ lifter 对这类格子没有跟踪写，于是回落到文件镜像拿到 0，
 **注意**：这是诊断开关，不是修法 —— `.rZu0` 的加密字节码**必须**保持具体，
 所以不能整节停用；正确的修法是**只对「会被 VM 运行时改写」的格子**不给文件值。
 
-### 7.6.29 修复（range policy）
+### 7.6.31 修复（range policy）
 
 错改：`MERGEN_NO_FILE_PROMOTION` 只挡 SYMBOLIC 早退支路，而 `.rZu0` 当时是 CONCRETE，走 composed → `file.readMemory` → PE 零。
 
 已改（通用，不是灌值）：
-1. `MemoryPolicySetup`：**白名单**才 CONCRETE；保护器自创节名一律 SYMBOLIC。
-2. `retrieveCombinedValueImpl`：SYMBOLIC 且 buffer 未覆盖时**禁止** file promotion。
+1. 白名单节 CONCRETE；**可执行**的未知节也 CONCRETE（加密字节码要从 PE 读）。
+2. 不可执行的未知节 SYMBOLIC。
+3. 非白名单节里 **≥8 字节且值为 0** 的 file 读不提升（`0xEF850` 这类运行时写的指针槽），1–4 字节字节码仍提升。
 
-不做 `MEM_OVERLAY`：按样本灌堆指针是打补丁，ASLR 一变就废，也不符合「无 handler / 无表」的静态路线。
+`shouldPromoteFileValue` 已接到 lift 时 `retrieveCombinedValue`、concolic buffer 回退，以及事后 `GEPLoadPass`。重测见 7.6.32。
+
+### 7.6.30 DR 证据：堆指针在 `0x7210` 之前由 `0x88AFE2` 写入
+
+`ef850_7210.regs`（`-entry 0x140007210` = lifter 同起点，`-trackmem` 盯 `image+0xEF850`）：
+
+```
+watchW#1..#8  pre_entry=1  ip=image+0x88AFE2  size=1  逐字节写 EF850..EF857
+=== vm_entry / probe 0x7210 ===
+  [image+0xef850]=0x000002910ceee250   ← 已是堆，writes_seen=8
+```
+
+相对 `-entry 0x1f0efb` 同样：入口时已是堆，触写全在 `pre_entry=1`。
+写手 **`0x88AFE2`**（`.rZu2`），不是 VM 里的 `0x3D50FE`。
+
+先前「磁盘 0 ⇒ 没有 runtime init」被否掉：有 init，只是在 **`0x7210` 之前**（壳/CRT 路径，来自 `AddressOfEntryPoint`）。
+
+### 7.6.32 promotion 全路径接上后块数仍未动
+
+构建：`D:\sogen\tools\rebuild_mergen_msvc_dbg.cmd`（不是 `scripts\dev\configure_iced.cmd`）。
+运行：`work.md` 0.4 A，起点 **`0x140007210`**。
+
+| 二进制 | 块 / 指令 | 停 |
+|---|---|---|
+| 15:34 | 13291 / 128252 | `0x140323cc0` 未解析间接跳 |
+| **16:05**（`stale-zero` 不看 buffer 覆盖；`PathSolver` `solveLoad` 用 bitwidth） | **13291 / 128252** | 同左；另 `0x1403da685` 未解析 ROP |
+
+exit 0，0 error。`shouldPromoteFileValue` 编进去了，**这条 `0xEF850 → 0x58` 路径在 lift 里没有被拆掉**。
+
+`0x58` 不是把堆指针读错：真机是 `堆+0x58`，lifter 是 `0+0x58`。不提升文件 0 的目标是变成符号堆基，不是还原堆页。
+
+### 7.6.33 `0x88AFE2` 与真正的进程入口
+
+PE 头（不是 lifter 参数）：
+
+| | |
+|---|---|
+| `AddressOfEntryPoint` | **`0x1404FD849`**（`.rZu2`） |
+| TLS 目录 | **空** |
+| 用户一直 lift 的 `0x140007210` | 原 `.text` 函数：prologue 之后 `jmp 0x1401F0EFB`（VM 入口） |
+| 写手 `image+0x88AFE2` | `.rZu2`：`mov byte ptr [r14+r10-1], r11b`（`45 88 5c 16 ff`），随后 VMP 假 `jmp $+5`；与 DR 的 8 次 size=1 写吻合 |
+| `HeapAlloc` / `LocalAlloc` | IAT 在 **`.rZu1` `0x140406000`**（RW，非 X） |
+
+DR `-entry 0x140007210` 时 `pre_entry=1` 的写，就是 **PE 入口 stub 在跳进 `0x7210` 之前跑完的**，不是 TLS，也不是 VM handler。
+
+从 `0x7210` 起 lift 看不到这次 store。`.rZu1` 现行 policy 是 SYMBOLIC；若改从 `AddressOfEntryPoint` 起抬，IAT 的 `HeapAlloc` 会先变成符号调用。
+
+### 7.6.34 博客怎么做；本样本差在哪
+
+Aftermath Labs《Static Devirtualization of Themida》2026-05-09 把 **VMP 也算进能还原的范围**（「Fully reducing Themida or VMP」）。不是从 `AddressOfEntryPoint` 起抬。
+
+- 从被虚拟化的函数起抬；寄存器符号，**只有 RSP 具体**。
+- Themida：VM context / 虚拟栈在**映像里**。VMP：在 **native 栈**上 → 靠具体 RSP + store-forward，不靠 promote 映像里的 context。
+- 字节码从模块 promote；VMP 的 VIP = 喂进间接跳的最后一次模块 load。
+- 写过再 load 禁止回落文件（range policy）。store 不在本次 CFG 里 → **不 promote**，不是去 lift 壳 stub。
+
+`0xEF850` **不是**博客说的 VMP 虚拟栈（那是 `[RSP]` / VSP）。它是壳在进 `0x7210` 之前写进映像的堆指针。经典 VMP 还原不依赖这块堆。本 Ultra 样本真机把堆指针压进 VM 栈再 `+0x58`；lifter 用文件 0 做成 `0x58` 去派发。
+
+已改文件（无 overlay、无按 `.rZu*` 灌值）：
+
+- `MemoryPolicySetup.hpp` — 白名单 / 可执行未知节 CONCRETE
+- `FileReader.hpp` — `shouldPromoteFileValue`
+- `GEPTracker.ipp` — composed + `stale-zero`
+- `LifterClass_Concolic.hpp` — buffer 回退
+- `CustomPasses.hpp` — `GEPLoadPass`
 
 ## 7.7 下一步（按优先级）
 
-**可交接状态：假 `0x58` 的直接原因是对保护器节做了 file promotion；policy 已挡住。
-`0xEF850` 的堆指针是 VM 入口前写好的，lift 若从入口才开始，静态侧本来就没有这个值。**
+**可交接状态：16:05 仍 13291。博客路径 = 继续从 `0x7210` 抬，不从 `0x4FD849` 起抬。
+promotion 已接线但未改变块数。不要 overlay。**
 
-1. 查谁在入口前写 `RVA 0xEF850`：能否把 lift 起点前移覆盖那段 init，让 store 进 concolic buffer。
-2. 若写发生在无法静态拿到的外部（堆分配 / 系统调用），再定 range policy：对该槽保持 symbolic，还是另有可具体化来源。
-3. 不要灌 overlay，不要再沿 R8 混淆算术往下追。
+1. 查 `0x1400EF850` 的 qword load 在 16:05 二进制里仍变成具体 0 的那条路径（`retrieveCombinedValue` / `solveLoad` / folder），让它变成符号而不是 `0`。
+2. 再从 `0x7210` 重抬：块数往上且字节码跳仍 concretize → 堆槽只是数据；一停在符号跳、块数掉 → 派发绑在堆对象上，那时才考虑假堆或 OEP 快照。
+3. 不要整节 SYMBOLIC；不要灌当前样本堆地址。
 4. `foldOrigin` 仍不可信（6.4）。
+
 
 ## 7.8 诊断基础设施（默认关闭，零输出）
 

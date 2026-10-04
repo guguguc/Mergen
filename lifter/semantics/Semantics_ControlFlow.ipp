@@ -428,6 +428,13 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_ret() { // fix
     int64_t rspval = constInt->getSExtValue();
     printvalue2(rspval);
     rop_result = rspval == STACKP_VALUE ? REAL_return : ROP_return;
+    std::cout << "[ret] at 0x" << std::hex
+              << (current_address - instruction.length) << " rsp=0x"
+              << static_cast<uint64_t>(rspval) << " initRSP=0x"
+              << static_cast<uint64_t>(STACKP_VALUE) << std::dec
+              << " disp=" << (rspval - static_cast<int64_t>(STACKP_VALUE))
+              << " rop=" << static_cast<int>(rop_result) << "\n"
+              << std::flush;
   }
   printvalue2(rop_result);
 
@@ -523,6 +530,34 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_ret() { // fix
   }
 
   ScopedPathSolveContext pathSolveContext(this, PathSolveContext::Ret);
+  currentTransferValue = realval;
+  currentVipOffset = vipModuleOffset(realval, &currentVipIsExact);
+  if (currentVipOffset == 0) {
+    currentVipOffset = vipFromFoldChain(realval);
+  }
+  if (currentVipOffset == 0) {
+    currentVipOffset = lastModuleLoadOffset;
+  }
+  {
+    static bool dumped = false;
+    if (!dumped) {
+      dumped = true;
+      std::string s;
+      llvm::raw_string_ostream os(s);
+      realval->print(os);
+      std::cout << "[vipret] at 0x" << std::hex
+                << (current_address - instruction.length)
+                << " isLoad=" << llvm::isa<llvm::LoadInst>(realval)
+                << " valueID=" << realval->getValueID()
+                << " bufHas14fc58=" << buffer.count(0x14fc58)
+                << " bufSize=" << buffer.size()
+                << " provSize=" << loadProvenance.size()
+                << " lastModLoad=0x" << std::hex << lastModuleLoadOffset
+                << std::dec
+                << " realval=" << os.str().substr(0, 200) << "\n"
+                << std::flush;
+    }
+  }
   auto pathResult = solvePath(function, destination, realval);
   if (pathResult == PATH_unsolved) {
     uint64_t diagAddr = current_address - instruction.length;
@@ -532,6 +567,52 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_ret() { // fix
       ++liftStats.blocks_unreachable;
       diagnostics.warning(DiagCode::UnresolvedRetChain, diagAddr,
                           "Unresolved ROP chain (ret to symbolic address)");
+      static bool dumpedRd = false;
+      if (!dumpedRd) {
+        dumpedRd = true;
+        std::cout << "[rdag] unresolved ret target at 0x" << std::hex
+                  << diagAddr << std::dec << " :\n";
+        std::cout << std::flush;
+        std::set<llvm::Value*> seen;
+        std::vector<std::pair<llvm::Value*, int>> work{{realval, 0}};
+        unsigned visited = 0;
+        while (!work.empty() && visited < 300) {
+          auto entry = work.back();
+          work.pop_back();
+          llvm::Value* v = entry.first;
+          if (!v || !seen.insert(v).second) continue;
+          ++visited;
+          std::string s;
+          llvm::raw_string_ostream os(s);
+          v->print(os);
+          std::cout << "  [" << entry.second << "] " << os.str().substr(0, 110);
+          if (auto* li = llvm::dyn_cast<llvm::LoadInst>(v)) {
+            std::string ps;
+            llvm::raw_string_ostream pos(ps);
+            li->getPointerOperand()->print(pos);
+            std::cout << "  <LOAD ptr=" << ps.substr(0, 90) << ">";
+            if (auto* g = llvm::dyn_cast<llvm::GetElementPtrInst>(
+                    li->getPointerOperand())) {
+              if (auto* oc =
+                      llvm::dyn_cast<llvm::ConstantInt>(g->getOperand(1))) {
+                LazyValue nl([li]() -> llvm::Value* { return li; });
+                auto* rc = retrieveCombinedValue(
+                    oc->getZExtValue(),
+                    li->getType()->getIntegerBitWidth() / 8, nl);
+                std::cout << "  <RETRV off=0x" << std::hex << oc->getZExtValue()
+                          << std::dec << " -> " << (rc ? "nonnull" : "NULL")
+                          << ">";
+              }
+            }
+          }
+          if (llvm::isa<llvm::Argument>(v)) std::cout << "  <ARG>";
+          std::cout << "\n";
+          if (auto* u = llvm::dyn_cast<llvm::User>(v))
+            for (auto& op : u->operands())
+              work.push_back({op.get(), entry.second + 1});
+        }
+        std::cout << std::flush;
+      }
     }
     // Block is currently unterminated: solvePath did not resolve the popped
     // RIP, no chain fired, and we are at a `ret`. The most accurate
@@ -595,12 +676,135 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_jmp() {
   ScopedPathSolveContext pathSolveContext(
       this, isDirectJump ? PathSolveContext::DirectJump
                          : PathSolveContext::IndirectJump);
+  currentTransferValue = trunc;
+  currentVipOffset = vipModuleOffset(trunc, &currentVipIsExact);
+  if (currentVipOffset == 0) {
+    currentVipOffset = vipFromFoldChain(trunc);
+  }
+  if (currentVipOffset == 0) {
+    currentVipOffset = lastModuleLoadOffset;
+  }
+  if (liftProgressDiagEnabled &&
+      (current_address - instruction.length == 0x1403B1543ULL ||
+       current_address - instruction.length == 0x1403B4FF9ULL)) {
+    static int trampolineDiag = 0;
+    if (trampolineDiag++ < 4) {
+      std::string tv;
+      llvm::raw_string_ostream tvo(tv);
+      trunc->print(tvo);
+      std::cout << "[fold] trampoline@0x" << std::hex
+                << (current_address - instruction.length) << " target=" << tv
+                << " isConst=" << llvm::isa<llvm::Constant>(trunc)
+                << " vip=0x" << currentVipOffset << " chain=0x"
+                << vipFromFoldChain(trunc) << " lastModLoad=0x"
+                << lastModuleLoadOffset << std::dec << "\n"
+                << std::flush;
+    }
+  }
   auto pathResult = solvePath(function, destination, trunc);
-  if (pathResult == PATH_unsolved) {
-    ++liftStats.blocks_unreachable;
+  if (pathResult == PATH_unsolved || pathResult == PATH_multi_solved) {
     uint64_t diagAddr = current_address - instruction.length;
-    diagnostics.warning(DiagCode::UnresolvedIndirectJump, diagAddr,
-                        "Unresolved indirect jump (symbolic target)");
+    if (pathResult == PATH_unsolved) {
+      ++liftStats.blocks_unreachable;
+      diagnostics.warning(DiagCode::UnresolvedIndirectJump, diagAddr,
+                          "Unresolved indirect jump (symbolic target)");
+    }
+
+    // One-shot register census at the instruction whose target could not be
+    // resolved. The dispatch is `movsxd r8,r8d; add r10,r8; jmp r10`, so the
+    // whole question is whether r10/r8 descend from a concrete value or from a
+    // register that the lifter only holds symbolically. Printed in full (no
+    // truncation) because the answer is usually the last operand of a long
+    // expression.
+    if (liftProgressDiagEnabled) {
+      auto full = [&](llvm::Value* v) {
+        std::string s;
+        llvm::raw_string_ostream os(s);
+        if (v) {
+          v->print(os);
+        } else {
+          os << "<null>";
+        }
+        return os.str();
+      };
+      std::cout << "[halt] unresolved at 0x" << std::hex << diagAddr
+                << std::dec << " pv=" << (int)pathResult
+                << " transfer=" << full(trunc) << "\n";
+      const std::pair<Register, const char*> regs[] = {
+          {Register::RSP, "RSP"}, {Register::RBP, "RBP"},
+          {Register::RAX, "RAX"}, {Register::RBX, "RBX"},
+          {Register::RCX, "RCX"}, {Register::RDX, "RDX"},
+          {Register::RSI, "RSI"}, {Register::RDI, "RDI"},
+          {Register::R8, "R8"},   {Register::R9, "R9"},
+          {Register::R10, "R10"}, {Register::R11, "R11"},
+          {Register::R12, "R12"}, {Register::R13, "R13"},
+          {Register::R14, "R14"}, {Register::R15, "R15"},
+      };
+      for (const auto& [reg, name] : regs) {
+        std::cout << "[halt]   " << name << " = " << full(GetRegisterValue(reg))
+                  << "\n";
+      }
+      std::cout << std::flush;
+    }
+
+    // VIP diagnostic (Aftermath Labs, VMP): the last module load feeding the
+    // indirect jump is the VIP. When the target stays symbolic, dumping every
+    // load reachable from it shows which bytecode load failed to promote.
+    static int dumpedVipDag = 0;
+    if (dumpedVipDag < 0) {
+      ++dumpedVipDag;
+      std::string targetText;
+      llvm::raw_string_ostream targetOs(targetText);
+      trunc->print(targetOs);
+      std::cout << "[vip] unresolved indirect target at 0x" << std::hex
+                << diagAddr << std::dec << " = " << targetOs.str() << "\n";
+
+      std::set<llvm::Value*> seen;
+      std::vector<std::pair<llvm::Value*, int>> work{{trunc, 0}};
+      unsigned visited = 0;
+      unsigned loads = 0;
+      while (!work.empty() && visited < 20000) {
+        auto entry = work.back();
+        work.pop_back();
+        llvm::Value* v = entry.first;
+        if (!v || !seen.insert(v).second) {
+          continue;
+        }
+        ++visited;
+        if (auto* li = llvm::dyn_cast<llvm::LoadInst>(v)) {
+          std::string ptrText;
+          llvm::raw_string_ostream ptrOs(ptrText);
+          li->getPointerOperand()->print(ptrOs);
+          std::cout << "[vip] load#" << loads++ << " (" << li->getType()
+                    << ") ptr=" << ptrOs.str();
+          if (auto* gep =
+                  llvm::dyn_cast<llvm::GetElementPtrInst>(li->getPointerOperand())) {
+            if (auto* off = llvm::dyn_cast<llvm::ConstantInt>(gep->getOperand(1))) {
+              std::cout << " off=0x" << std::hex << off->getZExtValue() << std::dec;
+            } else {
+              std::string offText;
+              llvm::raw_string_ostream offOs(offText);
+              gep->getOperand(1)->print(offOs);
+              std::cout << " off=<sym " << offOs.str() << ">";
+            }
+          }
+          std::cout << "\n";
+        } else if (visited <= 220) {
+          std::string nodeText;
+          llvm::raw_string_ostream nodeOs(nodeText);
+          v->print(nodeOs);
+          std::cout << "[vip] [" << entry.second << "] "
+                    << nodeOs.str().substr(0, 150) << "\n";
+        }
+        if (auto* u = llvm::dyn_cast<llvm::User>(v)) {
+          for (auto& op : u->operands()) {
+            work.push_back({op.get(), entry.second + 1});
+          }
+        }
+      }
+      std::cout << "[vip] dag visited=" << visited << " loads=" << loads << "\n"
+                << std::flush;
+    }
   }
   printvalue2(destination);
   // printvalue(newRip);

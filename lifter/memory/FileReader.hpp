@@ -7,6 +7,7 @@
 #include <coff/section_header.hpp>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 enum arch_mode : uint8_t { X86 = 0, X64 = 1 };
@@ -30,6 +31,51 @@ inline characteristics operator|(characteristics lhs, characteristics rhs) {
 inline characteristics& operator|=(characteristics& lhs, characteristics rhs) {
   lhs = lhs | rhs;
   return lhs;
+}
+
+// On-disk bytes that stay valid after mapping. Protector-invented sections
+// are not in this set even when marked RX: they mix encrypted bytecode with
+// slots rewritten at runtime.
+inline bool isFileImmutableSection(const char* name) {
+  static constexpr const char* kImmutable[] = {
+      ".text",    ".rdata", ".pdata", ".idata",   ".edata",  ".reloc",
+      ".rsrc",    ".00cfg", ".xdata", ".data",    ".bss",    ".tls",
+      ".CRT",     ".didat", ".gfids", ".gehcont", ".retplne", ".fptable",
+  };
+  for (const char* known : kImmutable) {
+    if (std::strcmp(name, known) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+template <typename SectionRange>
+inline bool isImmutableImageAddressIn(uint64_t imageBase,
+                                      const SectionRange& sections,
+                                      uint64_t va) {
+  if (va < imageBase || sections.empty()) {
+    return false;
+  }
+  const uint64_t rva64 = va - imageBase;
+  if (rva64 > UINT32_MAX) {
+    return false;
+  }
+  const uint32_t rva = static_cast<uint32_t>(rva64);
+  auto it = std::upper_bound(sections.begin(), sections.end(), rva,
+                             [](uint32_t val, const win::section_header_t& s) {
+                               return val < s.virtual_address;
+                             });
+  if (it == sections.begin()) {
+    return true;
+  }
+  --it;
+  if (rva >= it->virtual_address + it->virtual_size) {
+    return false;
+  }
+  char name[9] = {};
+  std::memcpy(name, &it->name.short_name, 8);
+  return isFileImmutableSection(name);
 }
 
 template <typename T>
@@ -60,6 +106,29 @@ public:
   }
   const char* getName(uint64_t offset) {
     return static_cast<Derived*>(this)->getName_impl(offset);
+  }
+  bool isImmutableImageAddress(uint64_t va) {
+    return static_cast<Derived*>(this)->isImmutableImageAddress_impl(va);
+  }
+  // Non-immutable file zeros are indistinguishable from slots rewritten after
+  // mapping. Refuse the whole load, including 1-4 byte slices of an 8-byte
+  // zero qword. Bytecode zeros that sit inside a nonzero qword still promote.
+  bool shouldPromoteFileValue(uint64_t va, unsigned byteSize, uint64_t value) {
+    if (isImmutableImageAddress(va)) {
+      return true;
+    }
+    if (value != 0) {
+      return true;
+    }
+    if (byteSize >= 8) {
+      return false;
+    }
+    uint64_t qword = 0;
+    const uint64_t aligned = va & ~uint64_t(7);
+    if (!readMemory(aligned, 8, qword)) {
+      return true;
+    }
+    return qword != 0;
   }
   inline void filebase_exists() {
 
@@ -131,7 +200,13 @@ public:
                            return val < s.virtual_address;
                          });
     if (it == sections.begin()) {
-      // rva is before the first section
+      // rva is before the first section. PE headers are not covered by any
+      // section, but they are file-backed at the same raw offset as their RVA.
+      // Leaving them unmapped makes header reads un-promotable, which poisons
+      // every value derived from the image's header area.
+      if (rva < sections.front().virtual_address) {
+        return rva;
+      }
       return 0;
     }
     --it; // now *it is the candidate section
@@ -208,6 +283,10 @@ public:
   const char* getName_impl(uint64_t offset) {
     auto rvaOffset = RvaToFileOffset(offset);
     return (const char*)FileBase + rvaOffset;
+  }
+
+  bool isImmutableImageAddress_impl(uint64_t va) {
+    return isImmutableImageAddressIn(imageBase, sections, va);
   }
 };
 
@@ -372,6 +451,10 @@ public:
   const char* getName_impl(uint64_t offset) {
     auto rvaOffset = RvaToFileOffset(offset);
     return (const char*)FileBase + rvaOffset;
+  }
+
+  bool isImmutableImageAddress_impl(uint64_t va) {
+    return isImmutableImageAddressIn(imageBase, sections_v, va);
   }
 };
 

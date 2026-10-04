@@ -242,3 +242,10 @@ namespace timer {
     running = true;
   }
 } // namespace timer
+namespace {
+  unsigned long long g_memEventSeq = 0;
+}
+
+unsigned long long nextMemEventSeq() {
+  return ++g_memEventSeq;
+}

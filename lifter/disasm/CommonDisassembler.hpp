@@ -464,6 +464,10 @@ struct MergenDisassembledInstruction_base {
   Register mem_base;
   Register mem_index;
   uint8_t mem_scale;
+  // Segment override for the memory operand (gs:/fs:). The disassembler
+  // previously normalized it away, which made gs:[k] resolve against the flat
+  // address k. Defaults to None for backends that do not surface it.
+  Register mem_segment = Register::None;
 
   uint8_t stack_growth;
 

@@ -4299,6 +4299,9 @@ namespace Mergen {
 
           convertedInstruction.mem_scale = op.mem.scale;
 
+          convertedInstruction.mem_segment =
+              zydisRegisterToMergenRegister<Register>(op.mem.segment);
+
           continue;
         }
       }

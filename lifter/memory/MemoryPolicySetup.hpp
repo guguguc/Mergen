@@ -5,23 +5,6 @@
 #include <cstdint>
 #include <cstring>
 
-// Sections whose on-disk bytes remain valid after the image is mapped.
-// Anything else (protector-invented names, packer stubs, etc.) is SYMBOLIC:
-// promoting file bytes there reinjects stale values the process no longer has.
-inline bool isFileImmutableSection(const char* name) {
-  static constexpr const char* kImmutable[] = {
-      ".text",  ".rdata", ".pdata", ".idata", ".edata", ".reloc",
-      ".rsrc",  ".00cfg", ".xdata", ".data",  ".bss",   ".tls",
-      ".CRT",   ".didat", ".gfids", ".gehcont", ".retplne", ".fptable",
-  };
-  for (const char* known : kImmutable) {
-    if (std::strcmp(name, known) == 0) {
-      return true;
-    }
-  }
-  return false;
-}
-
 inline void configureDefaultMemoryPolicy(lifterConcolic<>* lifter,
                                          uint64_t stackReserve = 0x1000) {
   lifter->memoryPolicy.setDefaultMode(MemoryAccessMode::SYMBOLIC);
@@ -33,9 +16,14 @@ inline void configureDefaultMemoryPolicy(lifterConcolic<>* lifter,
     char sectionName[9] = {0};
     std::memcpy(sectionName, &section.name.short_name, 8);
 
-    const MemoryAccessMode mode = isFileImmutableSection(sectionName)
-                                      ? MemoryAccessMode::CONCRETE
-                                      : MemoryAccessMode::SYMBOLIC;
+    // Linker-stable sections keep file bytes. Executable unknown sections
+    // (packer RX/RWX) stay CONCRETE so encrypted bytecode still promotes.
+    // Non-executable unknown sections are SYMBOLIC (runtime-rewritten data).
+    MemoryAccessMode mode = MemoryAccessMode::SYMBOLIC;
+    if (isFileImmutableSection(sectionName) ||
+        section.characteristics.mem_execute) {
+      mode = MemoryAccessMode::CONCRETE;
+    }
     lifter->memoryPolicy.addRange(sectionStart, sectionEnd, mode);
 
     if (section.characteristics.mem_execute &&

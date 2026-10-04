@@ -412,6 +412,9 @@ public:
 
             // Skip if readMemory fails (unmapped, BSS boundary, >8-byte load).
             if (!file.readMemory(constintvalue, byteSize, tempvalue)) continue;
+            if (!file.shouldPromoteFileValue(constintvalue, byteSize,
+                                             tempvalue))
+              continue;
 
             llvm::APInt readValue(byteSize * 8, tempvalue);
             llvm::Constant* newVal =

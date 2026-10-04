@@ -70,8 +70,18 @@ public:
     XMM15_ = 33,
     REGISTER_COUNT // Total number of registers
   };
-  std::array<llvm::Value*, REGISTER_COUNT> vec;
-  std::array<llvm::Value*, FLAGS_END> vecflag;
+  std::array<llvm::WeakTrackingVH, REGISTER_COUNT> vec;
+  std::array<llvm::WeakTrackingVH, FLAGS_END> vecflag;
+
+  // The base constructor calls InitRegisters() before this class's members are
+  // constructed. For a raw pointer array that wrote into raw storage and
+  // happened to survive; a tracking array is constructed afterwards and would
+  // null every slot. Re-binding the function arguments here runs after `vec`
+  // exists.
+  lifterConcolic() {
+    this->InitRegisters();
+    this->modelProcessEnvironment();
+  }
 
   int getRegisterIndex(Register key) const {
 
@@ -93,7 +103,11 @@ public:
         return XMM0_ + (static_cast<int>(key) - static_cast<int>(Register::XMM0));
       }
 
-      UNREACHABLE("unsupported register index in concolic register manager");
+      // Coverage limit: an instruction whose operand is a register the concolic
+      // manager does not model (x87/MMX/...). Aborting the whole lift for a path
+      // the concrete execution never takes is worse than degrading; the
+      // instruction is reported unsupported (Semantics.ipp) and its semantics
+      // are not relied upon.
       return RAX_;
     }
     }
@@ -154,8 +168,8 @@ public:
   constexpr ControlFlow getControlFlow_impl() { return ControlFlow::Unflatten; }
 
   struct backup_point {
-    std::array<llvm::Value*, REGISTER_COUNT> vec;
-    std::array<llvm::Value*, FLAGS_END> vecflag;
+    std::array<llvm::WeakTrackingVH, REGISTER_COUNT> vec;
+    std::array<llvm::WeakTrackingVH, FLAGS_END> vecflag;
     llvm::DenseMap<uint64_t, ValueByteReference> buffer;
     InstructionCache cache;
     llvm::DenseMap<llvm::Instruction*, llvm::APInt> assumptions;
@@ -180,8 +194,8 @@ public:
           assumptions(other.assumptions), ct(other.ct),
           sourceBlock(other.sourceBlock) {}
 
-    backup_point(std::array<llvm::Value*, REGISTER_COUNT> vec,
-                 std::array<llvm::Value*, FLAGS_END> vecflag,
+    backup_point(std::array<llvm::WeakTrackingVH, REGISTER_COUNT> vec,
+                 std::array<llvm::WeakTrackingVH, FLAGS_END> vecflag,
                  llvm::DenseMap<uint64_t, ValueByteReference> buffer,
                  InstructionCache cc,
                  llvm::DenseMap<llvm::Instruction*, llvm::APInt> assumptions,
@@ -274,12 +288,12 @@ public:
     if (firstIt == sourceBuffer.end() || !firstIt->second.value) {
       return nullptr;
     }
-    auto* sharedValue = firstIt->second.value;
+    llvm::Value* sharedValue = firstIt->second.value;
     uint8_t firstByteOffset = firstIt->second.byteOffset;
     for (uint8_t i = 0; i < byteCount; ++i) {
       auto it = sourceBuffer.find(startAddress + i);
-      if (it == sourceBuffer.end() || !it->second.value ||
-          it->second.value != sharedValue ||
+      if (it == sourceBuffer.end() ||
+          static_cast<llvm::Value*>(it->second.value) != sharedValue ||
           it->second.byteOffset != firstByteOffset + i) {
         return nullptr;
       }
@@ -296,14 +310,14 @@ public:
     }
 
     bool contiguousSingleValue = true;
-    auto* sharedValue = firstIt->second.value;
+    llvm::Value* sharedValue = firstIt->second.value;
     uint8_t firstByteOffset = firstIt->second.byteOffset;
     for (uint8_t i = 0; i < byteCount; ++i) {
       auto it = sourceBuffer.find(startAddress + i);
       if (it == sourceBuffer.end() || !it->second.value) {
         return nullptr;
       }
-      if (it->second.value != sharedValue ||
+      if (static_cast<llvm::Value*>(it->second.value) != sharedValue ||
           it->second.byteOffset != firstByteOffset + i) {
         contiguousSingleValue = false;
       }
@@ -346,11 +360,17 @@ public:
       }
     }
     uint64_t concreteValue = 0;
+    uint64_t usedAddress = startAddress;
     if (!this->file.readMemory(startAddress, byteCount, concreteValue)) {
       if (normalizedAddress == startAddress ||
           !this->file.readMemory(normalizedAddress, byteCount, concreteValue)) {
         return nullptr;
       }
+      usedAddress = normalizedAddress;
+    }
+    if (!this->file.shouldPromoteFileValue(usedAddress, byteCount,
+                                           concreteValue)) {
+      return nullptr;
     }
     return this->builder->getIntN(byteCount * 8, concreteValue);
   }
@@ -667,6 +687,20 @@ public:
     llvm::SmallVector<llvm::Value*, 2> regValues;
     llvm::SmallVector<llvm::Value*, 2> flagValues;
     for (size_t i = 0; i < REGISTER_COUNT; ++i) {
+      // "symbolizing everything except VIP" (Themida article, Virtualized
+      // Control Flow / Tencent limitations): if this register carries a
+      // module-backed address it is the VM's virtual instruction pointer.
+      // Merging it into a loop phi turns it symbolic, and then every in-loop
+      // bytecode read (load -> constant -> decrypt -> next handler) becomes
+      // unresolvable. Freeze it instead so the chain survives the backedge.
+      if (auto* ci =
+              llvm::dyn_cast_or_null<llvm::ConstantInt>(canonical.vec[i])) {
+        if (this->isModuleAddress(ci->getZExtValue()) &&
+            !this->feedsCondition(canonical.vec[i])) {
+          generalized.vec[i] = canonical.vec[i];
+          continue;
+        }
+      }
       const bool widenFirstBackedge =
           !shouldPreserveGeneralizedBackedgeRegister(i, canonical,
                                                      effectiveSources,
@@ -1120,6 +1154,9 @@ public:
             continue;
           }
           for (uint8_t i = 0; i < 8; ++i) {
+            noteBufferWriteDiag("seedInvariantLocalQword", qwordStart + i, 1,
+                                activeGeneralizedLoopLocalBuffer[qwordStart + i].value,
+                                this->current_address - this->instruction.length);
             this->buffer[qwordStart + i] =
                 activeGeneralizedLoopLocalBuffer[qwordStart + i];
           }

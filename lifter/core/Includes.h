@@ -45,8 +45,16 @@ inline llvm::raw_ostream& operator<<(llvm::raw_ostream& OS,
 }
 #endif
 
+// Pseudo-stack anchor.
+//
+// The machine's real RSP at the customer entry maps to 0x14FED8 on
+// add_test_fixed4.exe, i.e. this seed is a constant 0x38 below it. That offset
+// is harmless and must NOT be "corrected": the lifter's RSP tracks every push,
+// call and sub exactly (+/-8 per instruction), so the whole frame is merely
+// translated by a constant and every [rsp+imm] access still lands on the same
+// slot (measured: veneer->read drop is 0x220 on both sides). Seeding 0x14FED8
+// was tried and produced byte-identical output.
 #define STACKP_VALUE 0x00000000014FEA0
-// if this value changes, its only for debug purposes
 
 using ReverseRegisterMap = llvm::DenseMap<llvm::Value*, int>;
 using RegisterMap = llvm::DenseMap<int,

@@ -15,7 +15,9 @@
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Value.h>
 #include <llvm/IR/CFG.h>
+#include <llvm/IR/ConstantFold.h>
 #include <llvm/Support/Casting.h>
+#include <functional>
 #include <limits>
 
 MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
@@ -35,7 +37,7 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
         if (loadBits % 8 == 0) {
           LazyValue nestedLoad([loadInst]() -> Value* { return loadInst; });
           if (auto* resolved = solveLoad(
-                  nestedLoad, gep, static_cast<uint8_t>(loadBits / 8))) {
+                  nestedLoad, gep, static_cast<uint8_t>(loadBits))) {
             if (liftProgressDiagEnabled && pathSolveSite == 0x1400237F9ULL) {
               std::string resolvedText;
               llvm::raw_string_ostream os(resolvedText);
@@ -129,6 +131,32 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
     const bool backwardVisitedTarget =
         visitedAddresses.contains(target) &&
         target <= blockInfo.block_address;
+    // VMProtect's dispatch encodes (VIP, vm-id) and derives the native handler
+    // address from them (intel.cc:11731/11734), so a backward native target is
+    // not a stable loop key: the same handler recurs across the 10 vm instances
+    // without the virtual program counter repeating. Only generalize a loop
+    // when the VIP itself has been seen before.
+    bool vipConfirmsBackedge = true;
+    bool vipRepeat = false;
+    if (currentVipOffset != 0) {
+      // Key the backedge on (VIP, native target). Repeating a native block is
+      // normal for VMProtect - the same handler runs for many different VM
+      // commands - so the native address alone is not a loop. A real loop
+      // repeats the same VM command AND the same handler.
+      const uint64_t backedgeKey =
+          currentVipOffset * 1099511628211ULL + target;
+      vipRepeat = seenVipOffsets.contains(backedgeKey);
+      seenVipOffsets.insert(backedgeKey);
+      vipConfirmsBackedge = vipRepeat;
+    }
+    if (backwardVisitedTarget) {
+      std::cout << "[vip] backward target=0x" << std::hex << target
+                << " cur=0x" << blockInfo.block_address << " vip=0x"
+                << currentVipOffset << std::dec
+                << " repeat=" << (vipRepeat ? 1 : 0)
+                << " exact=" << (currentVipIsExact ? 1 : 0)
+                << " confirm=" << (vipConfirmsBackedge ? 1 : 0) << "\n";
+    }
     auto it = addrToBB.find(target);
     const bool hasPendingGeneralization =
         pendingLoopGeneralizationAddresses.contains(target);
@@ -142,7 +170,7 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
         hasPendingGeneralization && canUseStructuredLoopGeneralization;
     const bool wantsGeneralization =
         canReusePendingGeneralization ||
-        (backwardVisitedTarget &&
+        (backwardVisitedTarget && vipConfirmsBackedge &&
          canGeneralizeStructuredLoopHeader(target,
                                            /*targetResolvedConcretely=*/true));
     if (wantsGeneralization) {
@@ -183,8 +211,10 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
   // do static polymorphism here
 
   auto shouldTraceHotPathSolve = [&]() {
-    return liftProgressDiagEnabled && pathSolveSite >= 0x140023582ULL &&
-           pathSolveSite <= 0x140023FFFULL;
+    return liftProgressDiagEnabled &&
+           ((pathSolveSite >= 0x140023582ULL &&
+             pathSolveSite <= 0x140023FFFULL) ||
+            pathSolveSite == 0x1403B1543ULL);
   };
   auto formatPathValue = [](llvm::Value* value) {
     if (!value) {
@@ -201,6 +231,7 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
     std::cout << "[diag] solvePath site=0x" << std::hex << pathSolveSite
               << std::dec << " value=" << formatPathValue(simplifyValue) << "\n";
   }
+
   if (llvm::ConstantInt* constInt =
           dyn_cast<llvm::ConstantInt>(simplifyValue)) {
     dest = normalizeTargetAddress(constInt->getZExtValue());
@@ -245,7 +276,294 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
   printvalue(simplifyValue);
   run = 0;
   auto pvset = computePossibleValues(simplifyValue);
+  // A loop-generalized exit value can be a PHI, which computePossibleValues
+  // does not enumerate. Its incoming constants are exactly the possible
+  // transfers (the virtualized JCC: "the branch has multiple real
+  // destinations"), so treat them as candidates.
+  if (pvset.size() < 2) {
+    if (auto* phi = llvm::dyn_cast<llvm::PHINode>(simplifyValue)) {
+      for (unsigned i = 0; i < phi->getNumIncomingValues(); ++i) {
+        if (auto* ci =
+                llvm::dyn_cast<llvm::ConstantInt>(phi->getIncomingValue(i))) {
+          pvset.insert(ci->getValue());
+        }
+      }
+    }
+  }
+  // Virtualized conditional control flow (Themida article, "Virtualized
+  // Conditional Control Flow"; VMProtect encodes the two destinations through
+  // ltJmpWithFlag, intel.cc:11721). When the dispatch target's DAG carries a
+  // select, it has multiple real destinations: fold the target once per arm so
+  // the dispatcher forks instead of collapsing to one destination. Only the
+  // transfer's DAG is inspected, so mutated junk never contributes.
+  std::vector<std::pair<llvm::Value*, llvm::Constant*>> subs;
+  std::function<llvm::Constant*(llvm::Value*, llvm::Value*,
+                                llvm::Constant*, int)>
+      jccFold = [&](llvm::Value* v, llvm::Value* node, llvm::Constant* repl,
+                    int depth) -> llvm::Constant* {
+      if (depth > 24 || !v) return nullptr;
+      for (auto& s : subs) {
+        if (v == s.first) return s.second;
+      }
+      if (v == node) return repl;
+      if (auto* k = llvm::dyn_cast<llvm::Constant>(v)) return k;
+      if (auto* bo = llvm::dyn_cast<llvm::BinaryOperator>(v)) {
+        auto* a = jccFold(bo->getOperand(0), node, repl, depth + 1);
+        auto* b = jccFold(bo->getOperand(1), node, repl, depth + 1);
+        if (!a || !b) return nullptr;
+        return llvm::ConstantFoldBinaryOpOperands(bo->getOpcode(), a, b,
+                                                  M->getDataLayout());
+      }
+      if (auto* cmp = llvm::dyn_cast<llvm::CmpInst>(v)) {
+        auto* a = jccFold(cmp->getOperand(0), node, repl, depth + 1);
+        auto* b = jccFold(cmp->getOperand(1), node, repl, depth + 1);
+        if (!a || !b) return nullptr;
+        return llvm::ConstantFoldCompareInstruction(cmp->getPredicate(), a, b);
+      }
+      if (auto* cast = llvm::dyn_cast<llvm::CastInst>(v)) {
+        auto* a = jccFold(cast->getOperand(0), node, repl, depth + 1);
+        if (!a) return nullptr;
+        return llvm::ConstantFoldCastInstruction(cast->getOpcode(), a,
+                                                 cast->getType());
+      }
+      if (auto* sel = llvm::dyn_cast<llvm::SelectInst>(v)) {
+        auto* cd = jccFold(sel->getCondition(), node, repl, depth + 1);
+        auto* tv = jccFold(sel->getTrueValue(), node, repl, depth + 1);
+        auto* fv = jccFold(sel->getFalseValue(), node, repl, depth + 1);
+        if (!cd || !tv || !fv) return nullptr;
+        return llvm::ConstantFoldSelectInstruction(cd, tv, fv);
+      }
+      if (auto* p2 = llvm::dyn_cast<llvm::PHINode>(v)) {
+        llvm::Constant* all = nullptr;
+        for (unsigned i = 0; i < p2->getNumIncomingValues(); ++i) {
+          auto* f2 = jccFold(p2->getIncomingValue(i), node, repl, depth + 1);
+          if (!f2) return nullptr;
+          if (!all) all = f2;
+          else if (all != f2) return nullptr;
+        }
+        return all;
+      }
+      return nullptr;
+  };
+
+  // Virtualized conditional control flow (Themida article; VMProtect encodes
+  // the destinations of ltJmpWithFlag through a select on a VM flag,
+  // intel.cc:11721). Fold the transfer once per select arm and keep those
+  // destinations separately: computePossibleValues cross-products the rest of
+  // the expression, which would otherwise drown the real fork in heuristic
+  // candidates and turn a recoverable branch into a multi-way switch.
+  std::set<llvm::APInt, APIntComparator> selectArms;
+  {
+    // Collect every select reachable from the transfer. A virtualized
+    // conditional is select(flag, destA, destB); a dispatch can carry several
+    // of them. They must be substituted *all at once*: folding one while
+    // another remains would make jccFold walk that other select's symbolic
+    // condition and fail. Substituting every select keeps the traversal out of
+    // the conditions, so each arm combination folds to a real destination.
+    std::vector<llvm::SelectInst*> selects;
+    llvm::PHINode* basePhi = nullptr;
+    llvm::ConstantInt* baseConst = nullptr;
+    std::set<llvm::Value*> selSeen;
+    std::vector<llvm::Value*> selWork{simplifyValue};
+    unsigned selVisited = 0;
+    while (!selWork.empty() && selVisited < 4000 && selects.size() < 4) {
+      llvm::Value* v = selWork.back();
+      selWork.pop_back();
+      if (!v || !selSeen.insert(v).second) continue;
+      ++selVisited;
+      if (auto* sel = llvm::dyn_cast<llvm::SelectInst>(v)) {
+        if (llvm::isa<llvm::ConstantInt>(sel->getTrueValue()) &&
+            llvm::isa<llvm::ConstantInt>(sel->getFalseValue())) {
+          selects.push_back(sel);
+        }
+      }
+      if (!basePhi) {
+        if (auto* ph = llvm::dyn_cast<llvm::PHINode>(v)) {
+          for (unsigned k = 0; k < ph->getNumIncomingValues(); ++k) {
+            if (auto* kc =
+                    llvm::dyn_cast<llvm::ConstantInt>(ph->getIncomingValue(k))) {
+              basePhi = ph;
+              baseConst = kc;
+              break;
+            }
+          }
+        }
+      }
+      if (auto* u = llvm::dyn_cast<llvm::User>(v)) {
+        for (auto& op : u->operands()) selWork.push_back(op.get());
+      }
+    }
+    if (!selects.empty()) {
+      const unsigned combos = 1u << selects.size();
+      for (unsigned mask = 0; mask < combos && selectArms.size() <= 8; ++mask) {
+        subs.clear();
+        for (unsigned i = 0; i < selects.size(); ++i) {
+          llvm::Constant* arm =
+              ((mask >> i) & 1)
+                  ? llvm::cast<llvm::Constant>(selects[i]->getTrueValue())
+                  : llvm::cast<llvm::Constant>(selects[i]->getFalseValue());
+          subs.push_back({selects[i], arm});
+        }
+        // VMProtect's dispatch target is jmp_registr_ (the per-instance base)
+        // + decrypt(vip); pin that base phi too so the combination folds to the
+        // concrete handler (the bytecode encodes the next handler address).
+        if (basePhi && baseConst) {
+          subs.push_back({basePhi, baseConst});
+        }
+        if (auto* folded = jccFold(simplifyValue, nullptr, nullptr, 0)) {
+          if (auto* fci = llvm::dyn_cast<llvm::ConstantInt>(folded)) {
+            selectArms.insert(fci->getValue());
+          }
+        }
+      }
+      subs.clear();
+    }
+  }
+  bool selectDerived = false;
+  if (selectArms.size() >= 2 && selectArms.size() <= 4) {
+    pvset = selectArms;
+    selectDerived = true;
+  } else if (pvset.size() < 2) {
+    pvset.insert(selectArms.begin(), selectArms.end());
+  }
   std::vector<APInt> pv(pvset.begin(), pvset.end());
+  // Virtualized-JCC rewrite (Themida article "Virtualized Conditional Control
+  // Flow"; VMProtect encodes the destinations through ltJmpWithFlag and the
+  // vm-instance selector through set_jmp_value, intel.cc:11721/11734).
+  //
+  // The dispatch target of a vm loop is base_phi + decrypt(read(addr)). The
+  // base_phi mixes the per-vm-instance bases, so the target only becomes
+  // concrete once the instance is fixed. Speculate on that phi with pure
+  // constant folding (no IR insertion) and see what each arm resolves to.
+  if (pvset.empty() && shouldTraceHotPathSolve()) {
+    std::function<llvm::Constant*(llvm::Value*, llvm::PHINode*,
+                                  llvm::ConstantInt*, int)>
+        foldWith = [&](llvm::Value* v, llvm::PHINode* phi, llvm::ConstantInt* c,
+                       int depth) -> llvm::Constant* {
+      if (depth > 24 || !v) {
+        return nullptr;
+      }
+      if (v == phi) {
+        return c;
+      }
+      if (auto* k = llvm::dyn_cast<llvm::Constant>(v)) {
+        return k;
+      }
+      if (auto* bo = llvm::dyn_cast<llvm::BinaryOperator>(v)) {
+        auto* a = foldWith(bo->getOperand(0), phi, c, depth + 1);
+        auto* b = foldWith(bo->getOperand(1), phi, c, depth + 1);
+        if (!a || !b) return nullptr;
+        return llvm::ConstantFoldBinaryOpOperands(bo->getOpcode(), a, b,
+                                                  M->getDataLayout());
+      }
+      if (auto* cmp = llvm::dyn_cast<llvm::CmpInst>(v)) {
+        auto* a = foldWith(cmp->getOperand(0), phi, c, depth + 1);
+        auto* b = foldWith(cmp->getOperand(1), phi, c, depth + 1);
+        if (!a || !b) return nullptr;
+        return llvm::ConstantFoldCompareInstruction(cmp->getPredicate(), a, b);
+      }
+      if (auto* cast = llvm::dyn_cast<llvm::CastInst>(v)) {
+        auto* a = foldWith(cast->getOperand(0), phi, c, depth + 1);
+        if (!a) return nullptr;
+        return llvm::ConstantFoldCastInstruction(cast->getOpcode(), a,
+                                                 cast->getType());
+      }
+      if (auto* sel = llvm::dyn_cast<llvm::SelectInst>(v)) {
+        auto* cd = foldWith(sel->getCondition(), phi, c, depth + 1);
+        auto* tv = foldWith(sel->getTrueValue(), phi, c, depth + 1);
+        auto* fv = foldWith(sel->getFalseValue(), phi, c, depth + 1);
+        if (!cd || !tv || !fv) return nullptr;
+        return llvm::ConstantFoldSelectInstruction(cd, tv, fv);
+      }
+      if (auto* p2 = llvm::dyn_cast<llvm::PHINode>(v)) {
+        llvm::Constant* all = nullptr;
+        for (unsigned i = 0; i < p2->getNumIncomingValues(); ++i) {
+          auto* f2 = foldWith(p2->getIncomingValue(i), phi, c, depth + 1);
+          if (!f2) return nullptr;
+          if (!all) all = f2;
+          else if (all != f2) return nullptr;
+        }
+        return all;
+      }
+      return nullptr;
+    };
+
+    std::set<llvm::Value*> seen2;
+    std::vector<llvm::Value*> work2{simplifyValue};
+    unsigned visited2 = 0;
+    while (!work2.empty() && visited2 < 2000) {
+      llvm::Value* v = work2.back();
+      work2.pop_back();
+      if (!v || !seen2.insert(v).second) continue;
+      ++visited2;
+      if (auto* phi = llvm::dyn_cast<llvm::PHINode>(v)) {
+        bool allConst = phi->getNumIncomingValues() > 0;
+        for (unsigned i = 0; i < phi->getNumIncomingValues(); ++i)
+          if (!llvm::isa<llvm::ConstantInt>(phi->getIncomingValue(i)))
+            allConst = false;
+        if (allConst) {
+          std::cout << "[diag] spec phi with " << phi->getNumIncomingValues()
+                    << " const arms:\n";
+          for (unsigned i = 0; i < phi->getNumIncomingValues(); ++i) {
+            auto* arm = llvm::cast<llvm::ConstantInt>(phi->getIncomingValue(i));
+            auto* folded = foldWith(simplifyValue, phi, arm, 0);
+            std::cout << "    arm=0x" << std::hex << arm->getZExtValue()
+                      << " -> ";
+            if (folded) {
+              std::string t;
+              llvm::raw_string_ostream os(t);
+              folded->print(os);
+              std::cout << os.str();
+            } else {
+              std::cout << "<not-constant>";
+            }
+            std::cout << std::dec << "\n";
+          }
+        }
+      }
+      if (auto* u = llvm::dyn_cast<llvm::User>(v))
+        for (auto& op : u->operands()) work2.push_back(op.get());
+    }
+    std::cout << std::flush;
+  }
+  if (pvset.empty() && shouldTraceHotPathSolve()) {
+    std::string pv0Text;
+    llvm::raw_string_ostream pv0Os(pv0Text);
+    simplifyValue->print(pv0Os);
+    std::cout << "[diag] pv0 site=0x" << std::hex << pathSolveSite << std::dec
+              << " valueID=" << simplifyValue->getValueID()
+              << " text=" << pv0Text.substr(0, 200) << "\n"
+              << std::flush;
+    std::set<llvm::Value*> ps;
+    std::vector<llvm::Value*> pw{simplifyValue};
+    unsigned pv2 = 0;
+    while (!pw.empty() && pv2 < 3000) {
+      llvm::Value* v = pw.back();
+      pw.pop_back();
+      if (!v || !ps.insert(v).second) continue;
+      ++pv2;
+      if (auto* ph = llvm::dyn_cast<llvm::PHINode>(v)) {
+        bool allc = ph->getNumIncomingValues() > 0;
+        for (unsigned i = 0; i < ph->getNumIncomingValues(); ++i)
+          if (!llvm::isa<llvm::ConstantInt>(ph->getIncomingValue(i)))
+            allc = false;
+        std::cout << "[diag] pv0-phi n=" << ph->getNumIncomingValues()
+                  << " allConst=" << allc;
+        if (allc) {
+          std::cout << " arms=";
+          for (unsigned i = 0; i < ph->getNumIncomingValues(); ++i)
+            std::cout << "0x" << std::hex
+                      << llvm::cast<llvm::ConstantInt>(ph->getIncomingValue(i))
+                             ->getZExtValue()
+                      << std::dec << " ";
+        }
+        std::cout << "\n";
+      }
+      if (auto* u = llvm::dyn_cast<llvm::User>(v))
+        for (auto& op : u->operands()) pw.push_back(op.get());
+    }
+    std::cout << std::flush;
+  }
   if (shouldTraceHotPathSolve()) {
     std::cout << "[diag] solvePath site=0x" << std::hex << pathSolveSite
               << std::dec << " pv_count=" << pvset.size();
@@ -494,11 +812,19 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
         continue;
       }
 
-      // computePossibleValues cross-products uncorrelated select branches,
-      // which can produce spurious targets outside mapped memory.  Skip them
-      // rather than crashing when the lifter tries to decode bytes there.
-      if (!isMemPaged(normalizedTarget)) {
-        std::cout << "[diag] skipping unmapped switch target 0x"
+      // computePossibleValues is heuristic: for an uncorrelated symbolic
+      // transfer it cross-products select arms into targets that were never
+      // real destinations. Lifting those decodes arbitrary bytes, and enough
+      // of them corrupts the IR (mid-instruction operand types, switch blow-up)
+      // until the process dies. A candidate is only adopted as code when it is
+      // already known code - a re-visited block or an outlined function entry.
+      // Everything else is left to the (unresolved) default below instead of
+      // being guessed at.
+      const bool knownCode =
+          selectDerived || visitedAddresses.contains(normalizedTarget) ||
+          inlinePolicy.isOutline(normalizedTarget);
+      if (!isMemPaged(normalizedTarget) || !knownCode) {
+        std::cout << "[diag] dropping unproven switch target 0x"
                   << std::hex << normalizedTarget << std::dec << "\n"
                   << std::flush;
         continue;

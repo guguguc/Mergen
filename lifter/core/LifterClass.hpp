@@ -21,6 +21,9 @@
 #include "llvm/Analysis/TargetTransformInfo.h"
 
 #include <concepts>
+#include <deque>
+#include <fstream>
+#include <sstream>
 #include <llvm/ADT/DenseMap.h>
 #include <llvm/Analysis/AliasAnalysis.h>
 #include <llvm/Analysis/DomConditionCache.h>
@@ -83,7 +86,7 @@ struct InstructionKey {
       return lhs == rhs;
     }
 
-    // Define empty and tombstone keys — MUST be distinct for DenseMap.
+    // Define empty and tombstone keys �?MUST be distinct for DenseMap.
     static inline InstructionKey getEmptyKey() {
       return InstructionKey(
           reinterpret_cast<Value*>(static_cast<uintptr_t>(-1)),
@@ -249,6 +252,15 @@ concept lifterConcept = Registers<R> && requires(T t) {
 
 // LiftStats is defined in LiftDiagnostics.hpp
 
+// Shared by the register and memory event streams so the two files can be
+// merged into one execution-ordered timeline. Both are opt-in diagnostics.
+// Single shared event counter for the register and memory streams, so their
+// sequence numbers form one execution-ordered timeline. It must be a single
+// object: the register-stream hook lives in a member template, so a static local
+// there would be instantiated once per translation unit and the two streams would
+// disagree on numbering. Defined in Utils.cpp.
+unsigned long long nextMemEventSeq();
+
 // main lifter
 template <typename Derived = void,
 #ifdef ICED_FOUND
@@ -269,7 +281,10 @@ class lifterClassBase {
 public:
   using Disassembler = DisassemblerBase<Mnemonic, Register>;
 
-  std::unique_ptr<llvm::IRBuilder<llvm::InstSimplifyFolder>> builder;
+  // ConstantFolder (not InstSimplifyFolder): the simplifier folder can delete an
+  // instruction it just created when it folds it to an existing value, which
+  // invalidates ValueHandles held by the concolic state during lifting.
+  std::unique_ptr<llvm::IRBuilder<>> builder;
   BBInfo blockInfo;
   uint64_t current_address;
   bool run = 0;      // we may set 0 so to trigger jumping to next basic block
@@ -510,6 +525,32 @@ public:
 
       runDisassembler((void*)offset, size);
 
+      // RSP-drift tracker. The real machine keeps RSP fixed inside a VM handler
+      // (the VM stack lives in a GPR); if the lifter's pseudo-RSP is seeded a
+      // constant amount away from the machine's entry RSP, every absolute
+      // [rsp+imm] access lands in a neighbouring slot while the relative
+      // offsets within one frame still look self-consistent. Logged at the VAs
+      // where DR can supply the ground-truth RSP (customer entry, veneer,
+      // dispatcher, and the handler read site).
+      if (liftProgressDiagEnabled) {
+        const uint64_t va = this->current_address;
+        const bool watch =
+            va == 0x140007210ULL || va == 0x140007215ULL || va == 0x140007216ULL ||
+            va == 0x1401F0EFBULL || va == 0x1401F0F00ULL || va == 0x1401F0F05ULL ||
+            va == 0x1403A5FF4ULL || va == 0x1403A6049ULL || va == 0x1402E17D5ULL;
+        if (watch) {
+          std::string rs;
+          llvm::raw_string_ostream ros(rs);
+          if (auto* sp = this->GetRegisterValue(Register::RSP)) {
+            sp->print(ros);
+          }
+          std::cout << "[rspmod] @0x" << std::hex << va << std::dec
+                    << " mnem=" << magic_enum::enum_name(this->instruction.mnemonic)
+                    << " rsp=" << ros.str().substr(0, 60) << "\n"
+                    << std::flush;
+        }
+      }
+
       const auto ct = (llvm::format_hex_no_prefix(this->counter, 0));
       const auto runtime_address =
           (llvm::format_hex_no_prefix(this->current_address, 0));
@@ -672,6 +713,186 @@ public:
     return currentPathSolveAllowsStructuredLoopGeneralization() ||
            currentPathSolveContext == PathSolveContext::IndirectJump;
   }
+  // Aftermath Labs, "Static Devirtualization of Themida": with VMProtect the
+  // last module load that feeds into the indirect jump/return computation is
+  // by definition the current VIP. Walking the IR DAG backwards from the SSA
+  // value holding the transfer target finds that load.
+  llvm::Value* findVipLoad(llvm::Value* target) const {
+    if (!target) {
+      return nullptr;
+    }
+    std::set<llvm::Value*> seen;
+    std::vector<llvm::Value*> work{target};
+    llvm::Value* best = nullptr;
+    unsigned visited = 0;
+    while (!work.empty() && visited < 20000) {
+      llvm::Value* v = work.back();
+      work.pop_back();
+      if (!v || !seen.insert(v).second) {
+        continue;
+      }
+      ++visited;
+      if (auto* li = llvm::dyn_cast<llvm::LoadInst>(v)) {
+        best = li;
+      }
+      if (auto* u = llvm::dyn_cast<llvm::User>(v)) {
+        for (auto& op : u->operands()) {
+          work.push_back(op.get());
+        }
+      }
+    }
+    return best;
+  }
+
+  // VMProtect keeps its virtual stack on the native stack, so a dispatch
+  // target is usually a value loaded back out of a memory slot rather than an
+  // SSA value. The concolic buffer holds the value that was stored there, so
+  // follow the store before walking the DAG - otherwise the provenance stops
+  // at the GEP and the bytecode load is never reached.
+  llvm::Value* transferSourceValue(llvm::Value* transfer) const {
+    if (auto* li = llvm::dyn_cast_or_null<llvm::LoadInst>(transfer)) {
+      if (auto* gep =
+              llvm::dyn_cast<llvm::GetElementPtrInst>(li->getPointerOperand())) {
+        if (gep->getPointerOperand()->stripPointerCasts() ==
+            memoryAlloc->stripPointerCasts()) {
+          if (auto* off = llvm::dyn_cast<llvm::ConstantInt>(gep->getOperand(1))) {
+            auto it = buffer.find(off->getZExtValue());
+            if (it != buffer.end() && it->second.value) {
+              return it->second.value;
+            }
+          }
+        }
+      }
+    }
+    return transfer;
+  }
+
+  // Bytecode offset of the load that produced `value`, walking the SSA DAG
+  // (and through the concolic buffer's last store first). 0 when unavailable.
+  // VMProtect keeps its VM stack on the native stack; in the flat memory model
+  // that region overlaps the image's virtual range, so address_to_mapped_address
+  // alone cannot separate a bytecode read from a VM-stack read.
+  std::vector<std::pair<uint64_t, uint64_t>> bytecodeRanges;
+  bool isBytecodeAddress(uint64_t address) const {
+    for (const auto& range : bytecodeRanges) {
+      if (address >= range.first && address < range.second) return true;
+    }
+    return false;
+  }
+  bool isStackAddress(uint64_t address) {
+    constexpr uint64_t kReserve = 0x100000;
+    return address >= STACKP_VALUE - kReserve &&
+           address <= STACKP_VALUE + kReserve;
+  }
+  bool isModuleAddress(uint64_t address) {
+    return !isStackAddress(address) &&
+           file.address_to_mapped_address(address) != 0;
+  }
+  // True when `v` (transitively) feeds a comparison or a select/branch
+  // condition. Such a value is guard state: it must stay symbolic so the
+  // virtualized loop guard survives as a real branch, unlike the pure VIP
+  // carrier, which is frozen to keep the dispatch resolvable.
+  bool feedsCondition(llvm::Value* v) {
+    if (!v) return false;
+    std::set<llvm::Value*> seen;
+    std::vector<llvm::Value*> work{v};
+    unsigned visited = 0;
+    while (!work.empty() && visited < 6000) {
+      llvm::Value* x = work.back();
+      work.pop_back();
+      if (!x || !seen.insert(x).second) continue;
+      ++visited;
+      for (auto* u : x->users()) {
+        if (llvm::isa<llvm::CmpInst>(u)) return true;
+        if (auto* sel = llvm::dyn_cast<llvm::SelectInst>(u)) {
+          if (sel->getCondition() == x) return true;
+        }
+        if (auto* br = llvm::dyn_cast<llvm::BranchInst>(u)) {
+          if (br->isConditional()) return true;
+        }
+        work.push_back(u);
+      }
+    }
+    return false;
+  }
+  uint64_t vipModuleOffset(llvm::Value* value, bool* exactFromLoad = nullptr) {
+    llvm::Value* source = transferSourceValue(value);
+    if (!source) {
+      if (exactFromLoad) *exactFromLoad = false;
+      return 0;
+    }
+    std::set<llvm::Value*> seen;
+    std::vector<llvm::Value*> work{source};
+    uint64_t fromLoad = 0;
+    unsigned visited = 0;
+    while (!work.empty() && visited < 20000) {
+      llvm::Value* v = work.back();
+      work.pop_back();
+      if (!v || !seen.insert(v).second) {
+        continue;
+      }
+      ++visited;
+      if (auto* li = llvm::dyn_cast<llvm::LoadInst>(v)) {
+        if (auto* gep =
+                llvm::dyn_cast<llvm::GetElementPtrInst>(li->getPointerOperand())) {
+          if (gep->getPointerOperand()->stripPointerCasts() ==
+            memoryAlloc->stripPointerCasts()) {
+            if (auto* off =
+                    llvm::dyn_cast<llvm::ConstantInt>(gep->getOperand(1))) {
+              // Only module-backed loads are VIP candidates; a stack/pseudo
+              // slot in the DAG must not be mistaken for the bytecode read.
+              if (isModuleAddress(off->getZExtValue())) {
+                fromLoad = off->getZExtValue();
+              }
+            }
+          }
+        }
+      }
+      if (auto* u = llvm::dyn_cast<llvm::User>(v)) {
+        for (auto& op : u->operands()) {
+          work.push_back(op.get());
+        }
+      }
+    }
+    if (exactFromLoad) {
+      *exactFromLoad = fromLoad != 0;
+    }
+    // Deliberately no loadProvenance fallback. LLVM uniques constants, so a
+    // folded constant's provenance is ambiguous: dozens of distinct bytecode
+    // reads collapse onto one ConstantInt and overwrite each other, fabricating
+    // a VIP and therefore a bogus loop backedge. Returning 0 lets the caller
+    // fall back to the pre-fold chain and then to lastModuleLoadOffset, which
+    // VMP's codegen makes exact (the dispatch bytecode read is the last module
+    // load appended to a handler, intel.cc:27836).
+    return fromLoad;
+  }
+  llvm::Value* currentTransferValue = nullptr;
+  llvm::DenseMap<llvm::Value*, uint64_t> loadProvenance;
+  // Address of the most recent module-backed load that was lifted. VMProtect's
+  // codegen appends the bytecode read as the final module load of a handler
+  // (AddEndHandlerCommands, intel.cc:27836), so at a transfer this is the VIP.
+  uint64_t lastModuleLoadOffset = 0;
+  std::set<uint64_t> lmlSeen;
+  uint64_t lmlLast = 0;
+  void noteModuleLoad(uint64_t addr) {
+    if (!lmlSeen.insert(addr).second && addr != lmlLast) {
+      std::cout << "[lmlrep] addr=0x" << std::hex << addr << " cur=0x"
+                << lmlLast << std::dec << "\n"
+                << std::flush;
+    }
+    lmlLast = addr;
+    lastModuleLoadOffset = addr;
+  }
+  uint64_t currentVipOffset = 0;
+  bool currentVipIsExact = false;
+  std::set<uint64_t> seenVipOffsets;
+  // Loop backedges are recognised by edge revisit, not by node revisit. The VM
+  // dispatch trampoline is shared: many different handlers jump to the same
+  // native target, which is what made a target-only criterion over-generalize.
+  // A real loop repeats the same (source -> target) edge; a shared trampoline
+  // is entered through different sources.
+  std::set<uint64_t> seenBackedgeEdges;
+
   bool isStructuredLoopHeaderShape(BasicBlock* block) const {
     const bool trace = liftProgressDiagEnabled &&
                        (block == addrToBB.lookup(0x1401BAE0FULL) ||
@@ -685,7 +906,7 @@ public:
     auto isTrampoline = [](BasicBlock* bb) {
       if (!bb || bb->size() != 1) return false;
       auto* term = bb->getTerminator();
-      auto* br = llvm::dyn_cast<llvm::BranchInst>(term);
+      auto* br = llvm::dyn_cast_or_null<llvm::BranchInst>(term);
       return br && !br->isConditional();
     };
     const bool entryIsTrampoline = isTrampoline(block);
@@ -706,7 +927,7 @@ public:
         return false;
       }
       auto* term = current->getTerminator();
-      auto* branch = llvm::dyn_cast<llvm::BranchInst>(term);
+      auto* branch = llvm::dyn_cast_or_null<llvm::BranchInst>(term);
       if (!branch) {
         // Trampoline-header relaxation: when the original header was a single
         // unconditional-br trampoline and we walked into a successor that is
@@ -907,6 +1128,16 @@ public:
   void liftBasicBlockFromAddress(uint64_t addr) {
     ++liftStats.blocks_attempted;
     ++liftAttemptCounts[addr];
+    if (liftProgressDiagEnabled) {
+      std::string bbName = "<none>";
+      auto bbIt = addrToBB.find(addr);
+      if (bbIt != addrToBB.end() && bbIt->second) {
+        bbName = bbIt->second->getName().str();
+      }
+      std::cout << "[bb] 0x" << std::hex << addr << std::dec << " " << bbName
+                << "\n"
+                << std::flush;
+    }
     printvalue2(this->finished);
     printvalue2(this->run);
     this->run = 1;
@@ -917,7 +1148,7 @@ public:
         if (speculativeCall.active && speculativeCallBudget > 0) {
           speculativeCallBudget--;
           if (speculativeCallBudget == 0) {
-            // Budget exhausted — abandon speculative inline.
+            // Budget exhausted �?abandon speculative inline.
             if (!builder->GetInsertBlock()->getTerminator()) {
               builder->CreateUnreachable();
             }
@@ -1127,6 +1358,101 @@ public:
   // llvm::DenseMap<Value*, flagManager> flagbuffer;
 
   flagManager FlagList;
+  struct FoldOrigin {
+    unsigned opcode;
+    llvm::Value* lhs;
+    llvm::Value* rhs;
+  };
+  llvm::DenseMap<llvm::Value*, FoldOrigin> foldOrigin;
+  // Record the pre-fold operands of a meaningful fold (at least one operand is
+  // not a constant). Trivial constant-from-constant folds are skipped and the
+  // first meaningful fold wins, so a uniqued constant is not overwritten by a
+  // later identity fold such as `or C, C` - that overwrite is what turned the
+  // reconstruction into a self-loop.
+  bool recordFoldOrigin(llvm::Value* result, unsigned opcode, llvm::Value* lhs,
+                        llvm::Value* rhs) {
+    if (!result || !llvm::isa<llvm::Constant>(result)) return false;
+    // An identity fold (the result is one of the operands, e.g. a same-width
+    // sext or `or C, C`) carries no provenance; recording it would overwrite
+    // the meaningful fold that produced this constant.
+    if (lhs == result || rhs == result) return false;
+    // First meaningful fold wins: LLVM uniques constants, so a later fold of
+    // the same constant must not replace the chain that reaches the load.
+    if (foldOrigin.find(result) != foldOrigin.end()) return false;
+    foldOrigin[result] = FoldOrigin{opcode, lhs, rhs};
+    return true;
+  }
+  // Blog rule (Devirtualization of Themida, Virtualized Control Flow): walk the
+  // transfer target backwards to the module load that feeds it. The load itself
+  // was folded away, so the walk follows the recorded pre-fold chain
+  // (foldOrigin) and, per VMP codegen, at each node follows the operand that is
+  // not the per-instance base constant - the target is
+  // `jmp_registr_ + sext(decrypt(load))` (intel.cc:27845).
+  uint64_t vipFromFoldChain(llvm::Value* target) {
+    static int chainDbg = 0;
+    const bool dbg = chainDbg < 400;
+    if (dbg) {
+      ++chainDbg;
+      std::cout << "[chain] start " << (target ? "v" : "null") << "\n"
+                << std::flush;
+    }
+    std::set<llvm::Value*> seen;
+    llvm::Value* v = target;
+    for (int depth = 0; v && depth < 64; ++depth) {
+      if (dbg) {
+        auto dumpV = [&](const char* tag, llvm::Value* x) {
+          if (!x) {
+            std::cout << "   " << tag << " null\n";
+            return;
+          }
+          std::string s;
+          llvm::raw_string_ostream os(s);
+          x->print(os);
+          std::cout << "   " << tag << " " << os.str().substr(0, 80)
+                    << " fold=" << foldOrigin.count(x)
+                    << " prov=" << loadProvenance.count(x) << "\n";
+        };
+        std::cout << "[chain] d" << depth << " fold=" << foldOrigin.count(v)
+                  << " prov=" << loadProvenance.count(v) << "\n";
+        auto itD = foldOrigin.find(v);
+        if (itD != foldOrigin.end()) {
+          dumpV("lhs", itD->second.lhs);
+          dumpV("rhs", itD->second.rhs);
+        }
+        std::cout << std::flush;
+      }
+      // Prefer the recorded pre-fold chain: a constant that a fold produced has
+      // a foldOrigin entry, and its loadProvenance entry (if any) is stale
+      // because LLVM uniques constants.
+      auto it = foldOrigin.find(v);
+      if (it == foldOrigin.end()) {
+        auto prov = loadProvenance.find(v);
+        return prov != loadProvenance.end() ? prov->second : 0;
+      }
+      auto isModuleConst = [&](llvm::Value* x) {
+        auto* ci = llvm::dyn_cast_or_null<llvm::ConstantInt>(x);
+        return ci && isModuleAddress(ci->getZExtValue());
+      };
+      auto hasChain = [&](llvm::Value* x) {
+        return x && (foldOrigin.count(x) || loadProvenance.count(x));
+      };
+      llvm::Value* next = nullptr;
+      if (hasChain(it->second.lhs) && hasChain(it->second.rhs)) {
+        // Both sides continue; the base is the module-address constant, so the
+        // other side is the decrypt chain that reaches the bytecode load.
+        next = isModuleConst(it->second.lhs) ? it->second.rhs : it->second.lhs;
+      } else if (hasChain(it->second.lhs)) {
+        next = it->second.lhs;
+      } else if (hasChain(it->second.rhs)) {
+        next = it->second.rhs;
+      }
+      if (!next || !seen.insert(next).second) {
+        return 0;
+      }
+      v = next;
+    }
+    return 0;
+  }
   RegisterManagerConcolic<Register> Registers;
 
   llvm::DomConditionCache* DC = new llvm::DomConditionCache();
@@ -1351,11 +1677,10 @@ public:
     createFunction();
     this->bb = llvm::BasicBlock::Create(this->context, "entry", this->fnc);
 
-    llvm::InstSimplifyFolder Folder(this->M->getDataLayout());
-
-    this->builder = std::make_unique<llvm::IRBuilder<llvm::InstSimplifyFolder>>(
-        this->bb, Folder);
-    InitRegisters();
+    this->builder = std::make_unique<llvm::IRBuilder<>>(this->bb);
+    // InitRegisters() is deliberately NOT called here: it writes the derived
+    // class's register array, which is not constructed yet at this point. The
+    // derived constructor calls it once its members exist.
     TargetLibraryInfoImpl TLIImpl(Triple(fnc->getParent()->getTargetTriple()));
     TLI = new TargetLibraryInfo(TLIImpl);
 
@@ -1408,6 +1733,71 @@ protected:
     return static_cast<Derived*>(this)->GetRegisterValue_impl(key);
   }
   void SetRegisterValue_internal(const Register key, llvm::Value* val) {
+    if (const char* path = std::getenv("MERGEN_REG_STREAM_FILE")) {
+      // One long-lived stream: opening the file per write would mean hundreds of
+      // thousands of open/close cycles and dominate the lift.
+      static std::ofstream* regStream = nullptr;
+      static bool streamInit = false;
+      if (!streamInit) {
+        streamInit = true;
+        regStream = new std::ofstream(path, std::ios::out);
+      }
+      // Every register write consumes a sequence number, including the ones the
+      // filter below drops, so the number is a true execution-order key shared
+      // with the memory stream. A ring of recent events is retained so the writes
+      // leading up to a watched instruction can be dumped even though they were
+      // not interesting when they happened.
+      const unsigned long long seq = nextMemEventSeq();
+      static std::deque<std::string> ring;
+      static int windowLeft = 0;
+      const uint64_t insnVA = current_address - instruction.length;
+      const Register canonicalReg = getBiggestEncoding<Register>(key);
+      std::string line = "REG," + std::to_string(seq) + ",0x";
+      {
+        std::ostringstream os;
+        os << std::hex << insnVA;
+        line += os.str();
+      }
+      line += "," + std::string(magic_enum::enum_name(canonicalReg)) + ",";
+      line += (val && llvm::isa<llvm::Constant>(val)) ? "1," : "0,";
+      if (auto* ci = llvm::dyn_cast_or_null<llvm::ConstantInt>(val)) {
+        std::ostringstream os;
+        os << "0x" << std::hex << ci->getZExtValue();
+        line += os.str();
+      } else {
+        line += "-";
+      }
+      // A store writes no register, so the interesting events cannot be found by
+      // watching an instruction VA. Persist every register write instead and let
+      // the reader join this stream with the memory stream on the shared sequence
+      // number; that is the only way to see which write set R8 before a store.
+      if (const char* winPath = std::getenv("MERGEN_REG_WINDOW_FILE")) {
+        static std::ofstream* winStream = nullptr;
+        static bool winInit = false;
+        if (!winInit) {
+          winInit = true;
+          winStream = new std::ofstream(winPath, std::ios::out);
+        }
+        if (winStream && *winStream) {
+          *winStream << line << "\n";
+        }
+      }
+      ring.push_back(line);
+      if (ring.size() > 32) {
+        ring.pop_front();
+      }
+      if (regStream && *regStream &&
+          (canonicalReg == Register::R8 || canonicalReg == Register::R10 ||
+           canonicalReg == Register::R11 || canonicalReg == Register::RSP ||
+           canonicalReg == Register::RDI || canonicalReg == Register::RAX ||
+           canonicalReg == Register::RCX || canonicalReg == Register::RDX ||
+           canonicalReg == Register::RBX || canonicalReg == Register::RSI ||
+           canonicalReg == Register::RBP || canonicalReg == Register::R9 ||
+           canonicalReg == Register::R12 || canonicalReg == Register::R13 ||
+           canonicalReg == Register::R14 || canonicalReg == Register::R15)) {
+        *regStream << line << "\n";
+      }
+    }
     return static_cast<Derived*>(this)->SetRegisterValue_impl(key, val);
   }
 
@@ -1658,8 +2048,54 @@ public:
 
   Value* retrieveCombinedValue(const uint64_t startAddress,
                                const uint8_t byteCount, LazyValue orgLoad);
+  Value* retrieveCombinedValueImpl(const uint64_t startAddress,
+                                   const uint8_t byteCount, LazyValue orgLoad);
 
   void addValueReference(Value* value, const uint64_t address);
+
+  // x86 segment-relative addressing (gs:/fs:) is TEB-relative. The lifter has
+  // no real TEB, so model one at tebBase (Aftermath Labs memory-modeling range
+  // policy): GetEffectiveAddress folds the segment override to tebBase, and the
+  // structural TEB/PEB links are seeded here.
+  //
+  // OSBuildNumber used to be left unknown here on the theory that the virtualized
+  // fingerprint condition would fork on it. It does not: this lifter has no fork
+  // at a symbolic load, it symbolizes and loses the path. Leaving it unknown made
+  // the VM key computation symbolic, which propagated into the RFLAGS value that
+  // selects the next handler, so `jmp r10` became unresolvable and the concrete
+  // walk stopped. Since the protector salts the key with the machine's real build
+  // number, and the sample was protected on the analysis host, seeding the host's
+  // value reproduces the key. Override with MERGEN_OS_BUILD_NUMBER when analysing
+  // a sample protected elsewhere.
+  static constexpr uint64_t tebBase = 0x7FFD0000ULL;
+  static constexpr uint64_t pebBase = 0x7FFD1000ULL;
+  static uint64_t hostOsBuildNumber() {
+    if (const char* env = std::getenv("MERGEN_OS_BUILD_NUMBER")) {
+      char* end = nullptr;
+      const unsigned long long parsed = std::strtoull(env, &end, 0);
+      if (end != env && *end == '\0') {
+        return parsed;
+      }
+    }
+    return 26200ULL; // build this sample was protected with (Win10 25H2 host)
+  }
+  void modelProcessEnvironment() {
+    llvm::LLVMContext& ctx = builder->getContext();
+    auto put = [&](uint64_t addr, uint64_t value, unsigned bits) {
+      addValueReference(
+          llvm::ConstantInt::get(llvm::Type::getIntNTy(ctx, bits), value), addr);
+    };
+    put(tebBase + 0x30, tebBase, 64); // TEB.Self
+    put(tebBase + 0x58, 0, 64);       // TEB.EnvironmentPointer
+    put(tebBase + 0x60, pebBase, 64); // TEB.ProcessEnvironmentBlock
+    put(pebBase + 0x2, 0, 8);         // PEB.BeingDebugged
+    put(pebBase + 0x68, 0, 32);       // PEB.NtGlobalFlag
+    // x64 TEB+0x120 is read back through the TEB self-pointer (gs:[0x30]), which
+    // is why the word is seeded at PEB-base + 0x120 as well.
+    const uint64_t build = hostOsBuildNumber();
+    put(tebBase + 0x120, build, 16);
+    put(pebBase + 0x120, build, 16);
+  }
 
   isPaged isValuePaged(Value* address, Instruction* ctxI);
 
@@ -1732,6 +2168,8 @@ public:
                          const Twine& Name = "");
   Value* folderBinOps(Value* LHS, Value* RHS, const Twine& Name,
                       Instruction::BinaryOps opcode);
+  Value* folderBinOpsImpl(Value* LHS, Value* RHS, const Twine& Name,
+                          Instruction::BinaryOps opcode);
   Value* createInstruction(const unsigned opcode, Value* operand1,
                            Value* operand2, Type* destType, const Twine& Name);
 
@@ -1741,6 +2179,16 @@ public:
                            Value* const op1);
 
   void run_opts();
+  // Folds just the module-backed loads (GEPLoadPass) once, without the
+  // pseudo-stack/pseudo-memory rewrites: those change memory addressing and
+  // would desynchronise the concolic buffer mid-lift.
+  void promoteModuleLoads();
+  // Folds the bytecode loads that are still live by replacing them with their
+  // concrete value (image + concolic buffer). Unlike GEPLoadPass it touches
+  // nothing else, so the concolic memory model stays valid; the tracked
+  // register/flag handles follow the RAUW, keeping the VM state concrete for
+  // the next block.
+  void concretizeBytecodeLoads();
   // end folders
 
 #define OPCODE(fncname, ...) DEFINE_FUNCTION(fncname);

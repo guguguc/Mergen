@@ -1,6 +1,7 @@
 #pragma once
 
 #include "LifterClass_Concolic.hpp"
+#include "MergenPB.hpp"
 #include <iostream>
 #include <sstream>
 

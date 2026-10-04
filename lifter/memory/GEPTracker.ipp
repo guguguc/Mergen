@@ -224,6 +224,33 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::createMemcpy(Value* src, Value* dest,
 MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::retrieveCombinedValue(
     const uint64_t startAddress, const uint8_t byteCount, LazyValue orgLoad) {
   Value* result = retrieveCombinedValueImpl(startAddress, byteCount, orgLoad);
+  if (startAddress == 0x1400EF850ULL || startAddress == 0xEF850ULL) {
+    static int efHits = 0;
+    if (efHits < 30) {
+      ++efHits;
+      uint64_t fileVal = 0;
+      const bool fileOk = file.readMemory(startAddress, byteCount, fileVal);
+      const bool promote =
+          fileOk && file.shouldPromoteFileValue(startAddress, byteCount, fileVal);
+      std::string s;
+      llvm::raw_string_ostream os(s);
+      if (result) {
+        result->print(os);
+      } else {
+        os << "<null>";
+      }
+      auto* ci = llvm::dyn_cast_or_null<llvm::ConstantInt>(result);
+      std::cout << "[ef850] insn=0x" << std::hex
+                << (current_address - instruction.length) << " va=0x"
+                << startAddress << std::dec << " bytes=" << (int)byteCount
+                << " fileOk=" << (fileOk ? 1 : 0) << " fileVal=0x" << std::hex
+                << fileVal << std::dec << " promote=" << (promote ? 1 : 0)
+                << " isCI=" << (ci ? 1 : 0) << " ci=0x" << std::hex
+                << (ci ? ci->getZExtValue() : 0) << std::dec << " ir="
+                << os.str().substr(0, 120) << "\n"
+                << std::flush;
+    }
+  }
   if (liftProgressDiagEnabled && startAddress == 0x14FE48) {
     std::string s;
     llvm::raw_string_ostream os(s);
@@ -250,7 +277,8 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::retrieveCombinedValueImpl(
 
   auto bufferFullyCoversRange = [&](uint64_t rangeStart, uint8_t rangeSize) {
     for (uint8_t i = 0; i < rangeSize; ++i) {
-      if (!buffer.contains(rangeStart + i)) {
+      auto it = buffer.find(rangeStart + i);
+      if (it == buffer.end() || !it->second.value) {
         return false;
       }
     }
@@ -383,6 +411,20 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::retrieveCombinedValueImpl(
     lastAccessMode = currentAccessMode;
   }
 
+  auto makeStaleFileValue = [&]() -> Value* {
+    auto* iTy = Type::getIntNTy(context, byteCount * 8);
+    auto* fTy = FunctionType::get(iTy, {Type::getInt64Ty(context)}, false);
+    const std::string name =
+        "mergen.stale_file_zero.i" + std::to_string(byteCount * 8);
+    auto* F = cast<Function>(builder->GetInsertBlock()
+                                 ->getParent()
+                                 ->getParent()
+                                 ->getOrInsertFunction(name, fTy)
+                                 .getCallee());
+    return builder->CreateCall(F, {builder->getInt64(startAddress)},
+                               "stale.file");
+  };
+
   Value* result = ConstantInt::get(Type::getIntNTy(context, byteCount * 8), 0);
 
   int m = 0;
@@ -392,27 +434,25 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::retrieveCombinedValueImpl(
     printvalue2(v.isRef);
 
     if (v.isRef) {
-      // Active union member is ref — do not access memoryAddress (UB).
-      byteValue = extractBytes(v.ref.value, v.ref.byteOffset,
-                               v.ref.byteOffset + bytesize);
+      if (v.ref.value) {
+        byteValue = extractBytes(v.ref.value, v.ref.byteOffset,
+                                 v.ref.byteOffset + bytesize);
+      } else {
+        byteValue = extractBytes(orgLoad.get(), m, m + bytesize);
+      }
     } else {
-      // Active union member is memoryAddress — safe to read.
       uint64_t mem_value;
       auto read_mem = file.readMemory(v.memoryAddress, bytesize, mem_value);
       printvalue2(read_mem);
       printvalue2(mem_value);
       if (memoryPolicy.isSymbolic(v.memoryAddress)) {
-        // Symbolic address: preserve symbolic fallback when concrete mapping
-        // is not proven.
-        if (read_mem) {
-          byteValue = builder->getIntN(bytesize * 8, mem_value);
-        } else {
-          byteValue = extractBytes(orgLoad.get(), m, m + bytesize);
-        }
+        byteValue = extractBytes(orgLoad.get(), m, m + bytesize);
       } else if (read_mem) {
+        if (!file.shouldPromoteFileValue(v.memoryAddress, bytesize, mem_value)) {
+          return cxTag("stale-zero", makeStaleFileValue());
+        }
         byteValue = builder->getIntN(bytesize * 8, mem_value);
       } else {
-        // Concrete read is unresolved when file mapping is unavailable.
         byteValue = extractBytes(orgLoad.get(), m, m + bytesize);
       }
     }
@@ -428,6 +468,15 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::retrieveCombinedValueImpl(
     m += bytesize;
   }
   printvalue(result);
+  if (auto* ci = dyn_cast<ConstantInt>(result)) {
+    // trackedBufferConstant already returned real stored zeros. A composed
+    // zero at this point is file bytes or empty buffer slots — the Themida
+    // range-policy failure mode (promote a slot rewritten before the lift).
+    if (byteCount >= 8 && ci->isZero() &&
+        !file.isImmutableImageAddress(startAddress)) {
+      return cxTag("stale-zero", makeStaleFileValue());
+    }
+  }
   return cxTag("composed", result);
 }
 

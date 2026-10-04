@@ -527,6 +527,8 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::createInstruction(
 
   Value* newValue = getOrCreate(key, opcode, Name);
 
+  recordFoldOrigin(newValue, opcode, operand1, operand2);
+
   return newValue; //
 }
 
@@ -758,11 +760,48 @@ KnownBits computeKnownBitsFromOperation(KnownBits& vv1, KnownBits& vv2,
 
 MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::folderBinOps(
     Value* LHS, Value* RHS, const Twine& Name, Instruction::BinaryOps opcode) {
+  Value* result = folderBinOpsImpl(LHS, RHS, Name, opcode);
+  recordFoldOrigin(result, static_cast<unsigned>(opcode), LHS, RHS);
+  // Propagate memory provenance through arithmetic so a computed transfer
+  // target (VMProtect dispatch: jmp_reg + loaded_bytecode, intel.cc:27845)
+  // keeps the identity of the bytecode load that produced it - that load is
+  // the VIP. Only values that feed the transfer ever carry it, so mutated
+  // junk loads (intel.cc:16039) never contribute.
+  if (result) {
+    auto it = loadProvenance.find(LHS);
+    if (it == loadProvenance.end()) {
+      it = loadProvenance.find(RHS);
+    }
+    if (it != loadProvenance.end()) {
+      loadProvenance[result] = it->second;
+    }
+  }
+  return result;
+}
+
+MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::folderBinOpsImpl(
+    Value* LHS, Value* RHS, const Twine& Name, Instruction::BinaryOps opcode) {
   auto folderSample = profiler.sample("sem_folder_binops");
   if (LHS->getType() != RHS->getType()) {
-    printvalue(LHS);
-    printvalue(RHS);
-    printvalue2(this->counter);
+    // A mismatch here means the fold below combines constants of different bit
+    // widths and takes the result type from the left operand. printvalue* write
+    // to the debug stream, which stays off unless a debug log was requested, so
+    // this condition used to pass silently. Report a bounded number instead.
+    static int mismatches = 0;
+    if (mismatches < 40) {
+      ++mismatches;
+      std::string ls;
+      std::string rs;
+      llvm::raw_string_ostream lo(ls);
+      llvm::raw_string_ostream ro(rs);
+      LHS->print(lo);
+      RHS->print(ro);
+      std::cout << "[typemismatch] @" << std::hex
+                << (current_address - instruction.length) << std::dec
+                << " lhs=" << ls.substr(0, 90) << " rhs=" << rs.substr(0, 90)
+                << "\n"
+                << std::flush;
+    }
   }
 
   if (LHS == RHS) {
@@ -1059,7 +1098,7 @@ std::optional<bool> foldKnownBits(CmpInst::Predicate P, const KnownBits& LHS,
   return std::nullopt;
 }
 
-Value* ICMPPatternMatcher(IRBuilder<llvm::InstSimplifyFolder>* builder,
+Value* ICMPPatternMatcher(IRBuilder<>* builder,
                           CmpInst::Predicate P, Value* LHS, Value* RHS,
                           const Twine& Name) {
   if (auto SI = dyn_cast<SelectInst>(LHS)) {
@@ -1292,6 +1331,13 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::GetRegisterValue(
 
   printvalue2(magic_enum::enum_name(largestKey));
   auto reg = GetRegisterValue_internal(largestKey);
+  if (!reg) {
+    std::cout << "[nullreg] key=" << magic_enum::enum_name(key)
+              << " largestKey=" << magic_enum::enum_name(largestKey)
+              << " at=0x" << std::hex << (current_address - instruction.length)
+              << std::dec << "\n"
+              << std::flush;
+  }
   printvalue(reg);
   return createZExtOrTruncFolder(reg, builder->getIntNTy(getRegisterSize(key)));
 }
@@ -1348,8 +1394,31 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::SetValueToSubRegister_8b(
 
   Value* updatedReg = createOrFolder(maskedFullReg, extendedValue, "newreg");
 
-  printvalue(fullRegisterValue) printvalue(maskValue) printvalue(maskedFullReg)
-      printvalue(extendedValue) printvalue(updatedReg);
+  // Sub-register writes of R8 are how the VM's byte-rotate chain (rol r8b, 1)
+  // lands in the register. If the merge produces a constant, R8 has collapsed
+  // from a 64-bit runtime value to a small integer; report a bounded number of
+  // the R8 cases with both sides so the collapse is visible.
+  if (fullRegKey == Register::R8) {
+    static int sub8bR8 = 0;
+    if (sub8bR8 < 30) {
+      ++sub8bR8;
+      auto txt = [&](llvm::Value* v) {
+        std::string s;
+        llvm::raw_string_ostream os(s);
+        if (v) {
+          v->print(os);
+        } else {
+          os << "<null>";
+        }
+        return os.str().substr(0, 70);
+      };
+      std::cout << "[sub8b] @" << std::hex
+                << (current_address - instruction.length) << std::dec
+                << " val=" << txt(value) << " old=" << txt(fullRegisterValue)
+                << " new=" << txt(updatedReg) << "\n"
+                << std::flush;
+    }
+  }
 
   SetRegisterValue_internal(fullRegKey, updatedReg);
 
@@ -1453,6 +1522,16 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::GetEffectiveAddress() {
     effectiveAddress = createAddFolder(effectiveAddress, dispValue, "disp_set");
   }
   printvalue(effectiveAddress);
+
+  // gs:/fs: addressing is TEB-relative. Model the TEB at tebBase instead of
+  // resolving the offset against the flat address space (the disassembler now
+  // surfaces the segment override; see modelProcessEnvironment).
+  if (instruction.mem_segment == Register::GS ||
+      instruction.mem_segment == Register::FS) {
+    effectiveAddress = createAddFolder(
+        effectiveAddress,
+        ConstantInt::get(Type::getInt64Ty(context), tebBase), "seg-base");
+  }
   return effectiveAddress;
 }
 
@@ -1466,6 +1545,33 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::getPointer(Value* address) {
   //
   // if (segment == Register::GS)
   //     memoryOperand = TEB;
+
+  // A small constant address reaching here means the effective address collapsed
+  // to a bare offset (the base register value is gone), so the access reads from
+  // address 0xN instead of the intended VM slot. Report the first few with the
+  // source instruction's memory-operand shape, which attributes the collapse to a
+  // specific addressing path.
+  if (auto* addressConst = llvm::dyn_cast<llvm::ConstantInt>(address)) {
+    const uint64_t addr = addressConst->getZExtValue();
+    if (addr >= 0x40 && addr <= 0x80) {
+      static int smallAddrHits = 0;
+      if (smallAddrHits < 20) {
+        ++smallAddrHits;
+        std::cout << "[smalladdr] @" << std::hex
+                  << (current_address - instruction.length) << " addr=0x" << addr
+                  << " mem_base=" << magic_enum::enum_name(instruction.mem_base)
+                  << " mem_index=" << magic_enum::enum_name(instruction.mem_index)
+                  << " mem_disp=0x" << instruction.mem_disp << std::dec
+                  << " scale=" << (unsigned)instruction.mem_scale << " ops=";
+        for (uint8_t k = 0; k < instruction.operand_count_visible; ++k) {
+          std::cout << " [" << (unsigned)k << "]"
+                    << magic_enum::enum_name(instruction.types[k]) << "/"
+                    << magic_enum::enum_name(instruction.regs[k]);
+        }
+        std::cout << "\n" << std::flush;
+      }
+    }
+  }
 
   Value* pointer =
       builder->CreateGEP(Type::getInt8Ty(context), memoryOperand, indices);
@@ -1489,19 +1595,182 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::GetMemoryValue(Value* address,
 
   loadMemoryOp(pointer);
 
-  if (Value* solvedLoad = solveLoad(retval, pointer, size)) {
-    // if can solve, return
-    // todo: use optional instead
-    return solvedLoad;
+  // Determine the load address first: the bytecode range decides whether this
+  // read may keep its LoadInst (see below).
+  uint64_t loadAddress = 0;
+  if (auto* addressConst = llvm::dyn_cast<llvm::ConstantInt>(address)) {
+    loadAddress = addressConst->getZExtValue();
+  } else if (auto* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(pointer)) {
+    if (auto* offset = llvm::dyn_cast<llvm::ConstantInt>(gep->getOperand(1))) {
+      loadAddress = offset->getZExtValue();
+    }
   }
 
-  return retval.get();
+  Value* result = nullptr;
+
+  // Bytecode-read stream. The VM decrypts each handler's next target from a
+  // read inside the protector's bytecode section, so the first read whose
+  // address differs from the machine's is the first point where the VM's
+  // virtual instruction pointer has drifted. Recorded as
+  //   R,<reader insn VA>,<read address>,<width>
+  // and aligned against vmpdrtrace's -trackmem stream by reader RVA.
+  if (const char* path = std::getenv("MERGEN_READ_STREAM_FILE")) {
+    if (current_address >= 0x140000000ULL && current_address < 0x150000000ULL) {
+      FILE* f = std::fopen(path, "a");
+      if (f) {
+        std::fprintf(f, "R,0x%llx,0x%llx,%u\n",
+                     (unsigned long long)(current_address - instruction.length),
+                     (unsigned long long)loadAddress, (unsigned)size);
+        std::fclose(f);
+      }
+    }
+  }
+  // FINAL: the single byte that becomes 0x58. Both sides read the same byte
+  // (file byte 0xE2 at rva 0x12CD57) with the same key, yet the lifter ends up
+  // with 0x58. Print what this one read actually produced, its provenance, and
+  // the registers of the decrypt expression, so the arithmetic can be compared
+  // against the machine's 0x3e957e chain:
+  //   r8d = [r11] ^ r10d ^ 0x3AFD456B ; r8d += 0x05DA2F20 ; movsxd
+  if (std::getenv("MERGEN_DIAG_BYTE") &&
+      (current_address - instruction.length) == 0x14033578EULL) {
+    auto txt = [&](llvm::Value* v) {
+      std::string s;
+      llvm::raw_string_ostream os(s);
+      if (v) {
+        v->print(os);
+      } else {
+        os << "<null>";
+      }
+      return os.str().substr(0, 130);
+    };
+    std::cout << "[byte] @0x14033578E addr=0x" << std::hex << loadAddress
+              << std::dec << " size_bits=" << (unsigned)size
+              << " mnem=" << magic_enum::enum_name(instruction.mnemonic) << "\n"
+              << "[byte]   raw=" << txt(result)
+              << "\n[byte]   R10=" << txt(GetRegisterValue(Register::R10))
+              << "\n[byte]   R11=" << txt(GetRegisterValue(Register::R11))
+              << "\n[byte]   R8=" << txt(GetRegisterValue(Register::R8))
+              << "\n" << std::flush;
+  }
+  if (Value* solvedLoad = solveLoad(retval, pointer, size)) {
+    result = solvedLoad;
+  } else {
+    result = retval.get();
+  }
+  {
+    const uint64_t insnVA = current_address - instruction.length;
+    if (insnVA == 0x1403D50FEULL || loadAddress == 0x1400EF850ULL) {
+      static int gmvHits = 0;
+      if (gmvHits < 20) {
+        ++gmvHits;
+        auto* ci = llvm::dyn_cast_or_null<llvm::ConstantInt>(result);
+        std::string s;
+        llvm::raw_string_ostream os(s);
+        if (result) {
+          result->print(os);
+        } else {
+          os << "<null>";
+        }
+        std::cout << "[ef850-gmv] insn=0x" << std::hex << insnVA << " addr=0x"
+                  << loadAddress << std::dec << " bits=" << (unsigned)size
+                  << " isCI=" << (ci ? 1 : 0) << " ci=0x" << std::hex
+                  << (ci ? ci->getZExtValue() : 0) << std::dec << " ir="
+                  << os.str().substr(0, 120) << "\n"
+                  << std::flush;
+      }
+    }
+  }
+
+  // VIP candidates are bytecode-range reads only. VMProtect's dispatch does the
+  // next-pcode read last in every handler (AddEndHandlerCommands, intel.cc:27842),
+  // so the last bytecode load since the previous transfer is the current VIP.
+  // Other module reads (VM tables/context) would otherwise masquerade as the VIP
+  // and fabricate loop backedges. (Themida article, "Constant Promotion & Memory
+  // Modeling" - configurable range policy.)
+  if (loadAddress != 0 && isModuleAddress(loadAddress)) {
+    loadProvenance[result] = loadAddress;
+    noteModuleLoad(loadAddress);
+  }
+
+  return result;
 }
 
 // takes address, not pointers
 
 MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::SetMemoryValue(llvm::Value* address,
                                                          llvm::Value* value) {
+  if (liftProgressDiagEnabled && std::getenv("MERGEN_DIAG_SSA58") &&
+      (current_address - instruction.length) == 0x1403E9AF2ULL) {
+    // Walk the *real* SSA use-def chain of the stored value. Every earlier
+    // attempt read foldOrigin, a bookkeeping table whose operands never matched
+    // the disassembly. This walks actual operands and names the defining
+    // instruction, hard capped (depth 8, 200 nodes) so it cannot blow up the log.
+    if (auto* ci = llvm::dyn_cast_or_null<llvm::ConstantInt>(value)) {
+      if (ci->getBitWidth() == 64 && ci->getZExtValue() == 0x58) {
+        auto txt = [&](llvm::Value* v) {
+          std::string s;
+          llvm::raw_string_ostream os(s);
+          if (v) {
+            v->print(os);
+          } else {
+            os << "<null>";
+          }
+          return os.str().substr(0, 110);
+        };
+        std::cout << "[ssa58] store of 0x58; R8=" << txt(GetRegisterValue(Register::R8))
+                  << " R10=" << txt(GetRegisterValue(Register::R10))
+                  << "\n[ssa58] use-def chain of the stored value:\n";
+        std::set<llvm::Value*> seen;
+        std::vector<std::pair<llvm::Value*, int>> work{{value, 0}};
+        int printed = 0;
+        while (!work.empty() && printed < 200) {
+          auto entry = work.back();
+          work.pop_back();
+          llvm::Value* v = entry.first;
+          const int d = entry.second;
+          if (!v || !seen.insert(v).second) continue;
+          auto* inst = llvm::dyn_cast<llvm::Instruction>(v);
+          if (!inst) {
+            std::cout << "[ssa58]   " << std::string(d * 2, ' ')
+                      << "NON-INSTR " << txt(v) << "\n";
+            ++printed;
+            continue;
+          }
+          std::cout << "[ssa58]   " << std::string(d * 2, ' ') << txt(inst);
+          if (auto* li = llvm::dyn_cast<llvm::LoadInst>(inst)) {
+            std::cout << "   [LOAD ptr=" << txt(li->getPointerOperand()) << "]";
+          }
+          std::cout << "\n";
+          ++printed;
+          if (d >= 8) continue;
+          for (auto& op : inst->operands()) {
+            work.push_back({op.get(), d + 1});
+          }
+        }
+        std::cout << "[ssa58] end (printed " << printed << ")\n" << std::flush;
+      }
+    }
+  }
+  if (liftProgressDiagEnabled && std::getenv("MERGEN_DIAG_ST9AF2") &&
+      (current_address - instruction.length) == 0x1403E9AF2ULL) {
+    static bool reported = false;
+    if (!reported) {
+      reported = true;
+      auto txt = [&](llvm::Value* v) {
+        std::string s;
+        llvm::raw_string_ostream os(s);
+        if (v) {
+          v->print(os);
+        } else {
+          os << "<null>";
+        }
+        return os.str().substr(0, 160);
+      };
+      std::cout << "[stb] store=0x58 R8=" << txt(GetRegisterValue(Register::R8))
+                << " R10=" << txt(GetRegisterValue(Register::R10))
+                << "\n" << std::flush;
+    }
+  }
   auto memorySample = profiler.sample("sem_memory_store");
 
   auto pointer = getPointer(address);
