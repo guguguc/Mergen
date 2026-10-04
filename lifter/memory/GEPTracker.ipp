@@ -16,10 +16,140 @@
 
 using namespace llvm;
 
+// Watched interval: the pseudo-stack slot whose read-back value (0x58) the
+// dispatcher later treats as data.
+static constexpr uint64_t kBufferWatchStart = 0x14FC90ULL;
+static constexpr uint64_t kBufferWatchEnd = 0x14FC98ULL;
+
+void noteBufferWriteDiag(const char* site, uint64_t start, uint64_t size,
+                         llvm::Value* value, uint64_t insnAddr) {
+  if (!(start < kBufferWatchEnd && start + size > kBufferWatchStart)) {
+    return;
+  }
+  // Only the write that puts the 58 pattern into the slot matters; logging
+  // every overlapping write drowns it (56 hits, none of them the culprit).
+  bool is58 = false;
+  if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(value)) {
+    if (ci->getBitWidth() == 64 && ci->getZExtValue() == 0x58) {
+      is58 = true;
+    }
+  }
+  if (!is58) {
+    return;
+  }
+  std::string vs;
+  llvm::raw_string_ostream vos(vs);
+  if (value) {
+    value->print(vos);
+  } else {
+    vos << "<null>";
+  }
+  std::cout << "[bufwr58] site=" << site << " insn=0x" << std::hex << insnAddr
+            << " slot=0x" << start << std::dec << " size=" << size
+            << " value=" << vos.str().substr(0, 160) << "\n"
+            << std::flush;
+}
+
 MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::addValueReference(Value* value,
                                                             uint64_t address) {
+  // Address-stream probe. The real machine's write stream can be captured with
+  // vmpdrtrace's -trackmem; this is the same stream as the lifter models it.
+  // Aligning the two by (instruction RVA, destination address) pinpoints the
+  // first write whose address differs, i.e. the first instruction whose
+  // register/memory state has drifted from the machine's. That is the root to
+  // fix - it needs no guessing about which value "should" be what.
+  if (const char* path = std::getenv("MERGEN_WRITE_STREAM_FILE")) {
+    // Skip the setup-time seeding (modelProcessEnvironment runs before any
+    // instruction is lifted, so current_address is not a code address yet).
+    if (current_address >= 0x140000000ULL && current_address < 0x150000000ULL) {
+      FILE* f = std::fopen(path, "a");
+      if (f) {
+        const unsigned vbytes = value && value->getType()->isIntegerTy()
+                                    ? value->getType()->getIntegerBitWidth() / 8
+                                    : 0;
+        unsigned long long cval = 0;
+        bool isConst = false;
+        if (auto* ci = llvm::dyn_cast_or_null<llvm::ConstantInt>(value)) {
+          cval = ci->getZExtValue();
+          isConst = true;
+        }
+        // value is recorded as a hex constant when known, else "-" (symbolic).
+        if (isConst) {
+          std::fprintf(f, "W,%llu,0x%llx,0x%llx,%u,0x%llx\n",
+                       nextMemEventSeq(),
+                       (unsigned long long)(current_address - instruction.length),
+                       (unsigned long long)address, vbytes, cval);
+        } else {
+          std::fprintf(f, "W,%llu,0x%llx,0x%llx,%u,-\n",
+                       nextMemEventSeq(),
+                       (unsigned long long)(current_address - instruction.length),
+                       (unsigned long long)address, vbytes);
+        }
+        std::fclose(f);
+      }
+    }
+  }
+  if (liftProgressDiagEnabled && value && value->getType()->isIntegerTy()) {
+    const unsigned vbytes = value->getType()->getIntegerBitWidth() / 8;
+    // Cover the whole pseudo-stack slot region below STACKP_VALUE instead of a
+    // single address. The slot that later feeds the dispatcher target is read
+    // back with `mov reg, [rsp+r11]`, and the bogus value can land in any slot
+    // between the current frame pointer and STACKP_VALUE - the earlier probe
+    // only looked above 0x14FCB8 and therefore missed every real write.
+    if (address + vbytes > 0x14FCB8ULL && address < 0x14FEA0ULL) {
+      static int slotStores = 0;
+      if (slotStores < 4000) {
+        ++slotStores;
+        std::string vt;
+        llvm::raw_string_ostream vo(vt);
+        value->print(vo);
+        std::cout << "[diag] wrslot @0x" << std::hex
+                  << (current_address - instruction.length) << " slot=0x" << address
+                  << std::dec << " size=" << vbytes
+                  << " value=" << vo.str().substr(0, 150);
+        if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(value)) {
+          std::cout << " cval=0x" << std::hex << ci->getZExtValue() << std::dec;
+        }
+        // RSP at the time of the write. The real machine keeps RSP fixed
+        // inside a VM handler (the VM stack lives in a GPR); a drifting RSP
+        // silently re-points every later [rsp+imm] access to another slot.
+        {
+          std::string rs;
+          llvm::raw_string_ostream ros(rs);
+          if (auto* rsp = this->GetRegisterValue(Register::RSP)) {
+            rsp->print(ros);
+          }
+          std::cout << " rsp=" << ros.str().substr(0, 40);
+        }
+        // Pin the register operands of the two stores that write the VM stack
+        // top from a register: if the read-back value was 0x58, one of these
+        // registers already held 0x58 at this point.
+        {
+          const uint64_t insnAddr = current_address - instruction.length;
+          if (insnAddr == 0x1402BE265ULL || insnAddr == 0x1402BEF25ULL) {
+            auto show = [&](Register r, const char* name) {
+              std::string rs;
+              llvm::raw_string_ostream ros(rs);
+              auto* rv = this->GetRegisterValue(r);
+              if (rv) {
+                rv->print(ros);
+              } else {
+                ros << "<null>";
+              }
+              std::cout << " " << name << "=" << rs.substr(0, 60);
+            };
+            show(Register::R9, "R9");
+            show(Register::R13, "R13");
+            show(Register::RAX, "RAX");
+          }
+        }
+        std::cout << "\n" << std::flush;
+      }
+    }
+  }
   if (liftProgressDiagEnabled &&
-      (address == 1375392 || address == 1375400 || address == 1375408)) {
+      (address == 1375392 || address == 1375400 || address == 1375408 ||
+       address == 88 || address == 96 || address == 104)) {
     std::string vtxt;
     llvm::raw_string_ostream os(vtxt);
     value->print(os);
@@ -28,6 +158,8 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::addValueReference(Value* value,
               << address << std::dec << " value=" << os.str() << "\n";
   }
   unsigned valueSizeInBytes = value->getType()->getIntegerBitWidth() / 8;
+  noteBufferWriteDiag("addValueReference", address, valueSizeInBytes, value,
+                      current_address - instruction.length);
   for (unsigned i = 0; i < valueSizeInBytes; i++) {
     printvalue2(address + i);
     buffer[address + i] = ValueByteReference(value, i);
@@ -75,16 +207,44 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::createMemcpy(Value* src, Value* dest,
       printvalue2(C_src + i);
       printvalue2(C_dest + i);
 
+      noteBufferWriteDiag("createMemcpy-miss", C_dest + i, 1, nullptr,
+                          current_address - instruction.length);
       buffer[C_dest + i] = ValueByteReference();
       // Handle missing source data
       continue;
     }
+    noteBufferWriteDiag("createMemcpy", C_dest + i, 1,
+                        static_cast<llvm::Value*>(buffer[C_src + i].value),
+                        current_address - instruction.length);
     buffer[C_dest + i] = buffer[C_src + i];
   }
 }
 // instead of passing a LazyValue, lazily load it.
 
 MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::retrieveCombinedValue(
+    const uint64_t startAddress, const uint8_t byteCount, LazyValue orgLoad) {
+  Value* result = retrieveCombinedValueImpl(startAddress, byteCount, orgLoad);
+  if (liftProgressDiagEnabled && startAddress == 0x14FE48) {
+    std::string s;
+    llvm::raw_string_ostream os(s);
+    if (result) {
+      result->print(os);
+    }
+    std::cout << "[cx] retrieveCombinedValue(0x14FE48," << (int)byteCount
+              << ") -> " << os.str().substr(0, 150) << "\n"
+              << std::flush;
+  }
+  if (result && isModuleAddress(startAddress)) {
+    // Only module-backed promotions are VIP candidates; stack/pseudo-stack
+    // slots must not overwrite the VIP (configurable range policy, Themida
+    // article "Constant Promotion & Memory Modeling").
+    loadProvenance[result] = startAddress;
+    noteModuleLoad(startAddress);
+  }
+  return result;
+}
+
+MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::retrieveCombinedValueImpl(
     uint64_t startAddress, uint8_t byteCount, LazyValue orgLoad) {
   printvalue2(startAddress);
 
@@ -104,12 +264,28 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::retrieveCombinedValue(
     }
 
     llvm::APInt combined(rangeSize * 8, 0);
+    const bool t48 = liftProgressDiagEnabled && rangeStart == 0x14FE48;
     for (uint8_t i = 0; i < rangeSize; ++i) {
       auto it = buffer.find(rangeStart + i);
       if (it == buffer.end()) {
         return nullptr;
       }
       auto* ci = dyn_cast<ConstantInt>(it->second.value);
+      if (t48) {
+        std::string bt;
+        llvm::raw_string_ostream bo(bt);
+        llvm::Value* bv = it->second.value;
+        if (bv) {
+          bv->print(bo);
+        } else {
+          bo << "<null>";
+        }
+        std::cout << "[cx]   b" << (int)i
+                  << " off=" << (int)it->second.byteOffset
+                  << " isConst=" << (ci ? 1 : 0) << " v="
+                  << bo.str().substr(0, 90) << "\n"
+                  << std::flush;
+      }
       if (!ci) {
         return nullptr;
       }
@@ -119,33 +295,43 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::retrieveCombinedValue(
     return ConstantInt::get(builder->getContext(), combined);
   };
 
+  const bool traceCx = liftProgressDiagEnabled && startAddress == 0x14FE48;
+  auto cxTag = [&](const char* tag, Value* v) -> Value* {
+    if (traceCx) {
+      std::string s;
+      llvm::raw_string_ostream os(s);
+      if (v) {
+        v->print(os);
+      }
+      std::cout << "[cx]   " << tag << " = " << os.str().substr(0, 150) << "\n"
+                << std::flush;
+    }
+    return v;
+  };
+
   if (auto* tracked = trackedBufferConstant(startAddress, byteCount)) {
-    return tracked;
+    return cxTag("buffer-const", tracked);
   }
   uint64_t normalizedStartAddress = normalizeRuntimeTargetAddress(startAddress);
+  if (traceCx) {
+    std::cout << "[cx]   normalized=0x" << std::hex << normalizedStartAddress
+              << std::dec << "\n"
+              << std::flush;
+  }
   if (normalizedStartAddress != startAddress) {
     if (auto* normalizedTracked =
             trackedBufferConstant(normalizedStartAddress, byteCount)) {
-      return normalizedTracked;
+      return cxTag("normalized-buffer-const", normalizedTracked);
     }
   }
 
   if (memoryPolicy.isRangeFullyCovered(startAddress, startAddress + byteCount,
                                        MemoryAccessMode::SYMBOLIC) &&
       !bufferFullyCoversRange(startAddress, byteCount)) {
-    // Fully symbolic range with no tracked-byte coverage: use concrete bytes
-    // only when mapping is proven; otherwise preserve the symbolic fallback.
-    // When the concolic buffer covers the whole range, rebuild from tracked
-    // bytes below even though the address is symbolic.
-    uint64_t sym_value;
-    if (file.readMemory(startAddress, byteCount, sym_value)) {
-      return builder->getIntN(byteCount * 8, sym_value);
-    }
-    if (normalizedStartAddress != startAddress &&
-        file.readMemory(normalizedStartAddress, byteCount, sym_value)) {
-      return builder->getIntN(byteCount * 8, sym_value);
-    }
-    return extractBytes(orgLoad.get(), 0, byteCount);
+    // Fully SYMBOLIC with no tracked bytes: never fall back to the PE image.
+    // Protector-owned ranges are rewritten after map; promoting file bytes
+    // reinjects values the process no longer has. Keep the LoadInst symbolic.
+    return cxTag("extractBytes", extractBytes(orgLoad.get(), 0, byteCount));
   }
 
 
@@ -242,7 +428,7 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::retrieveCombinedValue(
     m += bytesize;
   }
   printvalue(result);
-  return result;
+  return cxTag("composed", result);
 }
 
 MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::extractBytes(Value* value,
@@ -395,6 +581,18 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::insertMemoryOp(StoreInst* inst) {
   pagedCheck(gepOffset, inst);
 
   if (!isa<ConstantInt>(gepOffset)) {
+    if (liftProgressDiagEnabled) {
+      std::string s;
+      llvm::raw_string_ostream os(s);
+      gepOffset->print(os);
+      std::string vs;
+      llvm::raw_string_ostream vos(vs);
+      inst->getValueOperand()->print(vos);
+      std::cout << "[diag] untracked store @0x" << std::hex
+                << (current_address - instruction.length) << std::dec
+                << " off=" << os.str() << " value=" << vos.str() << "\n"
+                << std::flush;
+    }
     printvalue(gepOffset);
     if (auto conditional_offset = dyn_cast<SelectInst>(gepOffset)) {
       printvalue(conditional_offset->getFalseValue());
@@ -428,6 +626,20 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::insertMemoryOp(StoreInst* inst) {
 
   if (bypassStackConcolicTracking &&
       isTrackedLocalStackAddress(gepOffsetCI->getZExtValue())) {
+    if (liftProgressDiagEnabled) {
+      static int bypassWrites = 0;
+      if (bypassWrites < 3000) {
+        ++bypassWrites;
+        std::string vs;
+        llvm::raw_string_ostream vos(vs);
+        inst->getValueOperand()->print(vos);
+        std::cout << "[diag] bypass-drop-write @0x" << std::hex
+                  << (current_address - instruction.length) << " slot=0x"
+                  << gepOffsetCI->getZExtValue() << std::dec
+                  << " value=" << vos.str().substr(0, 120) << "\n"
+                  << std::flush;
+      }
+    }
     return;
   }
 
@@ -684,7 +896,7 @@ calculatePossibleValues(std::set<APInt, APIntComparator> v1,
 MERGEN_LIFTER_DEFINITION_TEMPLATES(pvalueset)::computePossibleValues(
     Value* V, uint8_t Depth) {
   printvalue2(Depth);
-  if (Depth > 16) {
+  if (Depth > 64) {
     debugging::doIfDebug([&]() {
       std::string Filename = "output_depth_exceeded.ll";
       std::error_code EC;
@@ -925,7 +1137,13 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::solveLoad(LazyValue load,
   const Value* loadPtr = ptr;
 
   auto cloadsize = size / 8;
-  auto loadPtrGEP = cast<GetElementPtrInst>(loadPtr);
+  auto* loadPtrGEP = dyn_cast<GetElementPtrInst>(loadPtr);
+  if (!loadPtrGEP) {
+    // The pointer is not a GEP (e.g. a select/inttoptr produced by a kept
+    // bytecode load). There is no GEP offset to resolve against the concolic
+    // buffer or the image; let the caller keep the LoadInst.
+    return nullptr;
+  }
   auto loadPointer = loadPtrGEP->getPointerOperand();
   Value* loadOffset = loadPtrGEP->getOperand(1);
 
