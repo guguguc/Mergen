@@ -408,6 +408,15 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_pushfq() {
   // auto Rvalue = GetRFLAGS(builder);
   auto RspValue = GetRegisterValue(Register::RSP);
 
+  // work.md 7.12.6/7.12.7 and mix 0x2F528E: a symbolic flag bit here becomes a
+  // symbolic RFLAGS qword; later unaligned VM-stack loads cannot fold it.
+  if (std::getenv("MERGEN_DIAG_RFLAGS")) {
+    const uint64_t rva = maskedRVA(current_address - instruction.length);
+    if (rva == 0x396B77ULL || rva == 0x2F528EULL) {
+      dumpRflagsDiag("pushfq", rva, Rvalue);
+    }
+  }
+
   auto srcsize = 64; // based on bitness  ---
 
   auto val = ConstantInt::get(Type::getInt64Ty(context), srcsize / 8);

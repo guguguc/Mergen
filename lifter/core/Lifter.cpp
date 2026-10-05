@@ -32,6 +32,7 @@
 #include <llvm/Analysis/LazyCallGraph.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/IRBuilderFolder.h>
+#include <llvm/IR/Constants.h>
 #include <llvm/Support/NativeFormatting.h>
 #include <magic_enum/magic_enum.hpp>
 
@@ -194,16 +195,43 @@ void installCrashHandler() {
 
 
 
+bool applyEntryRegisterSeeds(
+    lifterConcolic<>* lifter,
+    const std::vector<std::pair<std::string, uint64_t>>& entryRegs) {
+#ifdef ICED_FOUND
+  using EntryRegister = Mergen::IcedRegister;
+#else
+  using EntryRegister = Mergen::ZydisRegister;
+#endif
+  for (const auto& [name, value] : entryRegs) {
+    const auto parsed = magic_enum::enum_cast<EntryRegister>(name);
+    if (!parsed.has_value()) {
+      std::cerr << "Unknown --reg name: " << name << std::endl;
+      return false;
+    }
+    auto* ci = llvm::ConstantInt::get(lifter->builder->getInt64Ty(), value);
+    lifter->SetRegisterValue(*parsed, ci);
+    std::cerr << "[entry-reg] " << name << "=0x" << std::hex << value
+              << std::dec << "\n";
+  }
+  return true;
+}
+
 bool InitFunction_and_LiftInstructions(const uint64_t runtime_address,
                                        std::vector<uint8_t>&& fileData,
                                        const std::vector<uint64_t>& outlineAddresses,
-                                       const std::string& memDumpPath) {
+                                       const std::string& memDumpPath,
+                                       const std::vector<std::pair<std::string, uint64_t>>& entryRegs) {
   std::string stageError;
   auto stageContext =
       prepareLifterStageContext(runtime_address, fileData, stageError,
                                 memDumpPath);
   if (!stageContext.has_value()) {
     std::cerr << stageError << std::endl;
+    return false;
+  }
+
+  if (!applyEntryRegisterSeeds(stageContext->lifter.get(), entryRegs)) {
     return false;
   }
 
@@ -284,6 +312,7 @@ int main(int argc, char* argv[]) {
   return testInit(suiteFilter);
 #endif
   const auto& outlineAddrs = parseResult.outlineAddresses;
+  const auto& entryRegs = parseResult.entryRegs;
   std::string memDumpPath = parseResult.memDumpPath;
   if (memDumpPath.empty()) {
     if (const char* env = std::getenv("MERGEN_MEM_DUMP")) {
@@ -291,10 +320,11 @@ int main(int argc, char* argv[]) {
     }
   }
   return runLifterApplication(args,
-      [&outlineAddrs, memDumpPath](uint64_t runtime_address,
+      [&outlineAddrs, &entryRegs, memDumpPath](uint64_t runtime_address,
                                    std::vector<uint8_t>&& fileData) {
         return InitFunction_and_LiftInstructions(runtime_address,
                                                   std::move(fileData),
-                                                  outlineAddrs, memDumpPath);
+                                                  outlineAddrs, memDumpPath,
+                                                  entryRegs);
       });
 }

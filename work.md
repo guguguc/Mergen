@@ -1415,7 +1415,481 @@ insn 流有 `0x7231`（真机 `lea eax,[rbx+rdi]`）再 `0x723e`。lift 从函�
 
 未追：§7.11.12 分叉前的早期 RCX/flags 差（seq 287/336/527/659+）。
 
+## 7.12 mix（`0x140007450`）：PC 对齐到 `push r11; ret`，VIP 从 context 槽没取回
+
+样本在 `D:\sogen\dr\vmptest\`（不是 `sample/add`）：`test.cpp` 的 `mix`，入口 `0x140007450`，映像 `test_fixed4.exe`，入口 dump `entry_7450.dmp`（16:45–16:46，`dumpmem-exit`，exit=0）。同文件还有 `compute_sum` `0x1400072d0`、`classify` `0x140007220`。lift **不要**从 PE AddressOfEntryPoint 起，停在客户函数。
+
+insn 流：DR `D:\sogen\dr\vmptest\mix_dr_insn.csv`（444770 `I-`行）；lift `build_msvc_dbg\mix_lift_insn.csv`（221160，FileReader/PC-widen 回退后重采）。格式同 §7.8。
+
+**不要再做的：** FileReader 拒 `va<imageBase`、lift PC `0x40xxxxxx→0x140` 拓宽（overlay 会打到所有 handler fetch，add 从能出 IR 变成 Unresolved ROP）；`STACKP±8` / 把 `STACKP_VALUE` 低 4 位改成 8；unique-fold；VIP overlay；`GetRFLAGSValue |= 0x202`；贴活堆指针；把 DR TSC 写进 lifter。`and rsp,-16` 两边相对入口差 8 **已否证为本次停住的根因**（§7.12.5）。
+
+### 7.12.1 表面现象
+
+| | 条数 | 末 PC | 下一跳 |
+|---|---|---|---|
+| lift | 221160 | RVA `0x35a716` `ret`（`disp=-584` `rop=0`） | 无（Unresolved ROP） |
+| DR | 444770 | 继续 | seq 221161 RVA `0x34e2f2` |
+
+前 **221160** 条 RVA 与 DR 前缀相同。不是 PC 走岔。add 回退后仍能出 `add i64 %RDX,%RCX` + 客户 `ret 0x723e`。
+
+末段（insn 流是**指令前**快照）：
+
+| seq | RVA | 指令 | DR r11 | lift r11 |
+|---|---|---|---|---|
+| 221157 | `0x3ba47b` | `add r11, rdx` | `0x7ff720883c7c`（RVA `0x423c7c`） | `0x40423c7c`（同 RVA） |
+| 221158 | `0x3ba47e` | `jmp 0x35a714` | `0x7ff7207ae2f2`（RVA `0x34e2f2`） | `-` |
+| 221159 | `0x35a714` | `push r11` | 同上 | `-` |
+| 221160 | `0x35a716` | `ret` | 同上 | `-` |
+| 221161 | `0x34e2f2` | （DR 继续） | | |
+
+`add r11, rdx` 的 rdx：DR `0xfffffffffff2a676`（前面 `ror edx,3` / `movsxd rdx,edx`）；lift `-`。r11 从此符号，ret 解不出 `0x34e2f2`。
+
+### 7.12.2 不是 R9−RSP「8 字节偏了」
+
+`0x41f361` `mov r9, [rbp]`（文件==dump：`4c8b4c2500`）。seq 3429 指令前 r9 仍是 `0xefc9a`；seq 3430 才看见写入。相对**入口栈**两边都是 `-0x50`（DR `0x31448ff8d8` vs `0x31448ff928`；lift `0x14fe50` vs `STACKP 0x14fea0`）。`r9-当前rsp` 的 `0x1f8` vs `0x1f0` 没有意义：R9 是 `[rbp]` 取出的指针，不是 RSP 的函数。`cmp_mix_r9rsp.py` 的 34801 次 skew 是同一度量，忽略。
+
+`bsf esi, ebp` 在 seq 5350 的 RSI `3` vs `5` 也是垃圾，随后 `mov esi, [r11]` 两边重新对齐。
+
+### 7.12.3 末段只是后果：RSI 还在，RCX 已经空
+
+到 seq 221113，**RSI 仍是 VIP**（DR `0x7ff720573f4e` = dump_ib+`0x113f4e`；lift `0x140113f4e`）。然后垃圾毁掉 RSI，`mov rsi, rcx` 用已经符号的 RCX 写回去，`mov edx, [rsi]` / `add r11, rdx` / `push r11; ret` 全断。
+
+| seq | RVA | 指令 | 作用 |
+|---|---|---|---|
+| 221113 | `0x35dfaf` | `mov rcx, [r9]` | DR：RCX=VIP；lift：`[r9]` 不是常数 |
+| 221114–221116 | `0x35dfb2`… | `or esi, edi` / `sal sil, 2` / `movsx esi, r13w` | 两边都毁掉 RSI（垃圾） |
+| 221119 | `0x35dfc8` | `mov rsi, rcx` | DR 写回 VIP；lift 写入符号 RCX |
+| 221157 | `0x3ba47b` | `add r11, rdx` | 见 7.12.1 |
+
+`221071` `mov rdx, [rsp+r8]`（`r8=rbp=0x68` 两边相同）DR 读到 VIP、lift 仍 `-`，**不是因为 `[rsp+0x68]` 相对入口差 8**。上一拍 `219865` `mov [rsp+rbp], rdx` 已经用同一相对槽：DR 写 VIP，lift 写 `-`。`rol edx, cl` 只是在 RCX 已符号时把 rdx 弄成 `-`，设计上该被这次 load 盖掉。
+
+### 7.12.5 VIP 槽在 218543 被 R10 写坏（RCX 当时还是 VIP）
+
+VIP = PE `0x140113f4e` / dump `0x7ff720573f4e`。`~VIP` = `0xfffffffebfeec0b1`。
+
+seq **218197** `mov [r9+8], rcx`：两边都把 `0x140113f4e` 写进 **入口相对 `-0x30`**（lift `0x14fe70` / DR `0x31448ff8f8`）。这是 VIP 槽。lift 最后一次 RCX=VIP 在 **218536** `not rcx`（两边变成 `~VIP`）。
+
+RCX 仍是 VIP 时，RDX 先坏：
+
+| seq | RVA | 指令 | DR | lift |
+|---|---|---|---|---|
+| 217710 | `0x3c1efd` | `mov [r9+8], rcx` | 写入 `0`（同一 `-0x30` 槽） | 写入 `-` |
+| 217806 | `0x30d9e1` | `mov rdx, [r9]` | rdx=`0` | `-` |
+| 217824 | `0x30da2a` | `mov [rsp+rbp], rdx`（`rbp=0x88`） | 写 `0` | 写 `-` |
+| 218308 | `0x344247` | `mov rdx, [rsp+r8]`（`r8=0x88`） | rdx=`0` | `-` |
+| 218313 | `0x391208` | `mov [r9], rdx`（入口相对 `-0x38`） | 写 `0` | 写 `-` |
+
+两边 `rsp+0x88` / `r9±8` 的**相对槽一致**。不是 STACKP 低 4 位。
+
+然后 R10 没能从 RCX 把 VIP 救回，并把符号值写进 VIP 槽：
+
+| seq | RVA | 指令 | DR | lift |
+|---|---|---|---|---|
+| 218524 | `0x40a986` | `mov r10, [r9]` | r10=`-1` | `-` |
+| 218532 | `0x40a9a3` | `not r10` | `0` | `-` |
+| 218536 | `0x40a9ae` | `not rcx` | `~VIP` | `~VIP`（RCX 仍常数） |
+| 218539 | `0x40a9b7` | **`or r10, rcx`** | `0 \| ~VIP = ~VIP` | `- \| ~VIP = -` |
+| 218543 | `0x40a9c4` | **`mov [r9+8], r10`** | 把 `~VIP` 写回 `-0x30` 槽 | 把 `-` 写进去 |
+
+之后全是这条坏槽的传播：`218683` `mov rbp, [r10]`、`218685` `mov [r9], rbp`、`218711`/`218713` 再 load、`219755`/`219835`/`219865` 再存 `[rsp+rbp]`，直到 7.12.3。
+
+**未追（已接到 7.12.6）：** `217710` 时 RCX 已是 `0` vs `-`。
+
+### 7.12.6 `217710`：`add rcx, rdi` 的 RDI 来自未对齐 `[r9]` 上的 `pushfq`
+
+`217709` `add rcx, rdi`：两边 RCX 仍是 `-1`。`217708` `mov rdi, [r9+8]` 之后 DR RDI=`1`、lift `-`。`-1+1=0` vs `-1+符号`。`217710` 把这结果写进 `-0x30` 槽。
+
+`1` 从哪来：`217178` `mov [r9+8], rdx`（DR rdx=`1`，lift `-`）。`217177` `shr rdx, cl`：DR `4 >> 2 = 1`（`cl` 来自 `rcx=…02`）。`217172` **`mov rdx, [r9]`**，r9 **未对齐**（两边相对入口都是 `-0x32`：`0x14fe6e` / `0x31448ff8f6`）：DR rdx=`4`，lift 仍 `-`。
+
+更早一次未对齐 load **成功**：`217016` `mov rdx, [r9]` r9=`0x14fe5e`（`-0x42`）两边都是 `0x282`。下一次失败：
+
+| seq | RVA | 指令 | r9（lift） | DR rdx | lift rdx |
+|---|---|---|---|---|---|
+| 217082 | `0x396b77` | `pushfq` | `0x14fe66` | `0x282` | `0x282` |
+| 217085 | `0x396b80` | `pop qword ptr [r9]` | `0x14fe66`（未对齐 +6） | | |
+| 217112 | `0x410840` | `mov rdx, [r9]` | 同 | **`0x202`** | **`-`** |
+
+`0x202` 是 FLAGS（含保留位 1）。lift 的 `pushfq` 写到未对齐 `[r9]` 的不是可折常数，随后 qword load 变 `-`。`217172` 再 load `4` 也盖不回去。禁止 `GetRFLAGSValue \|= 0x202`；这里是 **整段 FLAGS 符号**，不是只差 bit1。
+
+`r9` 走 `…e6 / …ee / …f6`（+2/+6），不是 8 字节格。`sub r9, 6` 在 `217176`，发生在 `217172` 之后。
+
+### 7.12.7 FLAGS 分字节写 tracker：add 回归（已撤回 overlay）
+
+`build_msvc_dbg` 18:57 构建含：`GetRFLAGSByte`、`lift_pushfq` 在 `SetMemoryValue` 之后对常数字节 `addValueReference`、`trackedBufferConstant` 对非 `ConstantInt` 做 `extractBytes` 折常数。
+
+| 配置 | add `0x140007210` + `entry_7210.dmp` |
+|---|---|
+| 完整改动 | ~8s；`output.ll` = `ret i64 1076726992`；`[ret] 0x40379500` `disp=-584` `rop=0`。无客户 `0x14000723e`。 |
+| 去掉 extract-fold，保留 pushfq overlay | 同样塌成 `ret i64 1076726992` / `disp=-584`。 |
+| 再去掉 pushfq overlay（只留未接线的 `GetRFLAGSByte`） | 恢复：`[ret] 0x14000723e` `disp=0` `rop=1`；IR `add i64 %RDX, %RCX` 再 `and` 低 32 位。 |
+
+原因：即使 8 字节 FLAGS 整体仍是符号，`addValueReference` 会把**已经是常数的 FLAG 字节**写进 byte buffer。后续小于 8 的 load / 未对齐 load 会把「半截 FLAGS」折成错常数，jcc 走错 handler。这和 `|= 0x202` 同类：用局部已知位冒充完整 EFLAGS。`usedFoldedExtract && combined.isZero()` 挡不住非零错常数。
+
+`GetRFLAGSByte` 仍在 `OperandUtils.ipp`，**没有**接到 `pushfq`。mix 的 217112 路径因此也还没修。不要把 overlay 接回去，除非 retrieve 在「有任一符号字节」时拒绝整段折常数（包括子宽度 load）。
+
+### 7.12.8 倒追 mix `0x410840` 的 `-`：源头是 `0x416691` 读未对齐 `[r9+8]`
+
+**倒着追，链已闭合到单条指令。** §7.12.6 只说 `217112` 的 `rdx` 是 `-`，没说 `-` 从哪来。往后（DR→lift）查不动，往前（lift→DR）两步就到根：
+
+`MERGEN_DIAG_RFLAGS`（新增，只听 `pushfq` + 那几个槽）打出来的东西：
+
+```
+[pushfq] rva=0x396B77 symbolic=[PF= %pf5197336 = icmp eq i64 0, %pf4197335,
+                               ZF= %zeroflag197330 = icmp eq i64 %realand-1078027935-, 0]
+        rflags_ir= %creatingrflag197343 = or i64 %creatingrflag197342, 512
+```
+
+`%realand-1078027935-` 里那个十进制数 = `0x41669F`，是**紧邻 `pushfq` 的那条指令的 VA**（`createAndFolder` 拿 `current_address` 拼名字），不是操作数。顺着它反汇编 `0x416687..0x4166a3`：
+
+```
+0x416687  mov r8, [r9]          ; r9 = 0x14fe66
+0x41668a  or  r10b, 0x7d
+0x41668e  or  r10b, sil         ; r10 -> 0x223ff
+0x416691  mov r10, [r9+8]       ; ★ 读 0x14fe6e：lift '-'/ DR 0xa02
+0x416695  not r8
+0x416698  cmc
+0x416699  not r10
+0x41669c  and r8, r10
+0x41669f  mov [r9+8], r8         ; 写回 0x14fe6e（写流 seq 15772 value '-'）
+0x4166a3  jmp 0x396b77           ; → pushfq → ZF/PF 符号化
+```
+
+**算术自洽**：`0x223ff & 0xa02 = 0x202` —— 正是 DR 在 `217112` 读到的值。`r10` 之所以该是 `0xa02`，全靠 `[r9+8]` 折出来。
+
+`mov r10, [r9+8]` 两侧输入完全相同（`r9` 都是 `0x14fe66`、前一条都是 `0x223ff`），**只有输出不同**：`0xa02` vs `-`。所以分歧点就是这一条 load，而它读的是**未对齐**（`0x14fe6e`，+6）的 8 字节，和它兄弟 `0x416687` 读的 `0x14fe66`（+6）一样未对齐。`r8` 的 `-` 是 `0x41669c` 的 `and` 传染的下游，不是独立故障。
+
+**注意**：`r10` 的 `-` 在 `0x416691` 就出现，`r8` 的 `-` 到 `0x41669c` 才出现——「谁先变符号」能区分根因与传染，别把 `r8` 当根。
+
+### 7.12.9 根因：qword 槽的**部分字节**从未被写过，`mov [r9],reg` 只写 8 字节对齐槽
+
+再往下一层，根因是**结构性的，不是 flag、也不是 unaligned fold**：
+
+`0x416691` 读 `0x14fe6e..0x14fe75`（8 字节，+6 未对齐）。写流里这 8 字节的 **1100 次**重叠写，**全部**落在两个 8 字节对齐槽 `0x14fe68` / `0x14fe70` 上——**没有任何一条写 `0x14fe6e` 本身**。而这两个槽的**最后一次写都是符号**：
+
+| 槽 | 最后一次写 | 指令 | 值 |
+|---|---|---|---|
+| `0x14fe68` | seq 16004 | `0x3932b5  mov qword ptr [r9], rdx` | `-` |
+| `0x14fe70` | seq 16000 | `0x367eaa  mov qword ptr [r9], rdx` | `-` |
+
+**但 `rdx` 当时是具体常数 `0x0`。** 寄存器流（`MERGEN_REG_STREAM_FILE`，记的是指令**尾**地址、重基形式）给出决定性证据：
+
+```
+=== 0x14fe68 <- rdx  (RDX written at reg-seq 166136) ===
+      seq 166133  0x402e7061   const 0x9d
+      seq 166134  0x402e7069   const 0x0
+    last CONSTANT rdx: seq 166134 at 0x402e7069 value 0x0
+```
+
+即：store 之前 2 次 `rdx` 写都是**已知常数**，store 却把整个 8 字节槽记成符号。insn 流同窗口（seq 192589–192593）也一致：
+
+```
+192589  0x2e7069  rdx=0x9d   r9=0x14fe58
+192590  0x2e706d  rdx=0x0    r9=0x14fe58
+192591  0x3932ad  rdx=0x0    r9=0x14fe58     ; sub r9,8
+192592  0x3932b4  rdx=0x0    r9=0x14fe50
+192593  0x3932b5  rdx=0x0    r9=0x14fe50     <== mov qword ptr [r9],rdx
+```
+
+所以 **`rdx` 不是根因**；`0x14fe6e` 这 8 字节该由谁写成 `0xa02`（`02 0a 00 00 00 00 00 00`）才是。`0xa02` 的高 6 字节是 0，说明真机上这 8 字节**大部分是零**，只有 byte6=`0x02`、byte7=`0x0a` 非零——而这两个字节正落在 `0x14fe68` 槽的**高 2 字节**。也就是说：真机这 8 字节是**两个槽拼接**的结果（`0x14fe68` 高 2 字节 + `0x14fe70` 低 6 字节），lifter 两个槽都记成符号，于是拼接不出来。
+
+**这解释了为什么 §7.12.7 的 overlay 方向是错的**：不是「8 字节 FLAGS 整体符号」的问题，而是 **VM 把一个逻辑 qword 拆在两个 8 字节槽里、且只更新其中一部分**。`GetRFLAGSByte` 那种「把已知字节折进去」正是这个形状，但 §7.12.7 已经证明直接接 `pushfq` 会让 jcc 走错 handler。
+
+**修复方向（三选一，按风险排序）**：
+
+1. **对齐写合并**（正解，最小面）：`mov qword ptr [r9], rdx` 在 r9 变化时只覆盖槽内 8 字节是对的；问题在**读**侧。`retrieveCombinedValueImpl` 的 `trackedBufferConstant` 要求 8 字节全 `ConstantInt`。可加一步：若 `0x14fe6e` 未被直接写过，则按 byte 分别从 `0x14fe68`(+6,+7) 和 `0x14fe70`(+0..+5) 取——**仅当每字节都是 `ConstantInt` 才折**。真机 `0xa02` 恰好满足。但要防 §7.12.7 那类「用局部已知字节冒充完整值」：必须逐字节判 `ConstantInt`，不能只判「非零/有 extract」。
+
+2. **让 store 保住具体性**：既然 `rdx` 是 `ConstantInt 0` 而 store 记成 `-`，先查 `insertMemoryOp` → `addValueReference(inst->getValueOperand(), …)` 这一路为什么没拿到 `ConstantInt`（`getValueOperand` 在 `O2` 前应是常数）。这是**最窄**的怀疑点，若成立则一改全链通。
+
+3. **别指望 fold**：`0x410840` 的 `rdx` 即使折不出 `0x202`，也应能靠 `pushfq` 写进 `[0x14fe6e]` 的**已知字节**反推。这条最复杂，收益最低。
+
+**下一步先做 (2)**：它能一句话验证「store 是否真的丢了 `ConstantInt`」。加一个只听 `r9∈{0x14fe68,0x14fe70}` 的 store 探针，打 `getValueOperand()` 的 `isa<ConstantInt>` 与 IR，即可判定走 (1) 还是 (2)。
+
+### 7.12.10 决定性结果：store 没丢常数，是**两个槽的值本来就都不是 `0xa02`**
+
+`MERGEN_DIAG_SLOTSTORE`（只听 `0x14fe68` / `0x14fe70`）打出来：
+
+```
+[slotstore] rva=0x3932b5 slot=0x14fe68 isConst=0 ir=  %134920 = zext i32 %134186 to i64
+[slotstore] rva=0x367eaa slot=0x14fe70 isConst=0 ir=i64 %RSI
+```
+
+所以 (2) 被否证：store 收到的确实是符号，但**原因不是「丢了已知常数」**。`0x14fe68` 那个 `zext i32` 里 `%134186` 是**被 zext 之前的 32 位值**，它本身可能折叠，但 zext 后不再是 `ConstantInt`，`trackedBufferConstant` 的逐字节 `dyn_cast<ConstantInt>` 就直接 `return nullptr` 了（`GEPTracker.ipp:320`）。
+
+**真正的根因在 `0x14fe70` 那个槽**，而且比前面想的严重：
+
+| | `0x14fe68` ← rdx @`0x3932b5` | `0x14fe70` ← rsi @`0x367eaa` |
+|---|---|---|
+| DR（真机） | `rdx = 0x7ff5e0460000` | `rsi = 0x7ff720574a44` |
+| lift | `0x0` | `0x140114a44` |
+
+**两边存进去的就不是同一个东西。** `0x14fe70` 真机存的是**堆指针** `0x7ff720574a44`，lift 存的是 `0x140114a44`——**模块内地址**。低 20 位 `0x114a44` 恰好一致，但高 32 位被换成了模块基址。这是**地址来源错误**，不是精度丢失：值"具体"但语义完全错。
+
+这解释了为什么 `0x410840` 读出 `0x202` 这么难：真机 `0x14fe6e..0x14fe75` = `02 0a 00 00 00 00 00 00`，其中高 6 字节为 0，说明**真机上这两个槽在那个时刻的有效部分已经被清零**（`0x14fe68` 的高 2 字节 = `02 0a`，`0x14fe70` 低 6 字节 = 0）。而 lift 的 `0x14fe68` 是 `0x0`（丢了这 2 字节）、`0x14fe70` 是堆指针（不该有值），**拼不出** `0xa02`。
+
+**堆指针被系统性改写的规模**（`0x7ff7…` → `0x1401…`）：
+
+| 寄存器 | lift 中形如 `0x1401xxxxx` 的次数 |
+|---|---|
+| `r9` | 88575 |
+| `rsi` | 40636 |
+| `rax` | 20871 |
+| `r8` | 12786 |
+| `rdx` | 4574 |
+| `r10` | 4469 |
+
+且 `rsi` 在 DR 上 **100% 具体**（502492/502492），lift 只有 94.8%；`rdx` DR 100%，lift 80.2%。
+
+**结论：根因是堆指针的 provenance 被换成模块基址，不是 flag 折叠、不是 unaligned fold、也不是 store 丢常数。** 之前 §7.12.6–7.12.8 全部在下游找错了目标。
+
+**修复方向随之改变，按优先级**：
+
+1. **堆地址归一化**（真正的根）：DR 的 `0x7ff720574a44` 与 lift 的 `0x140114a44` 必须能互转。查 `lifter/memory/` 里把文件/堆 VA 折成 lifter 内部地址的代码（`normalizeRuntimeTargetAddress` / `shouldPromoteFileValue` 一线），确认它对**非映像基址**的堆地址做了什么。低 20 位一致说明映射偏移是 `0x140000000 - 0x7ff700000000 + …` 之类的固定重定位，逻辑上可逆。
+
+2. **`zext i32` 的常数回折**（次要，但独立有效）：`0x14fe68` 那个 store 写的是 `zext i32 %v to i64`。`trackedBufferConstant` 逐字节 `dyn_cast<ConstantInt>` 见到 `zext` 就返回 null，即使 `%v` 是常数。给它加一条 "zext/sext of ConstantInt" 的回折即可独立修好 `0x14fe68`。**注意**：这与 §7.12.7 被撤回的 overlay 是同一类改动，必须逐字节校验，不得用局部已知字节冒充完整 qword。
+
+3. **`0x202` 的最后 4 字节从别处补**：`0x14fe70` 在真机该时刻低 6 字节为 0。若 (1) 修好，`0xa02` 会自然拼出；不要为此再加 overlay。
+
+**下一步做 (1)**：加一个只听 r9/rsi 携带堆指针的探针，打 lifter 内部把堆 VA 折成什么、走的哪个函数。这是唯一能把 88575 次 `r9` 改写定位到具体函数的方法。
+
+### 7.12.11 ❌ 撤回 7.12.10 的「堆指针被换成模块基址」
+
+**7.12.10 的根因判断是错的。** 我当时把手算的差值当成了验证结果。实测否证：
+
+```
+DR rsi    = 0x7ff720574a44
+lift rsi  = 0x140114a44
+difference= 0x7ff5e0460000   （碰巧等于该点 DR 的 rdx）
+DR rsi - ASLR_slide = 0x280114a44  → 不是 lift 的 rsi
+低 16 位相同 = 0x4a44 ；低 20 位不同
+DR 轨迹里 rsi == 0x140114a44 的行数：0
+```
+
+三条独立否证：(a) 减去 ASLR slide **得不到** lift 的值；(b) `0x140114a44` 在 DR 轨迹中**从未出现**；(c) lifter 在 seq 191742（远早于故障点 217075）就已是 `0x140114a45`。**它们不是同一值的重定位，是两个不同对象。**
+
+**还错在把 DR 当基准。** 两条流 RVA 100% 对齐（221160/221160），但寄存器从**第 0 条**（`0x7450` 客户入口）就全不同：
+
+```
+rva 0x7450:  DR rbx=0x1fc45d23d40  rsp=0x11eb8ffe08   ← 真机进程状态
+             lift rbx=-  rsp=0x14fea0                ← 空寄存器 + 伪栈顶
+```
+
+这是**设计如此**（`STACKP_VALUE` 伪栈）。所以「DR 有 X / lift 无」在本样本上**不是 lifter 缺陷的证据**。§7.12.9 那句「两边存进去的就不是同一个东西」也一并作废。
+
+### 7.12.12 ❌ 前提被 7.12.13 实测推翻：不是「cast 丢常数」，是真符号
+
+不依赖 DR，只看 lifter 自己。`MERGEN_DIAG_SLOTSTORE` 的 321 条 `0x14fe68`/`0x14fe70` store，按 IR 形态分类：
+
+> **⚠️ 本节的分类方法有缺陷**，见 §7.12.13。表中「源操作数已是字面量」是错的——我用正则把 SSA 名字也替换成了 `N`，实际源操作数是符号。**本节结论作废，以 §7.12.13 为准。**
+
+| 形态 | 数量 | ~~能否折~~ |
+|---|---|---|
+| `trunc i64 <常数> to i32/i16` | 38 | ~~本该能折~~ **否，源是符号** |
+| `trunc i64 %newreg to i32` | 11 | 源符号，真实不可折 |
+| `or i64 %creatingrflag…`（RFLAGS 重组） | 26 | 不可 naive 折 |
+| `i64 %RSI` / `%RBP` / `%RDI` / `%RAX` | 8 | 真实符号 |
+| `select i1 %c, i64 <const>, i64 <const>` | 13（10 两臂皆常数） | 条件符号，可后续折 |
+| `zext i32 %v to i64` | 2 | ~~本该能折~~ **否，源是符号** |
+
+`isConst=1` 有 218 条，说明 store 侧**能**拿到常数——不是全盘失效。
+
+**（已作废的）故障链推断**：`0x14fe68` 槽被 `zext`/`trunc` 包着的常数写成非 `ConstantInt` → `0x14fe70` 槽是 `i64 %RSI` → `0x416691` 读未对齐 `0x14fe6e..0x14fe75` 必须跨槽合并（VM 从不写 `0x14fe6e` 本身，1100 次重叠写全落在两个对齐槽）→ `trackedBufferConstant`（`GEPTracker.ipp:291-326`）逐字节 `dyn_cast<ConstantInt>` 见到非 `ConstantInt` 立刻 `return nullptr` → 整段不折 → `r10` 符号 → `and` 传染 → `pushfq` 的 ZF/PF 符号化 → `0x410840` 读出 `-` 而非 `0x202`。
+
+**仍然成立的部分**：`0x14fe6e` 是未对齐读、VM 只写 8 字节对齐槽、因此必然依赖跨槽合并——这三点是实测事实（该 8 字节的 1100 次重叠写全部落在 `0x14fe68`/`0x14fe70`）。**不成立的部分**：跨槽合并失败的原因不是「常数被 cast 丢掉」，而是那两个槽本来就是符号。
+
+### 7.12.13 ❌ 实施 (A) 后实测无效：可被 cast 折叠的 store 是 **0 条**
+
+按 §7.12.12 实现了 `peelToConstantInt`（在 `addValueReference` 里、写入 buffer 之前，只放行 `trunc`/`zext`/`sext` + 常量条件的 `select`，显式拒绝 `and`/`or`/`shl`/`lshr`），加 `MERGEN_DIAG_PEEL` 探针。编译通过，但：
+
+```
+peel fired: 0
+mix output.ll SHA256: 11C03F153C3C...   ← 与改动前逐字节相同
+```
+
+**§7.12.12 的前提是错的。** 我用 `re.sub(r"%?\d+", "N", ir)` 抽象 IR 形态分类，把 **SSA 名字和类型宽度** 一起替换成了 `N`：
+
+```
+%134920 = zext i32 %134186 to i64
+          ^^^^^^  ^^^^  ^^^^^^  ^^^^  ^^^^^
+          临时名  源类型 操作数  目标类型  ← 两个 N 是类型宽度，不是操作数
+```
+
+于是 `trunc i64 %x to i32` 被我读成「`trunc` 的源操作数**已经是常数**」。实际源操作数是 `%x`，**符号**。
+
+321 条 store 的诚实分类：
+
+| 形态 | 数量 | peel 能否折 |
+|---|---|---|
+| plain constant | 208 | 已是 `ConstantInt`，无关 |
+| `trunc`/`zext` **符号源** | 51 | **不能**（源真符号） |
+| `or`/`lshr`（RFLAGS 重组） | 27 | **故意不折**（§7.12.7 的坑） |
+| `select` 符号条件 | 13 | 不能（条件 `%138038` 等是符号） |
+| 裸寄存器 `%RSI`/`%RBP`/… | 12 | 不能 |
+| 其它窄常数（`i16`/`i32`） | 10 | 无关 |
+| **cast 源为常数** | **0** | — |
+
+13 个 `select` 的条件全是符号（`%138038` ×10、`%92289` ×2、`%103191` ×1），没有一个是常量条件。
+
+**结论：那两个槽在故障时刻是「真符号」，不是「被 cast 丢掉的常数」。** 故障链第 1 环（§7.12.12 写的「cast 包着的常数写成非 `ConstantInt`」）不存在，因此 (A) 无效是正确的实测结果，不是实现 bug。
+
+**代码处置：`peelToConstantInt` 保留。** 它语义正确、有价值（防止将来出现「已知常数被 cast 包一层」时静默丢具体性），零输出、零行为变化（实测哈希不变），且带 `MERGEN_DIAG_PEEL` 开关可复验。但**它不是 mix 故障的修复**，不要当成修复引用。
+
+### 7.12.14 剩下的唯一可查点：`%138038` 与 `%134186` 的来源
+
+故障时刻两个槽的符号源已经定位到具体 SSA 值：
+
+- `0x14fe68` 末写 @`0x3932b5`：`zext i32 %134186 to i64`
+- `0x14fe70` 末写 @`0x367eaa`：`i64 %RSI`
+- 另有 13 个 `select` 全部以 `%138038` 为条件（同一条件反复出现，值固定），`%138038` 显然是个**被反复复用的 VM 谓词**
+
+注意 `0x14fe68` 槽在 seq 216303（`0x3932b5` 之前的一次执行）写的是**常数 `0x0`**，而 seq 219981 变成 `zext %134186`。**同一个 slot 两次执行、`rdx` 一次具体一次符号**——这不是 fold 规则问题，是 `%134186` 在两次执行间从「具体」变成了「符号」。
+
+**下一步该查的是 `%134186` 和 `%138038` 的定义**：它们在 IR 里是哪个函数/哪个基本块产生的、上游是什么。如果它们是**路径求解/分支决策**的产物而非真正的数据依赖，那根因就在路径求解而不在内存模型——之前所有查法都在内存侧（`trackedBufferConstant`、跨槽合并、store 具体性），方向一开始就错了。
+
+查法：给 `MERGEN_DIAG_SSA58`（已有的真实 SSA use-def 上溯探针）指到 `%134186`，或直接在 lift 结束时 dump 这两个值的定义点。**先确认它们是不是 path-solve 产生的**——这决定后续是查内存模型还是查 PathSolver。
+
+**下一步该查的**（不是 flag 折叠）：`0x14fe6e..0x14fe75` 这 8 字节该由谁写成一个可折常数。写流里这 8 字节的 550 次重叠写中，`seq < 217075` 的最后一次是 `0x403932b5` 写 `0x14fe68` 值 `-`；`0x14fe6e` 本身在 `seq 15724`（`0x403330a6`）写过常数 `0x213`，之后被符号写覆盖。这才是要收敛的地方。（**注**：本节拿 DR 的 `rsi`/`rdx` 与 lift 对比的推断已在 §7.12.11 撤回——DR 是真机进程状态、lift 是伪栈，从入口起就不是同一个机器。真正的根因见 §7.12.12。）
+
+**本次只加诊断，不改语义。** 验证：默认（无 env）`mix 0x140007450` 仍 `221160 insns / 22317 blocks_attempted`，`output.ll` SHA256 `11C03F15…`。`test.py quick` / `micro` 本机跑不了（缺 NASM、`LLVM_DIR` 未设），与本改动无关。
+
+**顺手修掉的诊断 bug**：`addValueReference` 的写流门是 `current_address >= 0x140000000`，但 lift 把映像重基到 `0x40000000`，所以 `MERGEN_WRITE_STREAM_FILE` 只会记下 3 行 setup 写、没有任何按指令的行（写流等于不可用）。改成 `0x40000000..0x50000000` 后同一趟记 32164 行。同理，任何按指令卡点的探针都必须比 `maskedRVA()` 而不是裸地址，否则在重基 lane 上静默不触发——本次先踩了这个坑才误判「`pushfq` 一次都没执行」。
+
+### 7.12.15 FLAGS 链：167342 的 `0x206` 不是 164799 留下的 RFLAGS
+
+对照：`build_msvc_dbg\mix_lift_insn.csv` + `mix_lift_wr.csv`，DR `vmptest\mix_dr_insn_rerun.csv`。写流按 **RVA 访问下标 zip insn seq**（不能用「该 RVA 最后一次命中」）。insn 列是指令前快照。scratch `[rsp+disp]` 的基是 **`0x14fc60`**（`0x10→0x14fc70`，`0x48→0x14fca8`，`0x60→0x14fcc0`，`0xa0→0x14fd00`），不是 `STACKP 0x14fea0`。
+
+停在 221157 的 `rdx=-` 往前是同一套 VSP NAND / scratch 反复中毒。紧挨 FLAGS 的那一环：
+
+| seq | RVA | 做什么 | lift | DR |
+|---|---|---|---|---|
+| 167251 | `0x331230` | `mov rcx, [rsp+rax]` `rax=0x10` → `0x14fc70` | `-` | `0x206` |
+| 167253 | `0x33123b` | `mov [rdi], rcx` `rdi=0x14fe5c` | 写 `-` | 写 `0x206` |
+| 167311 | `0x36f18a` | `mov [rdi], rcx` `rdi=0x14fe54` | 写 `-` | 写 `0x206` |
+| 167342 | `0x3891a8` | `mov rsi, [rdi]` `rdi=0x14fe54` | `-` | `0x206` |
+| 167346 | `0x3891b4` | `mov rdx, [rdi+8]` → `0x14fe5c` | `-` | `0x206` |
+| 167350+ | `0x3891c2`… | `not rsi` / `not rdx` / `or`（NAND-or 形） | `-` | `~0x206 = 0xfdf9` |
+| 167359 | `0x3891e0` | `mov [rdi+8], rsi` → `0x14fe5c` | 写 `-` | 写 `0xfdf9` |
+
+**两边是同一份 scratch，不是两个独立 FLAGS。** `0x206 NAND 0x206` 在 DR 上就是 `0xfdf9`，对上 167857 那次 64-bit NAND 读 `0x14fe5c` 的 `0xfdf9`（`~0x206`）。
+
+scratch `0x14fc70` 最后写入是 **166407** `mov [rsp+rbx], r8`（`rbx=0x10`）。`r8` 来自 **166380** `mov r8, [rdi]`，`rdi=0x14fe5c`。那一格是 **166350** `pop [rdi]`，紧跟 **166346** `pushfq`。
+
+`pushfq` 抓的不是 AND 的 FLAGS，而是 **166341** `shld rax, rbp, cl` 的 FLAGS。三个操作数在 lift 里都已经是 `-`。DR 上 `shld` 结果 `0x131f6340a0`，FLAGS **碰巧也是 `0x206`**（PF+IF+reserved1）。
+
+`rax` 来自 **166331** `mov rax, [rdi]`，`rdi=0x14fe5a`（未对齐），值是 VM dword **`0x98fb1a05` vs `-`**：
+
+- 166258 `mov [rdi], rsi` 把 VSP 指针 `0x14fe62` 压到 `0x14fe5a`
+- 166293 `mov rbp, [rdi]` / 166296 `mov r8, [rbp]` 解引用得到 `0x98fb1a05`
+- 166300 `mov [rdi], r8` 写回 `0x14fe5a`
+
+`0x98fb1a05` 更早在 **163042** `mov ebx, [rsp+rax]`（`rax=0x50` → `0x14fcb0`）就已经是 `-`，163045 写进 `0x14fe70`，165092 `mov eax, [rdi]` 读出来做 32-bit NAND（165102 `and eax, ebp`）。所以 167342 的 `0x206` 是 **已经符号的 VM dword 再经 `shld` 产出的 FLAGS**，不是 164799 那次真实 RFLAGS 留下来的。
+
+**真正 concrete 的 FLAGS 被盖掉了，不是 `pushfq` 算不出：**
+
+| seq | 写什么 | lift |
+|---|---|---|
+| 163956 | `[rsp+0x10] = r8 = 0x207` | concrete |
+| 164799 | `pop [0x14fe5c] = 0x206` | concrete |
+| 166880 | `pop [0x14fe54] = 0x217`（`add rax,rbp` 得到 `0xd4` 之后） | **concrete** |
+| 165343 | `[rsp+0x10] = r8 = 0x286` | 已是 `-`（scratch FLAGS 更早一次变符号；167342 不用这份） |
+| 166350 / 166407 / 167311 | 用 shld-FLAGS `0x206` 盖掉上面那些格 | `-` |
+
+166880 证明：**操作数 concrete 时 `pushfq` 能写出 concrete FLAGS**（这里是 `0x217`）。167342 的洞不在 FLAGS 语义，而在 `shld` 的输入 dword 已经是 `-`。不要 FLAGS 分字节 overlay（§7.12.7）、不要 `GetRFLAGSValue |= 0x202`。`0x98fb1a05` 的来源见 §7.12.16。
+
+### 7.12.16 `0x98fb1a05` 是嵌套 32-bit NAND，原料早已是符号
+
+`0x98fb1a05` 不是 FLAGS。NAND 算术自洽；lift 两侧 load 都是 `-`。
+
+接到 163042：
+
+| seq | RVA | 做什么 | lift | DR |
+|---|---|---|---|---|
+| 161456 | `0x3704b8` | `mov eax, [rdi]` `rdi=0x14fe6c` | `-` | `0x98fb1a05` |
+| 161484 | `0x37051c` | `mov [rsp+rcx], eax` `rcx=0x50` → `0x14fcb0` | 写 `-` | 写 `0x98fb1a05` |
+| 163042 | `0x42697f` | `mov ebx, [rsp+rax]` `rax=0x50` | `-` | `0x98fb1a05` |
+| 163045 | `0x42698c` | `mov [rdi], ebx` → `0x14fe70` | 写 `-` | 写 `0x98fb1a05` |
+
+161290 `mov ax, [rdi]`（`rdi=0x14fe5a`，字 `0x78`）也会把 `rax` 变成 `-`，但 **161456 整 32 位覆盖**，stash 用的是这次 load，不是那次 16-bit。
+
+`0x14fe6c` 最后写入 **160126** `mov [rdi+8], eax`（`rdi=0x14fe64`），即下面这次 NAND 的结果：
+
+| seq | 指令 | DR |
+|---|---|---|
+| 160108 | `mov eax, [rdi]` `rdi=0x14fe68` | `0x6704edff` |
+| 160110 | `mov edx, [rdi+4]` → `0x14fe6c` | `0xfffff7fa` |
+| 160116 | `not eax` | `0x98fb1200` |
+| 160120 | `not edx` | `0x805` |
+| 160122 | `or eax, edx` | `0x98fb1a05` |
+
+`~0x6704edff | ~0xfffff7fa = 0x98fb1a05`。
+
+这两个操作数各自还是更早一次 `not`/`or`：
+
+- `0x6704edff` ← 160015 `or eax, edx` 后 160016 写入 `0x14fe68`：`0x4c7d | ~0x98fb5678`
+- `0xfffff7fa` ← 159590 `or eax, edx` 后 159591 写入 `0x14fe6c`：`~0x4c7d | ~0x98fb5678`
+
+共同原料两份 scratch（`edx` 比 `eax` 先死，和后面 `0x8ccc*` 链同一形态）：
+
+| 值 | 第一次变成 `-` 的 load | scratch 来源 |
+|---|---|---|
+| `0x98fb5678` | 159278 `mov ebx, [rsp+rax]` `rax=0x60`；edx 在 **159392** `mov edx, [rdi+4]` 先死 | `0x14fcc0`，最后写入 **148834** `mov [rsp+rcx], eax`（`rcx=0x60`），`eax` 当时已是 `-` vs `0x98fb5678`。该槽上次 concrete 写是 133106 的 `0x1402b8ec4` |
+| `0x4c7d` | 159844 `mov ebx, [rsp+rax]` `rax=0x50`；eax 在 **159885** `mov eax, [rdi]` `rdi=0x14fe60` 才死 | `0x14fcb0`，最后写入 **157734** 同一 stash handler，`eax` 当时已是 `-` vs `0x4c7d` |
+
+**下一步：** `0x98fb5678` 在 148834 之前、以及 `0x4c7d` 在 157734 之前，是哪次 load 把 `eax` 弄成 `-`。不要再往 `pushfq` 上修。
+
+### 7.12.17 根因合拢：符号从 mix 参数 `%RCX` 进来；`--reg rcx=0x12345678` 能越过 221160
+
+FLAGS / NAND / `0x98fb1a05` / `0x4c7d` / `0x98fb5678` 都是 **mix 的 xorshift 数据流**，不是 `pushfq` 坏了。
+
+`test.cpp`：`mix(uint32_t seed)` 做 8 轮 `seed^=seed<<13; ^=seed>>17; ^=seed<<5`，`main` 调 `mix(0x12345678u)`。Win64 第一参在 **RCX**。客户入口 seq 3 `mov ebx,ecx`：DR 从 seq 1 起 `rcx=0x12345678`；lift 的 `%RCX` 是函数参（insn 列为 `-`）。后面 `0x12345678<<13 = 0x8acf0000`、拼出 `0x98fb5678`、`>>17` 得到 `0x4c7d`，再经 VM NAND 变成 `0x98fb1a05`，`shld` 的 FLAGS 才变符号。221157 `add r11,rdx` 的 `rdx=-` 是这条链的下游。
+
+两条路：
+
+1. **诊断**：lift 入口在 `InitRegisters` 之后把 RCX 写成 `ConstantInt`（CLI `--reg`，值不要写进 handler）。
+2. **通用**：保持 `%RCX` 符号，修 VIP 槽不要把数据槽当 VIP 吃掉。
+
+**已做 (1)。** 通用开关，不特判 mix：
+
+```
+lifter.exe … 0x140007450 --mem-dump entry_7450.dmp --reg rcx=0x12345678
+```
+
+`ParseResult::entryRegs`；`ecx`/`rcx` 都落到 `RCX`。`MERGEN_MAX_BLOCK_BUDGET=131072`。
+
+| | 无 `--reg` | `--reg rcx=0x12345678` |
+|---|---|---|
+| 块 / 指令 | 22317 / 221160 | **41816 / 405604** |
+| error | 0 | 0 |
+| 客户 `ret` | 无（停在 `0x35a716` `push r11; ret`，`disp=-584` `rop=0`） | 仍无；末条仍是 `disp=-584` `rop=0` |
+| 优化 IR | 符号 ZF 在两个常数 RIP 间 `select` | **`bb1: br bb1` 死循环**（`output.ll`） |
+
+期望 `mix(0x12345678)=0xc5186e29` **没有**出现在优化 IR。末段 VIP 在 `0x403c4b78` ↔ `0x14008b4aa` 来回（`[lmlrep]`，`confirm=1`），`GEPTracker.ipp:898 max_unknown : 0`。
+
+**(1) 证明：把参数折死，xorshift/NAND/FLAGS 链能继续 lift，旧停点 221160 不是 handler 特判能修的洞。** 它不能当通用解：真实 mix 入口 RCX 应保持符号。下一步仍是 (2) VIP 取回，不要 unique-fold / VIP overlay / STACKP±8 / `GetRFLAGSValue |= 0x202`。
+
+### 7.12.18 试过「未对齐槽拼接」：博客要的是字节级 store-forward，peel 宽度修了但 mix 不动
+
+Aftermath Themida 篇（work.md 0.5）对内存模型的原话：
+
+> Propagation is modeled at the **byte level**, so overlapping stores are handled correctly. A narrow store that partially overlaps a wider load is composed properly rather than silently producing a stale or incorrect value.
+
+NaC-L / `DEVIRT_STRATEGY.md` 同一条：concolic buffer 按字节跟踪先前 store，允许部分重叠。**不是** VIP overlay，也不是 `GetRFLAGSValue |= 0x202`。
+
+已有 `peelToConstantInt` 只走 cast/select，**不**折 or/shl FLAGS 链（§7.12.7）。但 `zext i32 C to i64` 剥出来的是 **32 位** `ConstantInt`，`addValueReference` 因宽度不等拒收，`trackedBufferConstant` 见到 zext 就 bail。这和博客「重叠要能拼」相反：槽里明明是整常数，未对齐 load 却拼不出。
+
+**改动**（`GEPTracker.ipp`）：peel 把 zext/sext/trunc **按目标宽度**做成同宽 `ConstantInt`；`trackedBufferConstant` 对非 `ConstantInt` 也 peel。仍逐字节全 `ConstantInt` 才折，有任一符号字节整段保持符号。
+
+**无 `--reg` 实测 mix `0x140007450` + dump：** 仍 **22317 / 221160**，末 `ret` 仍 `0x4035a716` `disp=-584`。insn 流相对改前 **0 行多出具体值**；217113 `rdx`、218543 `r10` 仍是 `-`。add `0x140007210` 仍是 `add i64 %RDX, %RCX` + 低 32 `and`，没有 §7.12.7 那种塌成常数 RIP。
+
+**为什么不够：** §7.12.10 已写过，`0x14fe70` 那次 store 的 IR 是 `i64 %RSI`（符号），不是 cast 包着的常数。peel 只修「整段已知却被 zext 挡住」；跨槽 load 只要邻居有一字节是 SSA，按 7.12.7 规则就**不该**折。VIP 槽在 218543 被 `-` 盖掉，根因仍是数据 SSA 进了控制槽，不是 peel 宽度。
+
+保留 peel（通用、add 不回归）。下一步不是再 overlay FLAGS，而是让 VIP 取回在数据槽为 SSA 时仍读出具体指针（或避免把 SSA 写进 VIP 槽）——仍禁止 unique-fold / VIP overlay / STACKP±8 / `|= 0x202`。
+
+### 7.12.4 早期 `movabs` / overlay（已否证为「把 PC 拓宽就能修 mix」）
+
+seq 43 `0x3e28a1` `movabs rbx, imm64`：dump 已是 `0x7ff5e0460000`，文件是 0。lift rbx=0。拓宽 PC / 拒 FileReader underflow 后 mix 的 movabs 对了，但 add 从 ~26069 块客户 `ret` 塌成 11 块 Unresolved ROP。已 `git checkout HEAD -- FileReader.hpp LifterClass.hpp LifterStages.hpp`。mix 前 221160 条 PC 仍对齐，停在 7.12.5→7.12.3，不是取指 RVA 分叉。
+
 ## 7.8 诊断基础设施（默认关闭，零输出）
+
 
 | 环境变量 | 产物 | 用途 |
 |---|---|---|
@@ -1425,6 +1899,9 @@ insn 流有 `0x7231`（真机 `lea eax,[rbx+rdi]`）再 `0x723e`。lift 从函�
 | `MERGEN_READ_STREAM_FILE` | 读流 `R,insn,addr,size_bits` | 与 DR `-trackmem` 读侧对齐 |
 | `MERGEN_DIAG_BYTE` | 单指令字节读 | 只听 `0x14033578E` |
 | `MERGEN_DIAG_SSA58` | 真实 SSA use-def 上溯 | 深度 8 / 200 节点上限 |
+| `MERGEN_DIAG_RFLAGS` | 哪些 flag 位是符号 + 其 IR | 只听 `pushfq` @`0x396B77` 与 `0x14fe6{0,6,8}` / `0x410840` 几个槽（§7.12.8） |
+| `MERGEN_DIAG_SLOTSTORE` | store 操作数的真实 IR 类型 | 只听 `0x14fe68` / `0x14fe70` 两个 qword 槽（§7.12.10、§7.12.12） |
+| `MERGEN_DIAG_PEEL` | cast 折叠生效处 | 打印 `peelToConstantInt` 折成的值（§7.12.13；实测在 mix 上触发 0 次） |
 
 **两条流共用 `nextMemEventSeq()`（`mergen_events::memEventSeq`）**，
 序号在同一执行轴上，可按 seq 合并成一条时间线 —— 这是定位
@@ -1438,6 +1915,19 @@ insn 流有 `0x7231`（真机 `lea eax,[rbx+rdi]`）再 `0x723e`。lift 从函�
 构建脚本：`D:\sogen\dr\build_vmpdrtrace7.bat`（输出 `vmpdrtrace7.dll`）。
 
 lifter 侧默认会打 `[tramp]` / `[vip] pre`（定位用，未关）。不要开 `MERGEN_DIAG_LIFT_PROGRESS`。
+
+**所有按指令卡点的探针都必须比 `maskedRVA(va)`，不能比裸地址。** lift 把映像重基到
+`0x40000000`，写死 `0x140000000` 的探针在重基 lane 上静默不触发——0 命中看起来像
+「那段代码没执行」，实际是基址不匹配（§7.12.8 踩过）。`OperandUtils.ipp` 提供了
+「怎么修」的当前状态见 §7.12.13（cast 折叠实测无效）、§7.12.15（167342 的 `0x206` 是 shld 在已符号 dword 上的 FLAGS）与 §7.12.16（`0x98fb1a05` 是嵌套 32-bit NAND，原料 `0x98fb5678`/`0x4c7d` 进 NAND 前已是 `-`）。§7.12.14 的 SSA `%134186`/`%138038` 不是当前主线。
+
+**别拿 DR 的寄存器值当基准**：DR 是真机进程状态（入口 `rbx=0x1fc45d23d40`、`rsp=0x11eb8ffe08`），lifter 是空寄存器 + 伪栈 `rsp=0x14fea0`。两条流 RVA 100% 对齐，但寄存器从第 0 条就不同，这是设计如此。「DR 有 X / lift 无」不是缺陷证据（§7.12.11 实测否证）。
+
+**别用正则抽象 IR 形态再分类**：§7.12.12 就是这么错的——`re.sub(r"%?\d+", "N", ir)` 把 SSA 名字和类型宽度一起替换，于是 `trunc i64 %x to i32` 被读成「源操作数是常数」。要按**操作数结构**分类，不是按字符串形状。
+
+`maskedRVA` / `flagBitNames` / `irText` 三个 helper 现在在
+`lifter/core/LifterDiagHelpers.hpp`（因为 `OperandUtils.ipp` 与 `GEPTracker.ipp` 互相
+include，helper 不能只放在其中任一处）。
 
 ## 8. 待清理
 

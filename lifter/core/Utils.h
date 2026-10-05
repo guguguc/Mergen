@@ -6,6 +6,7 @@
 #include <llvm/Support/raw_ostream.h>
 #include <string>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 // #define _NODEV why?
@@ -95,6 +96,8 @@ namespace argparser {
     bool concretizeUnsafeReads = false;
     std::vector<uint64_t> outlineAddresses;
     std::string memDumpPath;
+    // Canonical 64-bit GPR names (RCX, RDX, ...) applied after InitRegisters.
+    std::vector<std::pair<std::string, uint64_t>> entryRegs;
     std::vector<std::string> errors;
 
     [[nodiscard]] bool ok() const { return errors.empty(); }

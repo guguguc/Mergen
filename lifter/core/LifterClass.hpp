@@ -2246,7 +2246,10 @@ public:
                                  llvm::Value* value,
                                  const std::string& address = "");
                                  */
+  llvm::Value* GetRFLAGSByte(unsigned byteIndex);
   llvm::Value* GetRFLAGSValue();
+  void dumpRflagsDiag(const char* tag, uint64_t rva,
+                      llvm::Value* rflagsIr = nullptr, uint64_t extraAddr = 0);
 
   llvm::Value* getSPaddress() { return GetRegisterValue(Register::RSP); }
   llvm::Value* getSP() { return getPointer(getSPaddress()); };

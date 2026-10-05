@@ -5849,6 +5849,65 @@ bool runGeneralizedLoopLocalValueReturnsConcreteStackBufferValueByteCountOne(
   return true;
 }
 
+// The VMP dispatcher saves RFLAGS into an *unaligned* pseudo-stack slot and
+// reloads the qword a few instructions later. GetRFLAGSValue() ors together
+// mostly-constant flags with the odd symbolic one, so the pushed i64 is a
+// genuine SSA value; the tracked-buffer splice must rebuild it on reload.
+// Falling out to a raw LoadInst is what silently poisons the register stream
+// mid-VM (mix 0x140396b80 pop qword ptr [r9] -> 0x140410840 mov rdx, [r9]).
+bool runPushFflagsPseudoStackQwordReloadResolvesAsSSA(std::string& details) {
+  LifterUnderTest lifter;
+  auto& context = lifter.context;
+  auto* entry = llvm::BasicBlock::Create(context, "entry", lifter.fnc);
+  lifter.builder->SetInsertPoint(entry);
+
+  // One symbolic flag (derived from an argument, so it cannot constant-fold)
+  // plus the concrete flags InitRegisters installs. The or-chain this
+  // produces is exactly the shape pushfq stores mid-VM.
+  auto* symbolicFlag = lifter.builder->CreateICmpNE(
+      lifter.GetRegisterValue(RegisterUnderTest::RDX),
+      llvm::ConstantInt::getSigned(llvm::Type::getInt64Ty(context), 0),
+      "zf.sym");
+  lifter.SetFlagValue_impl(FLAG_ZF, symbolicFlag);
+  lifter.SetFlagValue_impl(FLAG_CF, llvm::ConstantInt::getTrue(context));
+
+  auto* pushed = lifter.GetRFLAGSValue();
+  if (llvm::isa<llvm::ConstantInt>(pushed)) {
+    details = "  GetRFLAGSValue folded to a constant despite a symbolic ZF; "
+              "the test would not exercise the byte-splice path\n";
+    return false;
+  }
+
+  constexpr uint64_t unalignedSlot = 0x14FE6EULL;
+  lifter.SetMemoryValue(makeI64(context, unalignedSlot), pushed);
+
+  auto* reloaded = lifter.GetMemoryValue(makeI64(context, unalignedSlot), 64);
+  if (llvm::isa_and_nonnull<llvm::LoadInst>(reloaded)) {
+    details = "  unaligned qword reload of the pseudo-stack slot fell back to "
+              "a raw LoadInst; the tracked i64 should have been spliced back "
+              "into an SSA value\n";
+    return false;
+  }
+  if (!reloaded) {
+    details = "  unaligned qword reload of the pseudo-stack slot returned "
+              "null\n";
+    return false;
+  }
+
+  // Sub-width reloads of the same unaligned slot must also resolve, since
+  // the VM reads these slots at 1/2/4/8 byte widths.
+  for (unsigned bits : {8u, 16u, 32u}) {
+    auto* part =
+        lifter.GetMemoryValue(makeI64(context, unalignedSlot), bits);
+    if (llvm::isa_and_nonnull<llvm::LoadInst>(part)) {
+      details = "  unaligned " + std::to_string(bits) +
+                "-bit reload fell back to a raw LoadInst\n";
+      return false;
+    }
+  }
+  return true;
+}
+
 // load_generalized_backup moves loop-local stack bytes into
 // activeGeneralizedLoopLocalBuffer while keeping non-local bytes in the
 // main buffer. This covers the direct extractLocalStackBuffer +
@@ -11192,6 +11251,8 @@ bool runComputePossibleValuesOnRolledArithmeticChain(std::string& details) {
              &InstructionTester::runSolvePathWidensMappedRvaTarget);
     runCustom("normalize_runtime_target_widens_mapped_rva_target",
              &InstructionTester::runNormalizeRuntimeTargetWidensMappedRvaTarget);
+    runCustom("pushfq_pseudostack_unaligned_qword_reload_resolves_as_ssa",
+             &InstructionTester::runPushFflagsPseudoStackQwordReloadResolvesAsSSA);
 
     return failures;
   }

@@ -3,6 +3,7 @@
 
 #include "CommonDisassembler.hpp"
 #include "GEPTracker.ipp"
+#include "LifterDiagHelpers.hpp"
 #include "ZydisDisassembler.hpp"
 #include "LifterClass.hpp"
 #include "Utils.h"
@@ -1318,6 +1319,30 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::SetRFLAGSValue(Value* value) {
   return;
 }
 
+MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::GetRFLAGSByte(unsigned byteIndex) {
+  LLVMContext& context = builder->getContext();
+  auto* i8Ty = Type::getInt8Ty(context);
+  Value* packed = ConstantInt::get(i8Ty, 0);
+  if (byteIndex >= 8) {
+    return packed;
+  }
+  const int lo = static_cast<int>(byteIndex) * 8;
+  const int hi = lo + 8;
+  for (int flag = FLAG_CF; flag < FLAGS_END; flag++) {
+    if (flag < lo || flag >= hi) {
+      continue;
+    }
+    printvalue2(magic_enum::enum_name((Flag)flag));
+    Value* flagValue = getFlag((Flag)flag);
+    printvalue(flagValue);
+    Value* shiftedFlagValue = createShlFolder(
+        createZExtFolder(flagValue, i8Ty, "createrflag1-"),
+        ConstantInt::get(i8Ty, flag - lo), "createrflag2-");
+    packed = createOrFolder(packed, shiftedFlagValue, "creatingrflagbyte");
+  }
+  return packed;
+}
+
 MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::GetRFLAGSValue() {
   LLVMContext& context = builder->getContext();
   Value* rflags = ConstantInt::get(Type::getInt64Ty(context), 0);
@@ -1334,6 +1359,62 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::GetRFLAGSValue() {
     rflags = createOrFolder(rflags, shiftedFlagValue, "creatingrflag");
   }
   return rflags;
+}
+
+MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::dumpRflagsDiag(const char* tag,
+                                                         uint64_t rva,
+                                                         llvm::Value* rflagsIr,
+                                                         uint64_t extraAddr) {
+  const char** names = flagBitNames();
+  std::cout << "[" << tag << "] rva=0x" << std::hex << rva;
+  if (extraAddr) {
+    std::cout << " addr=0x" << extraAddr;
+  }
+  auto emitReg = [&](const char* name, Register reg) {
+    std::cout << " " << name << "=";
+    llvm::Value* v = GetRegisterValue(reg);
+    if (auto* ci = llvm::dyn_cast_or_null<llvm::ConstantInt>(v)) {
+      std::cout << "0x" << ci->getZExtValue();
+    } else {
+      std::cout << "-";
+    }
+  };
+  emitReg("r9", Register::R9);
+  emitReg("rsp", Register::RSP);
+  std::cout << " bits=[";
+  bool first = true;
+  std::cout << std::dec;
+  for (int f = FLAG_CF; f < FLAGS_END; ++f) {
+    llvm::Value* fv = getFlag((Flag)f);
+    if (!first) {
+      std::cout << " ";
+    }
+    first = false;
+    std::cout << names[f] << "=";
+    if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(fv)) {
+      std::cout << ci->getZExtValue();
+    } else {
+      std::cout << irText(fv);
+    }
+  }
+  std::cout << "] symbolic=[";
+  bool firstSym = true;
+  for (int f = FLAG_CF; f < FLAGS_END; ++f) {
+    llvm::Value* fv = getFlag((Flag)f);
+    if (llvm::isa<llvm::ConstantInt>(fv)) {
+      continue;
+    }
+    if (!firstSym) {
+      std::cout << ",";
+    }
+    firstSym = false;
+    std::cout << names[f] << "=" << irText(fv);
+  }
+  std::cout << "]";
+  if (rflagsIr) {
+    std::cout << " rflags_ir=" << irText(rflagsIr, 160);
+  }
+  std::cout << std::endl;
 }
 
 MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::GetRegisterValue(
@@ -1725,6 +1806,23 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::GetMemoryValue(Value* address,
                   << os.str().substr(0, 120) << "\n"
                   << std::flush;
       }
+    }
+  }
+  // Which flag bit was still symbolic when a flag-bearing op rewrote RFLAGS into
+  // VM data. work.md 7.12.6: `pushfq` at rva 0x396b77 wrote to an unaligned
+  // (r9+6) slot, so the later qword load at rva 0x410840 could not fold to the
+  // machine's 0x202 even though both sides entered `pushfq` with rdx=0x282.
+  // Naming the symbolic bit turns "FLAGS is symbolic" into an actionable site.
+  if (std::getenv("MERGEN_DIAG_RFLAGS")) {
+    const uint64_t insnRVA = maskedRVA(current_address - instruction.length);
+    const bool flagBearing =
+        (loadAddress == 0x14FE66ULL || loadAddress == 0x14FE68ULL ||
+         loadAddress == 0x14FE60ULL || loadAddress == 0x14FE62ULL) ||
+        insnRVA == 0x396B77ULL || insnRVA == 0x396B80ULL ||
+        insnRVA == 0x410840ULL || insnRVA == 0x2F528EULL ||
+        insnRVA == 0x2F5299ULL || insnRVA == 0x2F9E73ULL;
+    if (flagBearing) {
+      dumpRflagsDiag("rflags", insnRVA, nullptr, loadAddress);
     }
   }
   // VIP candidates are bytecode-range reads only. VMProtect's dispatch does the

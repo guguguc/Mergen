@@ -1,5 +1,6 @@
 #include "Utils.h"
 #include "llvm/IR/Value.h"
+#include <cctype>
 #include <chrono>
 #include <iostream>
 #include <sstream>
@@ -118,6 +119,75 @@ namespace {
 bool isOptionToken(const std::string& arg) {
   return !arg.empty() && arg.front() == '-';
 }
+
+std::string toUpperAscii(std::string value) {
+  for (char& ch : value) {
+    ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+  }
+  return value;
+}
+
+std::string canonicalizeGpr64(std::string name) {
+  name = toUpperAscii(std::move(name));
+  if (name == "AL" || name == "AH" || name == "AX" || name == "EAX" ||
+      name == "RAX")
+    return "RAX";
+  if (name == "CL" || name == "CH" || name == "CX" || name == "ECX" ||
+      name == "RCX")
+    return "RCX";
+  if (name == "DL" || name == "DH" || name == "DX" || name == "EDX" ||
+      name == "RDX")
+    return "RDX";
+  if (name == "BL" || name == "BH" || name == "BX" || name == "EBX" ||
+      name == "RBX")
+    return "RBX";
+  if (name == "SPL" || name == "SP" || name == "ESP" || name == "RSP")
+    return "RSP";
+  if (name == "BPL" || name == "BP" || name == "EBP" || name == "RBP")
+    return "RBP";
+  if (name == "SIL" || name == "SI" || name == "ESI" || name == "RSI")
+    return "RSI";
+  if (name == "DIL" || name == "DI" || name == "EDI" || name == "RDI")
+    return "RDI";
+  if (name == "R8B" || name == "R8W" || name == "R8D" || name == "R8")
+    return "R8";
+  if (name == "R9B" || name == "R9W" || name == "R9D" || name == "R9")
+    return "R9";
+  if (name == "R10B" || name == "R10W" || name == "R10D" || name == "R10")
+    return "R10";
+  if (name == "R11B" || name == "R11W" || name == "R11D" || name == "R11")
+    return "R11";
+  if (name == "R12B" || name == "R12W" || name == "R12D" || name == "R12")
+    return "R12";
+  if (name == "R13B" || name == "R13W" || name == "R13D" || name == "R13")
+    return "R13";
+  if (name == "R14B" || name == "R14W" || name == "R14D" || name == "R14")
+    return "R14";
+  if (name == "R15B" || name == "R15W" || name == "R15D" || name == "R15")
+    return "R15";
+  return name;
+}
+
+void parseEntryRegSpecs(const std::string& value, ParseResult& result) {
+  std::istringstream stream(value);
+  std::string token;
+  while (std::getline(stream, token, ',')) {
+    if (token.empty())
+      continue;
+    const auto eq = token.find('=');
+    if (eq == std::string::npos || eq == 0 || eq + 1 == token.size()) {
+      result.errors.push_back("Invalid --reg spec: " + token);
+      continue;
+    }
+    const std::string name = canonicalizeGpr64(token.substr(0, eq));
+    const std::string imm = token.substr(eq + 1);
+    try {
+      result.entryRegs.emplace_back(name, std::stoull(imm, nullptr, 0));
+    } catch (const std::exception&) {
+      result.errors.push_back("Invalid --reg immediate: " + token);
+    }
+  }
+}
 } // namespace
 
 void printHelp() {
@@ -128,6 +198,8 @@ void printHelp() {
                "reads to writable sections\n"
             << "  --outline <addrs>         Comma-separated addresses to outline (not inline)\n"
             << "  --mem-dump <file>         Process RW snapshot at the lift RVA\n"
+            << "  --reg <name>=<imm>        Concretize a GPR at lift entry after InitRegisters\n"
+            << "                            (repeatable; rcx/ecx map to RCX)\n"
             << "  --                        Stop option parsing\n";
 }
 
@@ -204,6 +276,23 @@ ParseResult parseArguments(const std::vector<std::string>& args,
           continue;
         }
         result.memDumpPath = value;
+        continue;
+      }
+      if (arg == "--reg" || arg.rfind("--reg=", 0) == 0) {
+        std::string value;
+        if (arg.rfind("--reg=", 0) == 0) {
+          value = arg.substr(6);
+          if (value.empty()) {
+            result.errors.push_back("--reg= requires a value after '='");
+            continue;
+          }
+        } else if (index + 1 < args.size()) {
+          value = args[++index];
+        } else {
+          result.errors.push_back("--reg requires an argument");
+          continue;
+        }
+        parseEntryRegSpecs(value, result);
         continue;
       }
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "GEPTracker.h"
+#include "LifterDiagHelpers.hpp"
 #include "MemoryPolicy.hpp"
 #include "OperandUtils.ipp"
 #include "LifterClass.hpp"
@@ -50,8 +51,142 @@ void noteBufferWriteDiag(const char* site, uint64_t start, uint64_t size,
             << std::flush;
 }
 
+// A VM store routinely wraps an already-known value in a cast or a select, e.g.
+// `%x = trunc i64 4369 to i32` or `%y = zext i32 %v to i64`. Storing the wrapper
+// makes the whole pseudo-stack slot non-ConstantInt, and
+// retrieveCombinedValueImpl's trackedBufferConstant then bails on the first
+// non-ConstantInt byte, so an unaligned read spanning that slot cannot fold even
+// though every input was constant (work.md 7.12.12).
+//
+// Return the underlying ConstantInt when the value is *wholly* constant after
+// looking through casts and selects, else nullptr. Recursion deliberately stops
+// at bitwise recombination: GetRFLAGSValue rebuilds FLAGS as an or/shl/zext
+// chain whose operands are partly-known single bits, and folding that into a
+// whole qword yields a plausible-but-wrong constant that sends jcc to the wrong
+// handler (work.md 7.12.7, which regressed the add sample for exactly this
+// reason). Only casts and selects -- which cannot manufacture a value that their
+// (wholly constant) operands do not already imply -- are peeled.
+static llvm::ConstantInt* peelToConstantInt(llvm::Value* v, unsigned depth = 0) {
+  // 8 is far above any real chain here; it exists only to make a malformed or
+  // self-referential IR chain terminate.
+  if (v == nullptr || depth > 8) {
+    return nullptr;
+  }
+  if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(v)) {
+    return ci;
+  }
+  // Aftermath / BLARE2: store-forward is byte-level. A VM store of
+  // `zext i32 C to i64` is still a concrete qword; returning the narrow
+  // ConstantInt made addValueReference reject the peel (width mismatch) and
+  // left unaligned cross-slot loads unable to compose (work.md 7.12.9–10).
+  // Re-apply the cast to the peeled constant so the result matches `v`'s
+  // width. Do not walk or/shl FLAGS chains — that is the 7.12.7 regression.
+  if (auto* cast = llvm::dyn_cast<llvm::CastInst>(v)) {
+    if (!cast->getType()->isIntegerTy()) {
+      return nullptr;
+    }
+    auto* src = peelToConstantInt(cast->getOperand(0), depth + 1);
+    if (src == nullptr) {
+      return nullptr;
+    }
+    const unsigned dstBits = cast->getType()->getIntegerBitWidth();
+    llvm::APInt bits = src->getValue();
+    if (llvm::isa<llvm::ZExtInst>(cast)) {
+      bits = bits.zext(dstBits);
+    } else if (llvm::isa<llvm::SExtInst>(cast)) {
+      bits = bits.sext(dstBits);
+    } else if (llvm::isa<llvm::TruncInst>(cast)) {
+      bits = bits.trunc(dstBits);
+    } else if (bits.getBitWidth() != dstBits) {
+      return nullptr;
+    }
+    return llvm::ConstantInt::get(cast->getContext(), bits);
+  }
+  if (auto* sel = llvm::dyn_cast<llvm::SelectInst>(v)) {
+    // A select only has a single value if its condition does. If the condition
+    // folds but differs per path, the arms are irrelevant: two distinct
+    // constants cannot be collapsed into one.
+    auto* cond = peelToConstantInt(sel->getCondition(), depth + 1);
+    if (cond == nullptr) {
+      return nullptr;
+    }
+    return peelToConstantInt(cond->isZero() ? sel->getFalseValue()
+                                             : sel->getTrueValue(),
+                              depth + 1);
+  }
+  return nullptr;
+}
+
 MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::addValueReference(Value* value,
                                                             uint64_t address) {
+  // The buffer records (value, byteOffset) pairs, so a wider/narrower constant
+  // than the stored value would mis-index every byte. Only substitute a constant
+  // that already has the stored value's exact bit width.
+  if (value != nullptr && !llvm::isa<llvm::ConstantInt>(value) &&
+      value->getType()->isIntegerTy()) {
+    if (auto* peeled = peelToConstantInt(value)) {
+      if (peeled->getBitWidth() == value->getType()->getIntegerBitWidth()) {
+        if (std::getenv("MERGEN_DIAG_PEEL")) {
+          std::cout << "[peel] rva=0x" << std::hex
+                    << maskedRVA(current_address - instruction.length)
+                    << " slot=0x" << address << std::dec << " bits="
+                    << peeled->getBitWidth() << " folded=0x" << std::hex
+                    << peeled->getZExtValue() << std::dec << " from="
+                    << irText(value, 100) << std::endl;
+        }
+        value = peeled;
+      }
+    }
+  }
+
+  // Report the value as actually stored, after peeling.
+  if (std::getenv("MERGEN_DIAG_SLOTSTORE") &&
+      (address == 0x14FE68ULL || address == 0x14FE70ULL)) {
+    std::cout << "[slotstore] rva=0x" << std::hex
+              << maskedRVA(current_address - instruction.length) << " slot=0x"
+              << address << std::dec << " isConst="
+              << (llvm::isa<llvm::ConstantInt>(value) ? 1 : 0) << " ir="
+              << irText(value, 100) << std::endl;
+  }
+  if (std::getenv("MERGEN_DIAG_SLOTDAG")) {
+    const uint64_t rva = maskedRVA(current_address - instruction.length);
+    if ((rva == 0x3932B5ULL || rva == 0x367EAAULL) &&
+        (address == 0x14FE68ULL || address == 0x14FE70ULL) && value &&
+        !llvm::isa<llvm::ConstantInt>(value)) {
+      std::cout << "[slotdag] rva=0x" << std::hex << rva << " slot=0x" << address
+                << std::dec << " ir=" << irText(value, 160) << std::endl;
+      std::set<llvm::Value*> seen;
+      std::vector<std::pair<llvm::Value*, int>> work{{value, 0}};
+      int printed = 0;
+      while (!work.empty() && printed < 80) {
+        const auto entry = work.back();
+        work.pop_back();
+        llvm::Value* v = entry.first;
+        const int d = entry.second;
+        if (!v || !seen.insert(v).second) {
+          continue;
+        }
+        auto* inst = llvm::dyn_cast<llvm::Instruction>(v);
+        if (!inst) {
+          std::cout << "[slotdag]   " << std::string(static_cast<size_t>(d) * 2, ' ')
+                    << "NON-INSTR " << irText(v, 120) << std::endl;
+          ++printed;
+          continue;
+        }
+        std::cout << "[slotdag]   " << std::string(static_cast<size_t>(d) * 2, ' ')
+                  << irText(inst, 140) << std::endl;
+        ++printed;
+        if (d >= 10) {
+          continue;
+        }
+        for (auto& op : inst->operands()) {
+          work.push_back({op.get(), d + 1});
+        }
+      }
+      std::cout << "[slotdag] end printed=" << printed << std::endl;
+    }
+  }
+
   // Address-stream probe. The real machine's write stream can be captured with
   // vmpdrtrace's -trackmem; this is the same stream as the lifter models it.
   // Aligning the two by (instruction RVA, destination address) pinpoints the
@@ -61,7 +196,11 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::addValueReference(Value* value,
   if (const char* path = std::getenv("MERGEN_WRITE_STREAM_FILE")) {
     // Skip the setup-time seeding (modelProcessEnvironment runs before any
     // instruction is lifted, so current_address is not a code address yet).
-    if (current_address >= 0x140000000ULL && current_address < 0x150000000ULL) {
+    // The image is rebased to 0x40000000, so accept that lane too: gating on
+    // 0x140000000 alone recorded only the few setup writes and produced a write
+    // stream with no per-instruction rows, which is useless for locating the
+    // store that left a symbolic value in a pseudo-stack slot.
+    if (current_address >= 0x40000000ULL && current_address < 0x50000000ULL) {
       FILE* f = std::fopen(path, "a");
       if (f) {
         const unsigned vbytes = value && value->getType()->isIntegerTy()
@@ -297,7 +436,13 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::retrieveCombinedValueImpl(
       if (it == buffer.end()) {
         return nullptr;
       }
+      // Prefer a peeled ConstantInt so cast-wrapped concrete stores still
+      // participate in unaligned cross-slot composition (Themida blog:
+      // overlapping stores composed at byte granularity).
       auto* ci = dyn_cast<ConstantInt>(it->second.value);
+      if (!ci) {
+        ci = peelToConstantInt(it->second.value);
+      }
       if (t48) {
         std::string bt;
         llvm::raw_string_ostream bo(bt);
@@ -314,6 +459,9 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::retrieveCombinedValueImpl(
                   << std::flush;
       }
       if (!ci) {
+        return nullptr;
+      }
+      if (it->second.byteOffset * 8u >= ci->getBitWidth()) {
         return nullptr;
       }
       auto byteValue = ci->getValue().lshr(it->second.byteOffset * 8).trunc(8);
