@@ -24,12 +24,14 @@ lift → concretize → continue 跑到不动点。
 ### 0.2 被分析的样本
 
 ```
-D:\sogen\dr\vmptest\add_test_fixed4.exe       ← 本文分析的二进制（10128 KB）
-D:\sogen\dr\vmptest\add_test.cpp               ← 源码（VMProtectBeginUltra("add_only")）
-D:\sogen\dr\vmptest\build_add_test.bat         ← 构建 + 保护 + 解包 一条龙
+sample/add/add_test_fixed4.exe   ← 本文分析的二进制（~10 MB）
+sample/add/add_test.cpp          ← 源码（VMProtectBeginUltra("add_only")）
+sample/add/build.cmd             ← 构建 + 保护 + 解包 一条龙
+sample/add/entry_7210.dmp        ← 客户入口 0x140007210 内存快照
+sample/add/README.md             ← 编译 / dump / lift 命令
 ```
 
-`build_add_test.bat` 的链路：
+`build.cmd` 的链路：
 
 ```bat
 cl /O2 /GS- /Zi /I D:\sogen\vmp\sdk add_test.cpp /OUT:add_test.exe
@@ -38,8 +40,7 @@ D:\sogen\dr\vmptest\VMPStatic.exe add_test_vmp.exe add_test_unpacked.exe     :: 
 D:\vmp-crcfix\saltscan.exe add_test_vmp.exe add_test_unpacked.exe             :: salt 扫描
 ```
 
-`*_fixed*.exe` 变体由 `D:\sogen\dr\vmptest\crcfix_fixpoint.py`
-在解包结果上做定点修复生成（`fixed4` 是第四轮定点）。
+`add_test_fixed4.exe` 是第四轮 crc 定点修复后的映像（工具仍在 `D:\sogen\dr\vmptest\crcfix_fixpoint.py`）。
 
 样本固定事实见第 3 节（ImageBase `0x140000000`、客户入口 `0x140007210` 等）。
 
@@ -69,7 +70,7 @@ D:\vmp-crcfix\saltscan.exe add_test_vmp.exe add_test_unpacked.exe             ::
 在**首次执行到 lift 起点**时，一次性 dump 已提交的可写页（映像脏页 + 堆）。不跟指令流。
 
 ```powershell
-cd D:\sogen\dr\vmptest
+cd D:\sogen\dr\refs\Mergen\sample\add
 $DR='D:\DynamoRIO\bin64\drrun.exe'; $DLL='D:\sogen\dr\vmpdrtrace7.dll'
 $argl=@('-c',$DLL,'-entry','0x140007210','-imagebase','0x140000000',
         '-dumpmem',"$PWD\entry_7210.dmp",
@@ -87,7 +88,7 @@ Start-Process -FilePath $DR -ArgumentList $argl -WorkingDirectory $PWD -Wait
 ```powershell
 cd D:\sogen\dr\refs\Mergen\build_msvc_dbg
 $env:MERGEN_MAX_BLOCK_BUDGET='131072'
-cmd /c "lifter.exe D:\sogen\dr\vmptest\add_test_fixed4.exe 0x140007210 > run.out 2> run.err"
+cmd /c "lifter.exe ..\sample\add\add_test_fixed4.exe 0x140007210 > run.out 2> run.err"
 ```
 
 期望：`13291 blocks (1 completed, 2 unreachable), 128252 instructions (0 unsupported)`，0 error，
@@ -98,7 +99,7 @@ cmd /c "lifter.exe D:\sogen\dr\vmptest\add_test_fixed4.exe 0x140007210 > run.out
 ```powershell
 cd D:\sogen\dr\refs\Mergen\build_msvc_dbg
 $env:MERGEN_MAX_BLOCK_BUDGET='131072'
-cmd /c "lifter.exe D:\sogen\dr\vmptest\add_test_fixed4.exe 0x140007210 --mem-dump D:\sogen\dr\vmptest\entry_7210.dmp > run_dump.out 2> run_dump.err"
+cmd /c "lifter.exe ..\sample\add\add_test_fixed4.exe 0x140007210 --mem-dump ..\sample\add\entry_7210.dmp > run_dump.out 2> run_dump.err"
 ```
 
 - 等价写法：`--mem-dump=<file>`，或环境变量 `MERGEN_MEM_DUMP=<file>`。
@@ -173,7 +174,7 @@ cmd /c "D:\sogen\tools\rebuild_mergen_msvc_dbg.cmd"
 :: 跑（客户函数入口 0x140007210）
 set MERGEN_MAX_BLOCK_BUDGET=131072
 set MERGEN_DIAG_LIFT_PROGRESS=1
-cmd /c "cd D:\sogen\dr\refs\Mergen\build_msvc_dbg && lifter.exe D:\sogen\dr\vmptest\add_test_fixed4.exe 0x140007210"
+cmd /c "cd D:\sogen\dr\refs\Mergen\build_msvc_dbg && lifter.exe ..\sample\add\add_test_fixed4.exe 0x140007210 --mem-dump ..\sample\add\entry_7210.dmp"
 ```
 
 产物：`build_msvc_dbg\output.ll` / `output_no_opts.ll` / `output_diagnostics.json`。
@@ -248,16 +249,17 @@ D:\DynamoRIO\bin64\drrun.exe -c D:\sogen\dr\vmpdrtrace5.dll ^
 
 ## 5. 现状
 
-**当前（dump + 主机 `CPUID`，未提交）** — 见 §7.11.11 / §7.11.12。
+**当前（dump + 主机 `CPUID` + 真 `RDTSC`）** — 见 §7.11.13 / §7.11.14。
 
 | 项 | 值 |
 |---|---|
-| 块 / 指令 | **18664 / 178945**（`1 completed, 0 unreachable`） |
-| 耗时 | lift ~7s（`output_diagnostics.json` total ~19s） |
-| 错误 | `0 error` / `0 warning` |
-| 出口 | `[ret] 0x14000723e` `rsp=STACKP` `disp=0` `rop=1`（客户函数尾） |
-| 对照 | insn 流 seq **1–173740** RVA 对齐；**seq 173741** 控制流分叉（`dec rax; jne`，计数器 `0xa0` vs `0x1`） |
-| 已闭合 | `0x806c1`/`0x300b0`/`0x500b0`/`0x5004f` 链（假 CPUID 模板） |
+| 块 / 指令 | **18129 / 176805**（`1 completed, 0 unreachable`） |
+| 耗时 | lift ~8.5s（`output_diagnostics.json` total ~23s） |
+| 错误 | `0 error` / `0 warning` / `0 unsupported` |
+| 出口 | `[ret] 0x14000723e` `rsp=STACKP` `disp=0` `rop=1`（客户函数尾；insn 末条 `0x723e`） |
+| IR | `output.ll` 已折成 **`EAX = (RCX + RDX) & 0xffffffff`**（`add_only` 语义）。insn 流走到 `0x7231`/`0x723e`，RAX 为 SSA `-`，**没有** DR 调用现场的 `0x21436587` |
+| 对照 | 与任意一趟 DR `-insn` 的 RVA 前缀对齐到 TSC 倒计时 `dec rax; jne`（`0x335d4c`/`0x335d4f`）后分叉；圈数随 TSC 变。DR 在客户 `ret` 之后还记到 `0x6ca07`（进程尾巴），lift 在 `0x723e` 停 |
+| 已闭合 | 假 CPUID（§7.11.11）；空 `lift_rdtsc` 残值 `EAX=0x70`（§7.11.13）。**不要**把某趟 DR 的 TSC 写进 lifter |
 
 **提交基线 a3a45c5（有 dump + InstructionCache 共享索引，假 CPUID）**
 
@@ -1337,6 +1339,8 @@ insn 流（`insn_lift.csv` / `insn_dr.csv`）从 `0x3FCC8F` 往回：
 
 `0x38d866` `jmp 0x335d4c` 进这条循环。lift 计数器 `0xa0`，DR `0x1`，所以多转一圈。lift 在 `0x14000723e` 先 `ret`；DR 后面还跑到 seq 194330（`0x6ca07`）。
 
+空 `rdtsc` 修掉之后，对**某一趟** DR 仍会在同一对 `dec/jne` 分叉，圈数改成「各自 TSC」而不是残值 `0xa4`（§7.11.14）。两趟 DR 自己也会在这里分叉。
+
 **分叉之前、过滤环境后仍在的 GP 差（未追）：**
 
 | seq | RVA | 差 |
@@ -1346,7 +1350,70 @@ insn 流（`insn_lift.csv` / `insn_dr.csv`）从 `0x3FCC8F` 往回：
 | 527 | `0x2ba795` | RCX `0x1` vs `0x0` |
 | 659+ | `0x350111` 一带 | RDX `0x206` vs `0x202`（flags；**不要** `GetRFLAGSValue \|= 0x202`） |
 
-下一刀：谁把 seq 173739 的 RAX 写成 `0xa0` 而不是 `0x1`；以及上面几条早期 RCX/flags 差是否喂进这个计数器。
+计数器 `0xa0` vs `0x1` 的**残值根因**已闭合，见 7.11.13。修好后圈数仍随 TSC 变，见 7.11.14。早期 RCX/flags 差是否另有后果未追。
+
+### 7.11.13 循环计数 `0xa4` vs `0x5`：空的 `lift_rdtsc`
+
+从 `seq 173739` `dec rax` 往回（insn 流，不算站点白名单）：
+
+| seq | RVA | 指令 | 作用 |
+|---|---|---|---|
+| 163302 | `0x32D2F9` | **`rdtsc`** | lift 不写寄存器，留下 `EAX=0x70` `EDX=0x2b7af`；DR 写出真 TSC（该趟 `EAX=0xc2236c6e` `EDX=0x1f14`，**不要写进代码**） |
+| 163308 | `0x32D308` | `mov [r10+4], eax` | TSC 低 32 推进 VSP |
+| 163358 | `0x32F20E` | `add r11d, eax` | `0x2b7af+0x70=0x2b81f` vs `0x1f14+TSC_lo` |
+| 163988 | `0x3F4D6A` | `add r11d, eax` | 再加一份两边相同的 `0x21ad612a` → `0x21b01949` vs `0xe3d0ecac` |
+| 165243 | `0x3F8195` | `div ecx`（`ecx=0x8d5` 同） | 商/余 `0x3d074,0x8c5` vs `0x19cb57,0x549` |
+| 165837 | `0x2BF83B` | `mul edx`（`edx=0xc` 同） | **`0x693c` vs `0x3f6c`**（差 `0x29d0`） |
+| 167306 | `0x2E4DB8` | `add r11, rax` | 映像基 `0x3fec65` 两边同 + 偏移 → RVA `0x4055a1` vs `0x402bd1` |
+| 169129 | `0x3FD47A` | `mov ecx, [rax]` | 取错立即数 `0x70d10864` vs `0x70d108c5` |
+| 169514 | `0x3AB877` | NAND | `0xffffffdb` vs `0xfffffffa` |
+| 170346 | `0x391ADD` | 再 NAND | **`0xa4` vs `0x5`** |
+| 173626 | `0x2C20A9` | `mov rax, [r10+8]` | 循环次数进 RAX |
+| 173739 | `0x335D4C` | `dec rax; jne` | lift 多转 ~159 圈 |
+
+沿途 `mul`/`div`/`add`/`NAND` 按输入都对。`lift_rdtsc` 原先是空函数，EAX/EDX 仍是 rdtsc 前的 VM 残值，不是一次 TSC 的高低 32 位。VMP 把 TSC 当 VM dword 用（与 CPUID 同类）。DR 每次 `add_only` 结果相同，说明算法应对**任意一次完整 TSC** 成立，禁止把某趟 DR 的 `0xc2236c6e` 写死进 lifter。修复：`rdtsc` 必须从**同一个** 64 位计数写出 `EDX:EAX`。
+
+### 7.11.14 真 `RDTSC` 之后：客户函数跑完；`add` 在 IR 里；DR 圈数本就不固定
+
+`Semantics_Misc.ipp`：`lift_rdtsc` 在 Win32 上 `__rdtsc()` 一次，低 32 → EAX、高 32 → EDX。`vmpdrtrace` **不**拦 `rdtsc`，`-insn` 只是指令前 INTEGER|CONTROL 快照。
+
+重 lift（`MERGEN_INSN_STREAM_FILE=insn_lift.csv`，dump overlay）：**18129 / 176805**，0 error，末条客户 `ret 0x723e`。进 `0x32D2F9` 时两边仍是残值 `EAX=0x70` `EDX=0x2b7af`；出来后 lift 写成一对真 TSC（该趟 `EDX:EAX=0x2680_92e1eec6`），不再留残值。
+
+**「每次 DR 都是同一条 trace」不成立（寄存器 / 圈数），`add_only` 结果成立。** 连跑两趟 `-insn`（`vmptest\insn_dr_a.csv` / `insn_dr_b.csv`）：
+
+| | A | B |
+|---|---|---|
+| `add_only(...)` | `21436587` | `21436587` |
+| 条数 | 274530 | 217690 |
+| `rdtsc` 后 seq 163303 `0x32d2fb` EAX:EDX | `0x270b_167b3394` | `0x2732_cff56b20` |
+| 前 197100 条 RVA | 相同 | 相同 |
+| seq 197101 `dec rax; jne` | RAX=`0xb1a` → `0x2ca58a` | RAX=`0` → `0x335d55` |
+
+`vmpdrtrace` 没有把 TSC 钉死。倒计时之前控制流几乎不依赖 TSC，只看 PC 会觉得两趟一样；从 `0x335d4c`/`0x335d4f` 起圈数不同，连 RVA 都错位。早期 GP 差（堆 ASLR，seq 189 的 RDX 等）也每趟不同，与语义无关。
+
+对照 **lift vs DR**（入口都是 `0x7210`，都经过 `0x723e`）：
+
+| | 条数 | 末条 | `0x723e` |
+|---|---|---|---|
+| lift | 176805 | `0x723e`（函数级结束） | seq 176805，RAX=`-` |
+| DR old `insn_dr.csv` | 194330 | `0x6ca07` | seq 175765，RAX=`0x21436587` |
+| DR a / b | 274530 / 217690 | `0x6ca07` | seq 255965 / 199125，RAX=`0x21436587` |
+
+RVA 前缀：vs 旧 DR **173740** 条后 lift 还在转圈（RAX=`0x34`）；vs a/b **174780** 条后 lift 已落空（RAX=`0`）。都是 TSC 倒计时，不是 `jne` 解错。DR 在客户 `ret` 之后继续记 CRT/退出到 `0x6ca07`，不应要求 lift 对齐那截。
+
+**有 add。** 优化后 `output.ll`：
+
+```llvm
+%bvalue_indexvalue_set = add i64 %RDX, %RCX
+%0 = and i64 %bvalue_indexvalue_set, 4294967295
+ret i64 %0
+```
+
+insn 流有 `0x7231`（真机 `lea eax,[rbx+rdi]`）再 `0x723e`。lift 从函数入口抬，RCX/RDX 是参数，不会出现 `main` 里的 `0x12345678+0x0F0F0F0F=0x21436587`。要那个十进制数需再代入参数。
+
+禁止：把 DR 的 TSC 写进 `lift_rdtsc`；unique-fold；VIP overlay；`STACKP±8`；`GetRFLAGSValue |= 0x202`；贴活堆指针。
+
+未追：§7.11.12 分叉前的早期 RCX/flags 差（seq 287/336/527/659+）。
 
 ## 7.8 诊断基础设施（默认关闭，零输出）
 

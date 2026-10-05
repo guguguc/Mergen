@@ -517,11 +517,17 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_cmp() {
   });
 }
 MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_rdtsc() {
-  // cout << current_address << "\n";
-  // LLVMContext& context = builder->getContext();
-  // auto rdtscCall =
-  //    builder->CreateIntrinsic(Intrinsic::readcyclecounter, {}, {});
-  // call rdtsc ??
+  LLVMContext& context = builder->getContext();
+  auto* i32 = Type::getInt32Ty(context);
+#ifdef _WIN32
+  const unsigned long long tsc = __rdtsc();
+#else
+  const unsigned long long tsc = 0;
+#endif
+  SetRegisterValue(Register::EAX,
+                   ConstantInt::get(i32, static_cast<uint32_t>(tsc)));
+  SetRegisterValue(Register::EDX,
+                   ConstantInt::get(i32, static_cast<uint32_t>(tsc >> 32)));
 }
 MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_cpuid() {
   LLVMContext& context = builder->getContext();
