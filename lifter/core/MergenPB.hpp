@@ -195,6 +195,9 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::run_opts() {
   postPassManager.addPass(StripTrailingScratchStoresPass());
   postPassManager.addPass(SelectChainToSwitchPass());
   postPassManager.addPass(SwitchNormalizationPass());
+  postPassManager.addPass(SignedCompareFromFlagsPass());
+  postPassManager.addPass(
+      llvm::createModuleToFunctionPassAdaptor(llvm::InstCombinePass()));
   postPassManager.addPass(llvm::DeadArgumentEliminationPass());
   postPassManager.addPass(CanonicalNamingPass());
   postPassManager.run(*module, finalModuleAnalysisManager);

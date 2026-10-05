@@ -15,9 +15,11 @@
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/Module.h>
+#include <llvm/IR/PatternMatch.h>
 #include <llvm/Support/KnownBits.h>
 #include <llvm/Support/raw_ostream.h>
 #include <map>
+#include <optional>
 #include <string>
 
 using namespace llvm;
@@ -1218,6 +1220,257 @@ public:
 
     // This is purely cosmetic; no semantics change.
     return llvm::PreservedAnalyses::all();
+  }
+};
+
+class SignedCompareFromFlagsPass
+    : public llvm::PassInfoMixin<SignedCompareFromFlagsPass> {
+  static constexpr int kMaxDepth = 24;
+
+  static std::optional<bool> evalSlt0(llvm::Value* X, llvm::Value* A,
+                                      llvm::Value* B, llvm::Value* Sub, bool sa,
+                                      bool sb, bool ss, int depth) {
+    using namespace llvm::PatternMatch;
+    if (!X || depth > kMaxDepth)
+      return std::nullopt;
+    if (X == A)
+      return sa;
+    if (X == B)
+      return sb;
+    if (X == Sub)
+      return ss;
+    llvm::Value *L = nullptr, *R = nullptr;
+    if (match(X, m_Xor(m_Value(L), m_Value(R)))) {
+      auto l = evalSlt0(L, A, B, Sub, sa, sb, ss, depth + 1);
+      auto r = evalSlt0(R, A, B, Sub, sa, sb, ss, depth + 1);
+      if (l && r)
+        return *l ^ *r;
+      return std::nullopt;
+    }
+    if (match(X, m_And(m_Value(L), m_Value(R)))) {
+      auto l = evalSlt0(L, A, B, Sub, sa, sb, ss, depth + 1);
+      auto r = evalSlt0(R, A, B, Sub, sa, sb, ss, depth + 1);
+      if (l && r)
+        return *l && *r;
+      return std::nullopt;
+    }
+    if (match(X, m_Or(m_Value(L), m_Value(R)))) {
+      auto l = evalSlt0(L, A, B, Sub, sa, sb, ss, depth + 1);
+      auto r = evalSlt0(R, A, B, Sub, sa, sb, ss, depth + 1);
+      if (l && r)
+        return *l || *r;
+      return std::nullopt;
+    }
+    return std::nullopt;
+  }
+
+  static std::optional<bool> evalI1(llvm::Value* V, llvm::Value* A,
+                                    llvm::Value* B, llvm::Value* Sub, bool sa,
+                                    bool sb, bool ss, bool zf, int depth) {
+    using namespace llvm::PatternMatch;
+    if (!V || depth > kMaxDepth)
+      return std::nullopt;
+    if (auto* C = llvm::dyn_cast<llvm::ConstantInt>(V)) {
+      if (C->getType()->isIntegerTy(1))
+        return C->isOne();
+      return std::nullopt;
+    }
+
+    llvm::ICmpInst::Predicate P;
+    llvm::Value *X = nullptr, *Y = nullptr;
+    if (match(V, m_ICmp(P, m_Value(X), m_Zero()))) {
+      if (P == llvm::ICmpInst::ICMP_SLT)
+        return evalSlt0(X, A, B, Sub, sa, sb, ss, depth + 1);
+      if (X == Sub) {
+        if (P == llvm::ICmpInst::ICMP_EQ)
+          return zf;
+        if (P == llvm::ICmpInst::ICMP_NE)
+          return !zf;
+      }
+      return std::nullopt;
+    }
+    if (match(V, m_ICmp(P, m_Value(X), m_Value(Y)))) {
+      const bool ab = (X == A && Y == B) || (X == B && Y == A);
+      const bool swapped = X == B && Y == A;
+      if (ab) {
+        if (P == llvm::ICmpInst::ICMP_EQ)
+          return zf;
+        if (P == llvm::ICmpInst::ICMP_NE)
+          return !zf;
+        if (swapped) {
+          if (P == llvm::ICmpInst::ICMP_SLT)
+            P = llvm::ICmpInst::ICMP_SGT;
+          else if (P == llvm::ICmpInst::ICMP_SGT)
+            P = llvm::ICmpInst::ICMP_SLT;
+          else if (P == llvm::ICmpInst::ICMP_SLE)
+            P = llvm::ICmpInst::ICMP_SGE;
+          else if (P == llvm::ICmpInst::ICMP_SGE)
+            P = llvm::ICmpInst::ICMP_SLE;
+        }
+        const bool of = (sa != sb) && (sa != ss);
+        const bool slt = ss ^ of;
+        if (P == llvm::ICmpInst::ICMP_SLT)
+          return slt;
+        if (P == llvm::ICmpInst::ICMP_SGE)
+          return !slt;
+        if (P == llvm::ICmpInst::ICMP_SLE)
+          return zf || slt;
+        if (P == llvm::ICmpInst::ICMP_SGT)
+          return !zf && !slt;
+      }
+      return std::nullopt;
+    }
+
+    if (match(V, m_Not(m_Value(X)))) {
+      auto e = evalI1(X, A, B, Sub, sa, sb, ss, zf, depth + 1);
+      if (e)
+        return !*e;
+      return std::nullopt;
+    }
+    if (match(V, m_And(m_Value(X), m_Value(Y)))) {
+      auto l = evalI1(X, A, B, Sub, sa, sb, ss, zf, depth + 1);
+      auto r = evalI1(Y, A, B, Sub, sa, sb, ss, zf, depth + 1);
+      if (l && r)
+        return *l && *r;
+      return std::nullopt;
+    }
+    if (match(V, m_Or(m_Value(X), m_Value(Y)))) {
+      auto l = evalI1(X, A, B, Sub, sa, sb, ss, zf, depth + 1);
+      auto r = evalI1(Y, A, B, Sub, sa, sb, ss, zf, depth + 1);
+      if (l && r)
+        return *l || *r;
+      return std::nullopt;
+    }
+    if (match(V, m_Xor(m_Value(X), m_Value(Y)))) {
+      auto l = evalI1(X, A, B, Sub, sa, sb, ss, zf, depth + 1);
+      auto r = evalI1(Y, A, B, Sub, sa, sb, ss, zf, depth + 1);
+      if (l && r)
+        return *l ^ *r;
+      return std::nullopt;
+    }
+    if (auto* S = llvm::dyn_cast<llvm::SelectInst>(V)) {
+      if (!S->getType()->isIntegerTy(1))
+        return std::nullopt;
+      auto c = evalI1(S->getCondition(), A, B, Sub, sa, sb, ss, zf, depth + 1);
+      auto t = evalI1(S->getTrueValue(), A, B, Sub, sa, sb, ss, zf, depth + 1);
+      auto f = evalI1(S->getFalseValue(), A, B, Sub, sa, sb, ss, zf, depth + 1);
+      if (c && t && f)
+        return *c ? *t : *f;
+    }
+    return std::nullopt;
+  }
+
+  static bool matchesPred(llvm::Value* V, llvm::Value* A, llvm::Value* B,
+                          llvm::Value* Sub, llvm::ICmpInst::Predicate Want) {
+    for (int bits = 0; bits < 16; ++bits) {
+      const bool sa = bits & 1;
+      const bool sb = bits & 2;
+      const bool ss = bits & 4;
+      const bool zf = bits & 8;
+      auto got = evalI1(V, A, B, Sub, sa, sb, ss, zf, 0);
+      if (!got)
+        return false;
+      const bool of = (sa != sb) && (sa != ss);
+      const bool slt = ss ^ of;
+      bool expect = false;
+      switch (Want) {
+      case llvm::ICmpInst::ICMP_SLT:
+        expect = slt;
+        break;
+      case llvm::ICmpInst::ICMP_SGE:
+        expect = !slt;
+        break;
+      case llvm::ICmpInst::ICMP_SLE:
+        expect = zf || slt;
+        break;
+      case llvm::ICmpInst::ICMP_SGT:
+        expect = !zf && !slt;
+        break;
+      default:
+        return false;
+      }
+      if (*got != expect)
+        return false;
+    }
+    return true;
+  }
+
+  static void collectSubs(llvm::Value* V, llvm::SmallPtrSetImpl<llvm::Value*>& seen,
+                          llvm::SmallVectorImpl<llvm::Instruction*>& subs,
+                          int depth) {
+    using namespace llvm::PatternMatch;
+    if (!V || depth > kMaxDepth || !seen.insert(V).second)
+      return;
+    llvm::Value *A = nullptr, *B = nullptr;
+    if (match(V, m_Sub(m_Value(A), m_Value(B)))) {
+      if (auto* I = llvm::dyn_cast<llvm::Instruction>(V))
+        subs.push_back(I);
+    }
+    if (auto* I = llvm::dyn_cast<llvm::Instruction>(V)) {
+      for (llvm::Value* Op : I->operands())
+        collectSubs(Op, seen, subs, depth + 1);
+    }
+  }
+
+  static bool tryFold(llvm::Value* Cond) {
+    using namespace llvm::PatternMatch;
+    if (!Cond || !Cond->getType()->isIntegerTy(1))
+      return false;
+    if (auto* IC = llvm::dyn_cast<llvm::ICmpInst>(Cond)) {
+      if (IC->isSigned() && (IC->getPredicate() == llvm::ICmpInst::ICMP_SLT ||
+                             IC->getPredicate() == llvm::ICmpInst::ICMP_SGT ||
+                             IC->getPredicate() == llvm::ICmpInst::ICMP_SLE ||
+                             IC->getPredicate() == llvm::ICmpInst::ICMP_SGE))
+        return false;
+    }
+    auto* InsertPt = llvm::dyn_cast<llvm::Instruction>(Cond);
+    if (!InsertPt)
+      return false;
+
+    llvm::SmallPtrSet<llvm::Value*, 32> seen;
+    llvm::SmallVector<llvm::Instruction*, 4> subs;
+    collectSubs(Cond, seen, subs, 0);
+    for (llvm::Instruction* SubI : subs) {
+      llvm::Value *A = nullptr, *B = nullptr;
+      if (!match(SubI, m_Sub(m_Value(A), m_Value(B))))
+        continue;
+      static const llvm::ICmpInst::Predicate kPreds[] = {
+          llvm::ICmpInst::ICMP_SGT, llvm::ICmpInst::ICMP_SLT,
+          llvm::ICmpInst::ICMP_SGE, llvm::ICmpInst::ICMP_SLE};
+      for (auto Pred : kPreds) {
+        if (!matchesPred(Cond, A, B, SubI, Pred))
+          continue;
+        llvm::IRBuilder<> Builder(InsertPt);
+        llvm::Value* Cmp = Builder.CreateICmp(Pred, A, B, "signed_cmp");
+        Cond->replaceAllUsesWith(Cmp);
+        return true;
+      }
+    }
+    return false;
+  }
+
+public:
+  llvm::PreservedAnalyses run(llvm::Module& M, llvm::ModuleAnalysisManager&) {
+    bool changed = false;
+    for (llvm::Function& F : M) {
+      if (F.isDeclaration())
+        continue;
+      llvm::SmallVector<llvm::Value*, 16> conds;
+      for (llvm::BasicBlock& BB : F) {
+        for (llvm::Instruction& I : BB) {
+          if (auto* SI = llvm::dyn_cast<llvm::SelectInst>(&I))
+            conds.push_back(SI->getCondition());
+          else if (auto* BI = llvm::dyn_cast<llvm::BranchInst>(&I)) {
+            if (BI->isConditional())
+              conds.push_back(BI->getCondition());
+          }
+        }
+      }
+      for (llvm::Value* C : conds)
+        changed |= tryFold(C);
+    }
+    return changed ? llvm::PreservedAnalyses::none()
+                   : llvm::PreservedAnalyses::all();
   }
 };
 #endif
