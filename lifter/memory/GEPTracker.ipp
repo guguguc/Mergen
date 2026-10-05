@@ -261,10 +261,9 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::retrieveCombinedValue(
               << ") -> " << os.str().substr(0, 150) << "\n"
               << std::flush;
   }
-  if (result && isModuleAddress(startAddress)) {
-    // Only module-backed promotions are VIP candidates; stack/pseudo-stack
-    // slots must not overwrite the VIP (configurable range policy, Themida
-    // article "Constant Promotion & Memory Modeling").
+  if (result && isModuleAddress(startAddress) &&
+      currentPathSolveContext != PathSolveContext::Ret) {
+    // Nested table reads while solving a `ret` RIP are data, not VIP.
     loadProvenance[result] = startAddress;
     noteModuleLoad(startAddress);
   }

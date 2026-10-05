@@ -29,32 +29,36 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
   // (from different branch paths), so cached results don't carry over.
   pv_cache.clear();
   const uint64_t pathSolveSite = current_address - instruction.length;
-  if (auto* loadInst = dyn_cast<LoadInst>(simplifyValue)) {
-    if (loadInst->getType()->isIntegerTy()) {
-      auto* gep = dyn_cast<GetElementPtrInst>(loadInst->getPointerOperand());
-      if (gep && gep->getPointerOperand() == memoryAlloc) {
-        unsigned loadBits = loadInst->getType()->getIntegerBitWidth();
-        if (loadBits % 8 == 0) {
-          LazyValue nestedLoad([loadInst]() -> Value* { return loadInst; });
-          if (auto* resolved = solveLoad(
-                  nestedLoad, gep, static_cast<uint8_t>(loadBits))) {
-            if (liftProgressDiagEnabled && pathSolveSite == 0x1400237F9ULL) {
-              std::string resolvedText;
-              llvm::raw_string_ostream os(resolvedText);
-              resolved->print(os);
-              std::cout << "[diag] solvePath eager load current=0x1400237f9 resolved="
-                        << os.str() << "\n";
-            }
-            if (currentPathSolveContext == PathSolveContext::IndirectJump) {
-              if (auto* resolvedCI = dyn_cast<ConstantInt>(resolved)) {
-                uint64_t normalizedResolved =
-                    normalizeRuntimeTargetAddress(resolvedCI->getZExtValue());
-                if (!isMemPaged(normalizedResolved)) {
-                  if (liftProgressDiagEnabled && pathSolveSite == 0x1400237F9ULL) {
-                    std::cout << "[diag] solvePath eager load skipping unmapped constant=0x"
-                              << std::hex << resolvedCI->getZExtValue()
-                              << " normalized=0x" << normalizedResolved << std::dec
-                              << "\n";
+  if (currentPathSolveContext != PathSolveContext::Ret) {
+    if (auto* loadInst = dyn_cast<LoadInst>(simplifyValue)) {
+      if (loadInst->getType()->isIntegerTy()) {
+        auto* gep = dyn_cast<GetElementPtrInst>(loadInst->getPointerOperand());
+        if (gep && gep->getPointerOperand() == memoryAlloc) {
+          unsigned loadBits = loadInst->getType()->getIntegerBitWidth();
+          if (loadBits % 8 == 0) {
+            LazyValue nestedLoad([loadInst]() -> Value* { return loadInst; });
+            if (auto* resolved = solveLoad(
+                    nestedLoad, gep, static_cast<uint8_t>(loadBits))) {
+              if (liftProgressDiagEnabled && pathSolveSite == 0x1400237F9ULL) {
+                std::string resolvedText;
+                llvm::raw_string_ostream os(resolvedText);
+                resolved->print(os);
+                std::cout << "[diag] solvePath eager load current=0x1400237f9 resolved="
+                          << os.str() << "\n";
+              }
+              if (currentPathSolveContext == PathSolveContext::IndirectJump) {
+                if (auto* resolvedCI = dyn_cast<ConstantInt>(resolved)) {
+                  uint64_t normalizedResolved =
+                      normalizeRuntimeTargetAddress(resolvedCI->getZExtValue());
+                  if (!isMemPaged(normalizedResolved)) {
+                    if (liftProgressDiagEnabled && pathSolveSite == 0x1400237F9ULL) {
+                      std::cout << "[diag] solvePath eager load skipping unmapped constant=0x"
+                                << std::hex << resolvedCI->getZExtValue()
+                                << " normalized=0x" << normalizedResolved << std::dec
+                                << "\n";
+                    }
+                  } else {
+                    simplifyValue = resolved;
                   }
                 } else {
                   simplifyValue = resolved;
@@ -62,15 +66,13 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
               } else {
                 simplifyValue = resolved;
               }
-            } else {
-              simplifyValue = resolved;
+            } else if (liftProgressDiagEnabled && pathSolveSite == 0x1400237F9ULL) {
+              std::string offsetText;
+              llvm::raw_string_ostream os(offsetText);
+              gep->getOperand(1)->print(os);
+              std::cout << "[diag] solvePath eager load current=0x1400237f9 returned-null offset="
+                        << os.str() << "\n";
             }
-          } else if (liftProgressDiagEnabled && pathSolveSite == 0x1400237F9ULL) {
-            std::string offsetText;
-            llvm::raw_string_ostream os(offsetText);
-            gep->getOperand(1)->print(os);
-            std::cout << "[diag] solvePath eager load current=0x1400237f9 returned-null offset="
-                      << os.str() << "\n";
           }
         }
       }
@@ -276,6 +278,9 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
   printvalue(simplifyValue);
   run = 0;
   auto pvset = computePossibleValues(simplifyValue);
+  if (currentPathSolveContext == PathSolveContext::Ret && pvset.size() > 2) {
+    pvset.clear();
+  }
   // A loop-generalized exit value can be a PHI, which computePossibleValues
   // does not enumerate. Its incoming constants are exactly the possible
   // transfers (the virtualized JCC: "the branch has multiple real

@@ -1396,12 +1396,10 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_cld() {
   setFlag(FLAG_DF, clearedDF);
 }
 MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_cli() {
-
   LLVMContext& context = builder->getContext();
-
-  Value* resetIF = ConstantInt::get(Type::getInt1Ty(context), 0);
-
-  setFlag(FLAG_IF, resetIF);
+  Value* cleared = ConstantInt::get(Type::getInt1Ty(context), 0);
+  setFlag(FLAG_IF,
+          createSelectFolder(privilegeAllowsIF(), cleared, getFlag(FLAG_IF)));
 }
 MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_bts() {
   /*   auto base = operands[0];

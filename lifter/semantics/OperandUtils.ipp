@@ -217,8 +217,14 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::doPatternMatching(
     break;
   }
   case Instruction::Xor: {
-    // X ^ ~X
+    // ~~X -> X
     Value* X = nullptr;
+    if (match(op1, m_SpecificInt(-1)) && match(op0, m_Not(m_Value(X))))
+      return X;
+    if (match(op0, m_SpecificInt(-1)) && match(op1, m_Not(m_Value(X))))
+      return X;
+
+    // X ^ ~X
     static auto isXorNotX = [](Value* op0, Value* op1, Value* X) {
       return (match(op0, m_ZExtOrSelf(m_Not(m_Value(X)))) &&
               match(op1, m_ZExtOrSelf(m_Specific(X)))) ||
@@ -368,17 +374,20 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::getOrCreate(
   }
   Value* newInstruction = nullptr;
   if (isCast(opcode) == 0) {
-    // Binary instruction
+    // Binary instruction. Distribute over select through folderBinOps so
+    // identities (-1/0/~~) and constant folding run on each arm; CreateBinOp
+    // alone skips Mergen's folder and leaves VIP masks symbolic.
+    const auto binOp = static_cast<Instruction::BinaryOps>(opcode);
     if (auto select_inst = dyn_cast<llvm::SelectInst>(key.operand1)) {
       printvalue2(
           analyzeValueKnownBits(select_inst->getCondition(), select_inst));
       if (isa<ConstantInt>(key.operand2))
         return createSelectFolder(
             select_inst->getCondition(),
-            builder->CreateBinOp(static_cast<Instruction::BinaryOps>(opcode),
-                                 select_inst->getTrueValue(), key.operand2),
-            builder->CreateBinOp(static_cast<Instruction::BinaryOps>(opcode),
-                                 select_inst->getFalseValue(), key.operand2),
+            folderBinOps(select_inst->getTrueValue(), key.operand2, Name,
+                         binOp),
+            folderBinOps(select_inst->getFalseValue(), key.operand2, Name,
+                         binOp),
             "lola-");
     }
     if (auto select_inst = dyn_cast<llvm::SelectInst>(key.operand2)) {
@@ -387,10 +396,10 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::getOrCreate(
       if (isa<ConstantInt>(key.operand1))
         return createSelectFolder(
             select_inst->getCondition(),
-            builder->CreateBinOp(static_cast<Instruction::BinaryOps>(opcode),
-                                 key.operand1, select_inst->getTrueValue()),
-            builder->CreateBinOp(static_cast<Instruction::BinaryOps>(opcode),
-                                 key.operand1, select_inst->getFalseValue()),
+            folderBinOps(key.operand1, select_inst->getTrueValue(), Name,
+                         binOp),
+            folderBinOps(key.operand1, select_inst->getFalseValue(), Name,
+                         binOp),
             "lolb-");
     }
 
@@ -402,10 +411,8 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::getOrCreate(
                                                                 // if inversed
           return createSelectFolder(
               select_inst->getCondition(),
-              builder->CreateBinOp(static_cast<Instruction::BinaryOps>(opcode),
-                                   lhs1, select_inst->getTrueValue()),
-              builder->CreateBinOp(static_cast<Instruction::BinaryOps>(opcode),
-                                   rhs1, select_inst->getFalseValue()),
+              folderBinOps(lhs1, select_inst->getTrueValue(), Name, binOp),
+              folderBinOps(rhs1, select_inst->getFalseValue(), Name, binOp),
               "lol2-");
     } else if (match(key.operand1,
                      m_ZExtOrSExtOrSelf(m_Select(m_Value(cnd1), m_Value(lhs1),
@@ -415,10 +422,8 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::getOrCreate(
                                                                 // if inversed
           return createSelectFolder(
               select_inst->getCondition(),
-              builder->CreateBinOp(static_cast<Instruction::BinaryOps>(opcode),
-                                   lhs1, select_inst->getTrueValue()),
-              builder->CreateBinOp(static_cast<Instruction::BinaryOps>(opcode),
-                                   rhs1, select_inst->getFalseValue()),
+              folderBinOps(lhs1, select_inst->getTrueValue(), Name, binOp),
+              folderBinOps(rhs1, select_inst->getFalseValue(), Name, binOp),
               "lol2-");
     }
     Value *cnd, *lhs, *rhs;
@@ -429,10 +434,8 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::getOrCreate(
                                                                // if inversed
           return createSelectFolder(
               select_inst->getCondition(),
-              builder->CreateBinOp(static_cast<Instruction::BinaryOps>(opcode),
-                                   select_inst->getTrueValue(), lhs),
-              builder->CreateBinOp(static_cast<Instruction::BinaryOps>(opcode),
-                                   select_inst->getFalseValue(), rhs),
+              folderBinOps(select_inst->getTrueValue(), lhs, Name, binOp),
+              folderBinOps(select_inst->getFalseValue(), rhs, Name, binOp),
               "lol2-");
     } else if (match(key.operand2,
                      m_ZExtOrSExtOrSelf(
@@ -442,15 +445,12 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::getOrCreate(
                                                                // if inversed
           return createSelectFolder(
               select_inst->getCondition(),
-              builder->CreateBinOp(static_cast<Instruction::BinaryOps>(opcode),
-                                   select_inst->getTrueValue(), lhs),
-              builder->CreateBinOp(static_cast<Instruction::BinaryOps>(opcode),
-                                   select_inst->getFalseValue(), rhs),
+              folderBinOps(select_inst->getTrueValue(), lhs, Name, binOp),
+              folderBinOps(select_inst->getFalseValue(), rhs, Name, binOp),
               "lol2-");
     }
     newInstruction =
-        builder->CreateBinOp(static_cast<Instruction::BinaryOps>(opcode),
-                             key.operand1, key.operand2, Name);
+        builder->CreateBinOp(binOp, key.operand1, key.operand2, Name);
   } else if (isCast(opcode)) {
     // Cast instruction
     switch (opcode) {
@@ -865,7 +865,22 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::folderBinOpsImpl(
     }
     break;
   }
-  case Instruction::Xor:   // x ^ 0 = x , 0 ^ x = 0
+  case Instruction::Xor: { // x ^ 0 = x ; ~~x = x
+    if (ConstantInt* LHSConst = dyn_cast<ConstantInt>(LHS)) {
+      if (LHSConst->isZero())
+        return RHS;
+    }
+    if (ConstantInt* RHSConst = dyn_cast<ConstantInt>(RHS)) {
+      if (RHSConst->isZero())
+        return LHS;
+    }
+    Value* X = nullptr;
+    if (match(RHS, m_SpecificInt(-1)) && match(LHS, m_Not(m_Value(X))))
+      return X;
+    if (match(LHS, m_SpecificInt(-1)) && match(RHS, m_Not(m_Value(X))))
+      return X;
+    break;
+  }
   case Instruction::Add: { // x + 0 = x , 0 + x = 0
 
     if (ConstantInt* LHSConst = dyn_cast<ConstantInt>(LHS)) {
@@ -904,6 +919,12 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::folderBinOpsImpl(
     break;
   }
   case Instruction::And: {
+    // ~~X & Y -> X & Y (VMP NAND masks often arrive double-complemented).
+    Value* peeled = nullptr;
+    if (match(LHS, m_Not(m_Not(m_Value(peeled)))))
+      return folderBinOps(peeled, RHS, Name, opcode);
+    if (match(RHS, m_Not(m_Not(m_Value(peeled)))))
+      return folderBinOps(LHS, peeled, Name, opcode);
     if (ConstantInt* LHSConst = dyn_cast<ConstantInt>(LHS)) {
       if (LHSConst->isZero())
         return builder->getIntN(LHSConst->getBitWidth(), 0);
@@ -1257,15 +1278,41 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::GetValueFromHighByteRegister(
   return createTruncFolder(highByteValue, builder->getIntNTy(8));
 }
 
+MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::privilegeAllowsIF() {
+  LLVMContext& context = builder->getContext();
+  Value* iopl = createOrFolder(
+      createZExtFolder(getFlag(FLAG_IOPL), Type::getInt64Ty(context)),
+      createShlFolder(
+          createZExtFolder(getFlag(FLAG_IOPL2), Type::getInt64Ty(context)),
+          ConstantInt::get(Type::getInt64Ty(context), 1)));
+  return createICMPFolder(
+      llvm::CmpInst::ICMP_ULE,
+      ConstantInt::get(Type::getInt64Ty(context), 3), iopl);
+}
+
 MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::SetRFLAGSValue(Value* value) {
   LLVMContext& context = builder->getContext();
+  Value* allowIF = privilegeAllowsIF();
   for (int flag = FLAG_CF; flag < FLAGS_END; flag++) {
     int shiftAmount = flag;
     Value* shiftedFlagValue = createLShrFolder(
         value, ConstantInt::get(value->getType(), shiftAmount), "setflag");
     auto flagValue = createTruncFolder(shiftedFlagValue,
                                        Type::getInt1Ty(context), "flagtrunc");
-
+    if (flag == FLAG_RESERVED1) {
+      setFlag(FLAG_RESERVED1,
+              ConstantInt::getSigned(Type::getInt1Ty(context), 1));
+      continue;
+    }
+    if (flag == FLAG_RESERVED3 || flag == FLAG_RESERVED5 || flag == FLAG_IOPL ||
+        flag == FLAG_IOPL2 || flag == FLAG_VM || flag == FLAG_VIP ||
+        flag == FLAG_VIF) {
+      continue;
+    }
+    if (flag == FLAG_IF) {
+      setFlag(FLAG_IF, createSelectFolder(allowIF, flagValue, getFlag(FLAG_IF)));
+      continue;
+    }
     setFlag((Flag)flag, flagValue);
   }
   return;
@@ -1680,14 +1727,14 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::GetMemoryValue(Value* address,
       }
     }
   }
-
   // VIP candidates are bytecode-range reads only. VMProtect's dispatch does the
   // next-pcode read last in every handler (AddEndHandlerCommands, intel.cc:27842),
   // so the last bytecode load since the previous transfer is the current VIP.
   // Other module reads (VM tables/context) would otherwise masquerade as the VIP
   // and fabricate loop backedges. (Themida article, "Constant Promotion & Memory
   // Modeling" - configurable range policy.)
-  if (loadAddress != 0 && isModuleAddress(loadAddress)) {
+  if (loadAddress != 0 && isModuleAddress(loadAddress) &&
+      currentPathSolveContext != PathSolveContext::Ret) {
     loadProvenance[result] = loadAddress;
     noteModuleLoad(loadAddress);
   }

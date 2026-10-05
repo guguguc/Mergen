@@ -1830,17 +1830,10 @@ public:
     auto one = ConstantInt::getSigned(Type::getInt1Ty(context), 1);
     auto two = ConstantInt::getSigned(Type::getInt1Ty(context), 2);
 
-    this->FlagList[FLAG_CF].set(zero);
-    this->FlagList[FLAG_PF].set(zero);
-    this->FlagList[FLAG_AF].set(zero);
-    this->FlagList[FLAG_ZF].set(zero);
-    this->FlagList[FLAG_SF].set(zero);
-    this->FlagList[FLAG_TF].set(zero);
-    this->FlagList[FLAG_IF].set(one);
-    this->FlagList[FLAG_DF].set(zero);
-    this->FlagList[FLAG_OF].set(zero);
-
-    this->FlagList[FLAG_RESERVED1].set(one);
+    for (int flag = FLAG_CF; flag < FLAGS_END; ++flag)
+      this->setFlag(static_cast<Flag>(flag), zero);
+    this->setFlag(FLAG_RESERVED1, one);
+    this->setFlag(FLAG_IF, one);
     this->SetRegisterValue(Register::RFLAGS, two);
 
     // auto value =

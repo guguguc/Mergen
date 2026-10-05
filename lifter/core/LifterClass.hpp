@@ -2415,8 +2415,6 @@ public:
   void insertMemoryOp(llvm::StoreInst* inst);
   std::set<llvm::APInt, APIntComparator>
   computePossibleValues(Value* V, const uint8_t Depth = 0);
-  bool tryFoldConcolicInt(llvm::Value* V, uint64_t& out);
-  void dumpRetPopSlot(llvm::Value* rspvalue, llvm::Value* realval);
 
   Value* extractBytes(Value* value, const uint8_t startOffset,
                       const uint8_t endOffset);

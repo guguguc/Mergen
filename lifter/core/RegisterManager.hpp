@@ -61,7 +61,7 @@ enum Flag {
   FLAG_AI = 31,       // Alternate Instruction Set enabled
   // reserved above 32-63
   FLAGS_START = FLAG_CF,
-  FLAGS_END = FLAG_IOPL
+  FLAGS_END = FLAG_ID + 1
 };
 
 namespace llvm {

@@ -40,6 +40,8 @@ __pycache__/
 debug*.txt
 *.log
 *.exe
+!sample/**/*.exe
+!sample/**/*.dmp
 emu_*.py
 check_*.py
 !scripts/rewrite/check_semantic.py

@@ -218,20 +218,8 @@ public:
     structTypes.push_back(llvm::Type::getInt64Ty(this->context));
     structTypes.push_back(llvm::Type::getInt64Ty(this->context));
 
-    // 12 flags
-    structTypes.push_back(llvm::Type::getInt1Ty(this->context));
-    structTypes.push_back(llvm::Type::getInt1Ty(this->context));
-    structTypes.push_back(llvm::Type::getInt1Ty(this->context));
-    structTypes.push_back(llvm::Type::getInt1Ty(this->context));
-    structTypes.push_back(llvm::Type::getInt1Ty(this->context));
-    structTypes.push_back(llvm::Type::getInt1Ty(this->context));
-    structTypes.push_back(llvm::Type::getInt1Ty(this->context));
-    structTypes.push_back(llvm::Type::getInt1Ty(this->context));
-    structTypes.push_back(llvm::Type::getInt1Ty(this->context));
-    structTypes.push_back(llvm::Type::getInt1Ty(this->context));
-    structTypes.push_back(llvm::Type::getInt1Ty(this->context));
-    structTypes.push_back(llvm::Type::getInt1Ty(this->context));
-    structTypes.push_back(llvm::Type::getInt1Ty(this->context));
+    for (int i = 0; i < FLAGS_END; ++i)
+      structTypes.push_back(llvm::Type::getInt1Ty(this->context));
 
     type = StructType::create(structTypes, "CTX");
 
