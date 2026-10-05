@@ -58,37 +58,73 @@ D:\vmp-crcfix\saltscan.exe add_test_vmp.exe add_test_unpacked.exe             ::
 | DR client 源码 / DLL | `D:\sogen\dr\vmpdrtrace.c` / `vmpdrtrace7.dll` |
 | DR client 构建 | `D:\sogen\dr\build_vmpdrtrace7.bat` |
 
-### 0.4 复现命令（两套）
+### 0.4 复现命令（四套：DR 快照 / 无快照 lift / 带快照 lift / DR trace）
 
-**A. lifter（静态）**
+构建（唯一入口）：`D:\sogen\tools\rebuild_mergen_msvc_dbg.cmd`（输出 `build_msvc_dbg\lifter.exe`）。
+注意：增量构建**不跟踪 `.ipp`**，改过 `.ipp` 必须先删 `CMakeFiles` 下的
+`Lifter.cpp.obj Utils.cpp.obj PathSolver.cpp.obj TestInstructions.cpp.obj`。
+
+**A. DynamoRIO 采入口内存快照（`-dumpmem`）**
+
+在**首次执行到 lift 起点**时，一次性 dump 已提交的可写页（映像脏页 + 堆）。不跟指令流。
+
+```powershell
+cd D:\sogen\dr\vmptest
+$DR='D:\DynamoRIO\bin64\drrun.exe'; $DLL='D:\sogen\dr\vmpdrtrace7.dll'
+$argl=@('-c',$DLL,'-entry','0x140007210','-imagebase','0x140000000',
+        '-dumpmem',"$PWD\entry_7210.dmp",
+        '--',"$PWD\add_test_fixed4.exe")
+Start-Process -FilePath $DR -ArgumentList $argl -WorkingDirectory $PWD -Wait
+```
+
+- `-entry 0x140007210` 必须与 lift 起点一致（快照即「该 RIP 上的进程映像」）。
+- 加 `-dumpmem-exit` 可在 dump 完成后立即退出（不跑完整个程序）。
+- 产物（实测）：`regions=84`，约 **19 MB**，格式 `MRGNDMP1` + `{dumpImageBase, imageSize, nregions, flags}` + 每区 `{va, size, prot, bytes}`。
+- 采集过滤（`dump_want_region`）：主模块全收；可写 `MEMTYPE_DATA` 仅收 `VA < 0x7FF000000000`（排除 ntdll 等，否则 overlay 爆）。
+
+**B. lifter：无 dump（历史基线）**
 
 ```powershell
 cd D:\sogen\dr\refs\Mergen\build_msvc_dbg
 $env:MERGEN_MAX_BLOCK_BUDGET='131072'
 cmd /c "lifter.exe D:\sogen\dr\vmptest\add_test_fixed4.exe 0x140007210 > run.out 2> run.err"
-# 产物: output.ll / output_no_opts.ll / output_diagnostics.json
 ```
 
-期望（当前状态，**16:05** `lifter.exe`）：`13291 blocks (1 completed, 2 unreachable), 128252 instructions (0 unsupported)`，
-0 error，仍**停在 13291 块**（真机 30270），诊断：
-`Unresolved indirect jump @0x140323cc0`、`Unresolved ROP chain @0x1403da685`。
-range policy / `shouldPromoteFileValue` 已接线，块数与改前相同。构建只用 `D:\sogen\tools\rebuild_mergen_msvc_dbg.cmd`。
+期望：`13291 blocks (1 completed, 2 unreachable), 128252 instructions (0 unsupported)`，0 error，
+诊断 `Unresolved indirect jump @0x140323cc0` + `Unresolved ROP chain @0x1403da685`。
 
-**B. DynamoRIO（真机真值）**
+**C. lifter：加载快照（当前基线）**
 
 ```powershell
-cd D:\sogen\dr\vmptest
-$DR='D:\DynamoRIO\bin64\drrun.exe'; $DLL='D:\sogen\dr\vmpdrtrace7.dll'
+cd D:\sogen\dr\refs\Mergen\build_msvc_dbg
+$env:MERGEN_MAX_BLOCK_BUDGET='131072'
+cmd /c "lifter.exe D:\sogen\dr\vmptest\add_test_fixed4.exe 0x140007210 --mem-dump D:\sogen\dr\vmptest\entry_7210.dmp > run_dump.out 2> run_dump.err"
+```
+
+- 等价写法：`--mem-dump=<file>`，或环境变量 `MERGEN_MEM_DUMP=<file>`。
+- **不要**开 `MERGEN_DIAG_LIFT_PROGRESS`（日志会爆）。
+- `stderr` 预期两行：
+  `[mem-dump] loaded <N> spans from <file>` / `[mem-dump] concrete spans <K>/<N> bytes <B>`
+  （实测 `433 spans`、`concrete 375/433 bytes 389392` ≈ 380 KB —— 只 CONCRETE「映像 + 2 跳指针可达堆」）。
+- **期望（当前基线，a3a45c5）**：`24240 blocks (1 completed, 1 unreachable), 209049 instructions (0 unsupported)`，
+  `0 error`，**~13s**；唯一告警 `Unresolved ROP chain @0x14032281c`。
+  真机 30270 块，约 80%。
+- 地址空间规则（硬约束）：dump 映像页 → `PE ImageBase + RVA`（并 alias 回 dump VA），
+  其余（堆）原 VA 原样；**格子里的 qword 不 rebase**；禁止区 = `STACKP±0x100000` 与 TEB `0x7FFD0000..0x7FFD2000`。
+
+**D. DynamoRIO 指令 trace / 寄存器真值（可选）**
+
+```powershell
 $argl=@('-c',$DLL,'-entry','0x1401f0efb','-imagebase','0x140000000',
         '-o',"$PWD\t.trace",'-regs',"$PWD\t.regs",'-mem',"$PWD\t.mem",'-trackmem',
         '--',"$PWD\add_test_fixed4.exe")
-Start-Process -FilePath $DR -ArgumentList $argl -WorkingDirectory $PWD -Wait
 ```
 
-可选选项：`-r8 <file>`（R8 解密链真值，输出 `R8,<rva>,<r8>,<r10>`）、
-`-bc`（字节码）、`-analysis`、`-memval`。
-**警告**：`-trackmem` 全量内存流很大（数万行量级）且写探针带值会让 DR 崩，
-寄存器/`-r8` 探针安全。
+- 其它选项：`-r8 <file>`（R8 解密链真值，输出 `R8,<rva>,<r8>,<r10>`）、`-bc`、`-analysis`、`-max <N>`、`-perentry <N>`。
+- **口径**：`-regs` 探针读的是**执行前**，lifter 写流记录的是**执行后**（见 §7.6.12）。
+- **实测坑**：`-max` / `-perentry` 默认 0（不限），但 trace 会在**客户入口那段 stub 交出去**时自然结束
+  （实测 ~20 万条指令、6 MB），所以**深地址可能根本没被 trace 到** —— 用「trace 里没有」下结论前先确认这一点。
+- **警告**：`-trackmem` 全量内存流很大（数万行量级）；写探针带值（`-memval`）会让 DR 崩，寄存器/`-r8` 探针安全。
 
 ### 0.5 博客与依据
 
@@ -212,19 +248,45 @@ D:\DynamoRIO\bin64\drrun.exe -c D:\sogen\dr\vmpdrtrace5.dll ^
 
 ## 5. 现状
 
-- `output_diagnostics.json`（16:05）：`13291 blocks (1 completed, 2 unreachable), 128252 instructions`，**0 error**
-- 与 DR **连续一致 13280 块**；唯一地址 3275
-- `output_no_opts.ll`：`br i1 = 0`，仍是 1 个函数 + 循环
-- 假 `0x58` = 文件 0 + 正确偏移；堆指针在 `0x7210` 前由 `0x88AFE2` 写入。按博客仍从 `0x7210` 抬，不从 `0x4FD849` 起抬。
-- `shouldPromoteFileValue` / `mergen.stale_file_zero` **保留，不还原**（`795f21b`）。IR 已是 `%stale.file + 88`，不再把槽读成 `0`。停在 13291 是因为 **`[heap+0x58]` 的表在堆上、进函数前已填好**，空合成页不够。
+**当前（dump + 主机 `CPUID`，未提交）** — 见 §7.11.11 / §7.11.12。
 
-## 6. 卡点（已定位到 IR 行）
+| 项 | 值 |
+|---|---|
+| 块 / 指令 | **18664 / 178945**（`1 completed, 0 unreachable`） |
+| 耗时 | lift ~7s（`output_diagnostics.json` total ~19s） |
+| 错误 | `0 error` / `0 warning` |
+| 出口 | `[ret] 0x14000723e` `rsp=STACKP` `disp=0` `rop=1`（客户函数尾） |
+| 对照 | insn 流 seq **1–173740** RVA 对齐；**seq 173741** 控制流分叉（`dec rax; jne`，计数器 `0xa0` vs `0x1`） |
+| 已闭合 | `0x806c1`/`0x300b0`/`0x500b0`/`0x5004f` 链（假 CPUID 模板） |
 
-`0x1403b4ff9`（VMP 派发蹦床）解出错误目标 → `pv=0` → 停在 **13291 块**（真机 30270）。
+**提交基线 a3a45c5（有 dump + InstructionCache 共享索引，假 CPUID）**
+
+| 项 | 值 |
+|---|---|
+| 块 / 指令 | **24240 / 209049**（真机 30270 块，约 80%） |
+| 耗时 | **~13s**（此前重建平面表为 ~325s，见 §7.9） |
+| 错误 | `0 error` |
+| 卡点 | 日志仍写 `Unresolved ROP @0x14032281c`；**真正先分叉的是第 4 次 `0x3B4FF9`（§6.1 / §7.11）**。`0x32281c` 在分叉之后，真机根本不执行 |
+| 已消除 | 旧卡点 `Unresolved indirect jump @0x140323cc0`；`mergen.stale_file_zero`（IR 中 0 次） |
+
+**历史基线（无 dump，供对照）**：13291 块 / 128252 指令，卡在 `0x140323cc0`。
+
+**已定结论**
+
+- `shouldPromoteFileValue` / `mergen.stale_file_zero` **保留，不还原**（`795f21b`、`f298e4e`）。
+  IR 里是 `%stale.file + 88`，**不再把槽读成 `0`**，也不再伪造 `0x58`。
+- 13291 那条路停止的原因是 **`[heap+0x58]` 的表在堆上、进函数前已填好**，空合成页不够（§7.6.35）——
+  这正是引入 **入口内存快照**（`ac06524`）的动机。
+- 按博客（Aftermath Labs）仍**从 `0x7210` 抬**，不从 `0x4FD849` 起抬（§7.6.33 / §7.6.34）。
+- **不要在 `solveLoad` 里对同类 DAG 做 unique-fold**，也**不要把 `addrToBB` 已有块一律当回边**（§7.10）。
+- dump 已读入（§7.6.36 / `--mem-dump`）。**不要再把 `0xEF850` / 文件 0 当当前根因。**
+## 6. 卡点与已否证的假设
+
+无 dump 时：`0x1403b4ff9` 解错 → 停在 **13291 块**。有 dump 后仍从同一块分叉，只是继续抬到 24240（§7.10 的 `0x32281c` 是分叉后的死胡同）。
 
 ### 6.1 路径对比（严格逐块，同一次运行）
 
-lifter 的块序列相对真机只多一个入口块（`0x7210`），逐块比较：
+lifter 的块序列相对真机只多一个入口块（`0x7210`），逐块比较（有/无 dump 的**第一个分歧相同**）：
 
 ```
 lifter[1..] vs real[0..] 共 13290 块: 一致 13281 (99.93%)
@@ -234,31 +296,28 @@ lifter[13281] = 0x3B4FF9   real[13280] = 0x3B4FF9     同一块
 lifter[13282] = 0x369063   real[13281] = 0x2D8CD0     ← 分歧
 ```
 
-`0x3B4FF9` 在真机共出现 5 次（idx 5295/11500/12602/13280/15391），
-其中 idx 5295 与 13280 后接 `0x2D8CD0`，idx 15391 后接 `0x369063`。
-**两边各自解出的都是真机用过的目标，只是对应不同的 VM 迭代。**
+`0x3B4FF9` 在真机共出现 5 次（idx 5295/11500/12602/13280/15391）。
+前 3 次后继两边一致；**第 4 次** dump 解出 `0x369063`，DR 走 `0x2D8CD0`。
+真机第 5 次才后接 `0x369063`。这不是「还原了真机没走的合法叉」，是 **走错路**（§7.11）：
+蹦床 `jmp r10` 算对了，进蹦床的 **R8 已经是下一轮的 delta**。
 
-### 6.2 根因：一条栈槽 load 的地址退化成裸偏移
+### 6.2 已否证的假设：`0x14FE48` 槽的「地址退化成裸偏移」
 
-关键槽是 **`0x14FE48`**，它等于 `STACKP_VALUE - 0x58`（`0x14FEA0 - 0x14FE48 = 0x58`）。
+> **本节原判「根因」已被 7.6.18 之后的实测否证**，只保留作为排查记录与教训。
 
-IR 中分歧源（`bb_solved_const89166`）：
+当时的观察：`0x14FE48` = `STACKP_VALUE - 0x58`，IR 里出现 `%memory + 88`（= `0x58`）的 GEP，
+于是判断「一条栈槽 load 的地址退化成了裸偏移」。
 
-```llvm
-L191419:  %70237 = getelementptr i8, ptr %memory, i64 1375816   ; 0x14FE48  ✓ 栈槽
-L191420:  %70238 = getelementptr i8, ptr %memory, i64 88        ; 0x58      ✗
-L191421:  %70239 = load i32, ptr %70238
-L191424:  %70242 = getelementptr i8, ptr %memory, i64 1375820   ; 0x14FE4C  相邻槽
-```
+**否证依据**：
 
-`%memory` 是零基址字节寻址（同一处用完整地址 `1375816` 即为证），所以
-**`%memory + 0x58` 读的是地址 `0x58`，而不是那个栈槽**。
+- `0x58` 从来不是任何指令的字面位移（7.2 在 `0x1402B0000..0x140400000` 内零匹配）；
+- 真机在 `0x140037ebaa` / `0x1403e9af2` 一带确实会算出 `0x58`，**是 VM 的合法还原**（7.6.22 同 visit 实测）；
+- 真正让 lifter 变差的是 **`0x1400EF850` 那格被文件镜像的 0 冒充**（7.6.29 / 7.6.31），
+  它经 `[RSP] → 0x3357C6 → … → 0x37507A` 一路传播；
+- `%memory + 88` 这个 GEP 是**后果**不是原因：换成 `stale.file + 88` 后该 GEP 消失（§7.6.31 后已验证）。
 
-`%70239` 沿 169 个节点的 use-def 链到
-`%realadd-5372596252- = add i64 …, 0x1402E7026`，即派发目标
-（`[halt]` 记录里的 `transfer=%realadd-5372596252-`），目标解不出 → `pv=0`。
-
-**结论：槽地址 `0x14FE48` 与「相对 STACKP_VALUE 的偏移 `0x58`」在这个位置被混用。**
+**教训**：IR 里出现一个「可疑常量 GEP」不等于它就是根因；
+必须先用**同一次运行的两侧真值**确认它是不是进程真实行为。
 
 ### 6.3 `0x1403e9af2` 的真实行为（两流对齐实测）
 
@@ -358,458 +417,18 @@ seq=102322  insn=0x1402e17ee  slot=0x14FCB8  val=0x58   (RDI=0x58, 地址自洽)
 `%memory + 88` 与 `0x14FE48` 槽**不是同一个地址**（零基址下 `88` 即地址 `0x58`）。
 把两者等同是未经核对的推论，**已作废**。
 
-### 7.6.1 完整因果闭环（已确证）
+### 7.6.12 从撤销的结论里保留的教训（读日志必知）
 
-`[smalladdr]` 诊断（`getPointer` 里，address 是常量且落在 `0x40..0x80` 时打印）
-**只命中 1 次**，内容决定性：
+原 7.6.1–7.6.12 那一条链（`R8=0x58` 由 `rol r8b,1` 产生 → `0x1403C4475` 的 `movsx r8w,bpl`
+→ `RBP` 伪栈低字节 → 「VM 把栈指针低字节当数据」）**已被 7.6.18 之后的实测否证并撤销**。
 
-```
-[smalladdr] @14034ed0e addr=0x58 mem_base=R11 mem_index=None
-            mem_disp=0x0 scale=0
-            ops=[0]Register32/ECX [1]Memory32/None
-```
+**但其中两条观察仍然有效，读 `[rdag]` / 诊断日志时必须知道：**
 
-即 `0x14034ed0e`（`mov ecx, [r11]`）的**基址寄存器 `R11` 退化成 `0x58`**，
-于是有效地址 = `0 + 0x58`，读的是地址 `0x58`。
-
-链路（两侧实测，序号来自统一事件流）：
-
-```
-0x1402e17d5  mov rdi,[rsp+r11]   r11=0x30 → 从栈槽读出 0x58    <-- 错误值入口
-      ↓
-0x1402e17ee  mov [rbx],rdi       seq=102322  把 0x58 写进 VM 槽 0x14FCB8
-      ↓
-0x14034ecfd  mov r11,[rbx]       seq=102349  读回 0x58 → R11=0x58
-      ↓
-0x14034ed0e  mov ecx,[r11]       seq=102353  有效地址 0x58 → 读到垃圾(符号)
-      ↓
-ecx 符号 → 派发目标符号化 → 蹦床 jmp r10 解不出 → pv=0 → 停在 13291 块
-```
-
-**真机真值对照**（`site.regs` / `r8.regs`）：
-
-| 位置 | 真机 | lifter |
-|---|---|---|
-| `0x2e17ee` 的 `RDI`（21 次） | `0x7ff6a5200000`(模块基址) / `0x91cb5c000`(堆) / `0x0` / `0x202` | **`0x58`**（真机从不出现） |
-| `0x34ecfd` 的 `R11`（3 次） | `0xfffffffffffb894c` / `0xfffffffffff7edc6` / `0x6d564` | 前两次 `0x1402b2ed0`/`0x1402b2f4c`（正常，seq 53173/76531），第三次 **`0x58`** |
-
-**⇒ 根因是一条指令：`0x1402e17d5`（`mov rdi,[rsp+r11]`，`r11=0x30`）
-从栈槽读出了 `0x58`，而真机该槽里是指针。** 错误值由此进入 `RDI`，
-经 `[rbx]` 中转后成为 `R11`，使 `[r11]` 读地址 `0x58`。
-
-（这正是本文件 6.1 最初记录的现象 —— `lifter: [rsp+0x58]=88 / 真值: 模块基址类`。）
-
-### 7.6.2 收敛到「第一条读错」的精确帧（seq 102317–102322）
-
-统一事件流（`reg6.csv` + `wr6.csv`）在分歧点附近逐条：
-
-```
-seq=102312  R11 = 0x30                                   <- 索引寄存器
-seq=102317  0x1402e17d5  mov rdi,[rsp+r11]  -> RDI = 0x58   <- 从 [0x14FC60+0x30]=0x14FC90 读出 0x58
-seq=102318  R11 = 0x14fe50
-seq=102319  RBX = 0x14fe48
-seq=102322  0x1402e17ee  mov [rbx],rdi      -> 写 0x58 到 0x14FE48
-seq=102323  R11 = 0x0
-seq=102347  R10 = 0x14034ecfd
-seq=102349  0x14034ecfd  mov r11,[rbx]      -> R11 = 0x58      <- 退化
-seq=102352  RCX = 0x58
-seq=102353  0x14034ed0e  mov ecx,[r11]      -> [0x58] 读到符号 <- 派发目标符号化
-```
-
-指令编码：
-
-```asm
-0x1402e17d5  4a 8b 04 3c     mov rdi, [rsp + r11]     (REX.W + 8B /r, SIB)
-```
-
-**结论：第一个错误值出现在 `0x1402e17d5` 这条读上** —— 它从 `[RSP+0x30] = 0x14FC90`
-读出 `0x58`，而真机该槽的值域是 模块基址/堆指针/`0x0`/`0x202`（21 次采样，见 7.6.1）。
-
-`0x58` 由此进入 `RDI`，经 `0x2e17ee` 写入 `0x14FE48`，再被 `0x34ecfd` 读成 `R11`，
-最终让 `0x34ed0e` 去读地址 `0x58`。
-
-### 7.6.3 0x14FC90 这个槽的写入史（已查到）
-
-`0x14FC90` 的写入者（`wr6.csv`，按 seq）：
-
-| seq | 指令 | 值 |
-|---|---|---|
-| 38978 | `0x1403e1ad1` | 符号 |
-| 41575 | `0x1403750eb` | `0x800800` |
-| 44088 | `0x1403e0b7c` | `0x800800` |
-| 50515 | `0x1402b8dd0` | `0x4` |
-| 50613 | `0x1403690d4` | `0x4` |
-| 50853 | `0x1403750eb` | `0x4` |
-| 60805 | `0x1402d3889` | 符号 |
-| 62244 | `0x1403e9af2` | `0x11` |
-| 63235 | `0x1403750eb` | 符号 |
-
-**注意 62244（`0x1403e9af2` 写 `0x11`）早于 102317，而 102322 那次写的是 `0x14FE48`
-（另一个槽）** —— 所以 `102317` 读到的 `0x58` **不是** `0x1403e9af2` 在 102322 写的。
-**该槽在 102317 之前还有更晚的写入者尚未列出，需要继续用 `wr6.csv` 过滤 `seq ∈ (63235, 102317)`。**
-
-### 7.6.4 真正的第一条错误：`0x14037ebaa` 的 `mov r8,[rbx]`
-
-继续上溯（`wr6.csv` 过滤 `slot == 0x14FC90 && seq < 102317`，共 54 条写入），
-**最后一条**就是那条 store：
-
-```
-seq=100464  insn=0x1403e9af2  slot=0x14FC90  val=0x58
-```
-
-再查这次 store 的源寄存器：
-
-```
-seq=100416  0x14037ebaa   R8 = 0x58        <- store 前最后一条 R8 写
-seq=100454  0x1403e9ad9   RDI = 0x30       seq=100460  0x1403e9ae5   RSI = 0x14017892d > 同块内
-seq=100464  0x1403e9af2   store 0x58 -> 0x14FC90     (RSP=0x14FC60, +0x30 = 0x14FC90 ✓)
-```
-
-指令编码（`0x14037EBAA`）：
-
-```asm
-0x14037ebaa  4c8b03            mov r8, qword ptr [rbx]   <- R8 = [rbx] = 0x58
-0x14037ebad  402aec            sub bpl, spl
-0x14037ebb0  40c0fd0f          sar bpl, 0xf
-0x14037ebb4  4881c308000000    add rbx, 8                <- 游标步进（与 0x37507a 同模式）
-```
-
-**⇒ 根因是这个「从 VM 数据区读 qword 到 R8」的操作**：lifter 读出 `0x58`，
-而真机在同一模式（`0x37507a` 的 `mov r8,[rbx]`，45 次采样）读出的值域是
-`0x7ff6a5200000`(模块基址) / `0x91c91f7a0`(堆) / `0x213` / `0x202` / `0x2c` 等
-—— **从来不是 `0x58`**。
-
-### 7.6.5 完整闭环（一条链，每环均有两侧真值）
-
-```
-0x14037ebaa  mov r8,[rbx]        R8 = 0x58            <- 第一个错误值（VM 数据区读）
-      ↓ seq 100416
-0x1403e9af2  mov [rsp+rdi],r8    rdi=0x30,rsp=0x14FC60 → 写 0x58 到 0x14FC90
-      ↓ seq 100464
-0x1402e17d5  mov rdi,[rsp+0x30]  读回 0x58            <- 6.1 最初记录的那条
-      ↓ seq 102317
-0x1402e17ee  mov [rbx],rdi       写 0x58 到 0x14FE48
-      ↓ seq 102322
-0x14034ecfd  mov r11,[rbx]       R11 = 0x58           <- 退化
-      ↓ seq 102349
-0x14034ed0e  mov ecx,[r11]       [0x58] → 符号        <- 派发目标符号化
-      ↓ seq 102353
-0x3B4FF9     jmp r10 解不出 → pv=0 → 停在 13291 块（真机 30270）
-```
-
-### 7.6.6 三条链收敛：`R8 = 0x58` 是唯一源头
-
-**链 1（store → 派发）**：见 7.6.5。
-
-**链 2（自循环，已闭合）**：
-
-```asm
-0x1403750eb  4c89043c    mov [rsp+rdi], r8     RSP=0x14fc60 RDI=0x40 → 写 0x14FCA0 (R8=0x58)
-0x14037990b  4a8b3c1c    mov rdi, [rsp+r11]    RSP=0x14fc60 R11=0x40 → 读 0x14FCA0 = 0x58
-0x14037990f  4881eb08..  sub rbx, 8
-0x140379916  48893b      mov [rbx], rdi        → 压入 0x14FDC0 (= 0x58)
-0x14037ebaa  4c8b03      mov r8, [rbx]         RBX=0x14FDC0 → R8 = 0x58   <- 回到起点
-```
-
-**`R8 = 0x58` 被压进 VM 栈、再被 `mov r8,[rbx]` 读回 `R8`，形成自循环** ——
-所以 `0x58` 一旦产生就会一直传播下去。
-
-**链 3（诊断直接命中）**：`[smalladdr] @14034ed0e mem_base=R11`，`R11 = 0x58`。
-
-### 7.6.7 唯一源头：`R8 = 0x58` 由 5 条 `rol r8b,1` 产生
-
-lifter 的寄存器流里 `R8 = 0x58` 只在这些指令上出现（每条前一条都是 `R8 = 0x2c`）：
-
-```
-0x140376FF7   0x1403CDBB2   0x1403BEAB9   0x14031C1B7   0x1402F2468
-（另有 0x1403A85EC / 0x1402E14F3，同型）
-```
-
-`0x2C << 1 = 0x58` —— `rol r8b,1` 的语义正确，**但真机在同一条 `0x140376ff7` 上的值是 `0x2c`**
-（`r8s.r8` 实测：`0x2c / 0x6c / 0x74`）。
-
-⇒ **lifter 在这个旋转链上多走了一步**（或进入该链时 `R8` 的初值与真机不同）。
-这里是「为什么读错」的最上游可定点。
-
-### 7.6.8 分歧的确切指令：`0x140376ff7`（`rol r8b,1`）
-
-**lifter 完整链**（`reg6.csv`，每处三次迭代）：
-
-```
-0x140376FCA  adc r8b,0x1f     R8 = 0x88 / 0x68 / 0x21
-0x140376FD1  movzx r8d,[r9]   R8 = 0xed / 0x35 / 0xf2
-0x140376FDA  xor r8b,sil      R8 = 0x20 / 0xa0 / 0x90
-0x140376FDD  sub r8b,0x79     R8 = 0xa7 / 0x27 / 0x17
-0x140376FE1  rol r8b,7        R8 = 0xd3 / 0x93 / 0x8b
-0x140376FEB  not r8b          R8 = 0x2c / 0x6c / 0x74     <-- 真机同值 ✓
-0x140376FF7  rol r8b,1        R8 = 0x58 / 0xd8 / 0xe8     <-- 真机 0x2c/0x6c/0x74 ✗
-0x140376FFF  neg r8b          R8 = 0xa8 / 0x28 / 0x18
-```
-
-**真机在 `0x376ff7` 处 R8 与上一条 `0x376feb` 完全相同（未变），lifter 翻倍**
-（`0x2C<<1 = 0x58`，`rol r8b,1` 语义正确）。
-
-**⇒ 最可能：真机在该轮并未执行到 `0x376ff7`**（该段是 VM handler 尾部，
-`0x140376FC0` 是 `jmp rdi` 间接跳转、`0x140376FD1` 是 `movzx r8d,[r9]` 字节码读），
-**lifter 把它当作顺序执行过去了** —— 即 **handler 边界 / 间接跳转落点在这一处判断有偏差**。
-
-注意 `0x140376FCA` 的 `adc r8b,0x1f` 是 **CF 依赖**指令，紧邻还有 `sbb`/`setl`/`bt`/`btr`，
-与第 4 节记录的「flags 条件选择」改动区域相关，一并存疑。
-
-### 7.6.9 更正 7.6.8 的推断 + 新的精确线索
-
-**7.6.8 里「真机没走到 `0x376FF7`」的推断被否证**：真机与 lifter 在
-`0x376FC0`（`jmp rdi`）处的后继块**完全相同**：
-
-```
-真机 @0x376FC0 (块 idx 2470) -> 0x3ce9d7, 0x2ba263, 0x3d0ed5
-lifter @0x376FC0 (块 idx 2471) -> 0x3ce9d7, 0x2ba263, 0x3d0ed5
-```
-
-（lifter 仅多一个入口块，与 6.1 的 13281 块一致。）
-
-**真正的数值关系（更强的线索）**：
-
-```
-真机 @0x376FF7   R8 = 0x2c   ==  lifter 在【上一条】0x376FEB 的值
-lifter @0x376FF7 R8 = 0x58   ==  0x2c << 1
-```
-
-⇒ **lifter 比真机多「做了一次操作」。** 但两边路径与指令序列相同，
-所以副作用只能来自 `0x376FEB` 与 `0x376FF7` **之间**那三条指令：
-
-```asm
-0x140376fee  480fa3cd   bt  rbp, rcx     ; 只动 CF
-0x140376ff2  440fb3cd   btr ebp, r9d     ; 位测试并复位（操作 ebp）
-0x140376ff6  f8         clc              ; 只动 CF
-```
-
-**嫌疑：`btr ebp, r9d`（`0x140376ff2`）的 lift 语义若错误地写到了 `R8`
-（而非 `EBP`），就会造成这个精确的一步偏移。**
-
-### 7.6.10 重要更正：7.6.7 / 7.6.8 / 7.6.9 的「rol 分歧」可能是口径不一致
-
-**7.6.9 的 `btr` 嫌疑已排除**：读 `lift_btr`（`Semantics_Misc.ipp:982-1018`），
-它只做 `baseVal = GetIndexValue(0)` → 位复位 → `SetIndexValue(0, baseVal)`，
-**只写回操作数 0（`ebp`），不碰 `R8`**。
-
-**新的、更可能的解释**：两侧探针的取值口径不同。
-
-- `reg6.csv`（lifter 的 `MERGEN_REG_STREAM_FILE`）记的是
-  `SetRegisterValue_internal` 被调用时的**新值 = 执行后**；
-- DR 的 `-r8` 探针用 clean call 插在指令前，**取的是执行前值**
-  （第 2 节记录过：`[regs]` 探针从 `0x1f0efb` 的 `push rdi` 校准为「执行前」）。
-
-若 `-r8` 是执行前值，则：
-
-```
-真机 @0x376FF7  R8 = 0x2c   = 执行前
-lifter @0x376FF7 R8 = 0x58  = 执行后
-=> rol r8b,1 在两边的语义一致（0x2c -> 0x58），此处【没有分歧】
-```
-
-**⇒ 7.6.7 / 7.6.8 关于「lifter 多旋转一次」的结论未经此口径核对，应视为待验证。**
-
-**核对方法**：取一个 `-r8` 站点，其**前一条指令确定地写该寄存器**，
-比较 `-r8` 的值与 lifter 在该前一条的值 —— 若相等则是执行前口径。
-`0x3E957E`（`mov r8d,[r11]`，其前为 `0x3E957A` 且 lifter 记 `R8=0x3500`）
-正好可用：真机 `0x3E957E` 处 `R8 = 0x3500`，与 lifter 在 `0x3E957A` 的 `0x3500` 相同
-（见 7.6 系列数据），**这支持「执行前」口径**。
-
-### 7.6.11 口径校准的结果（重要）
-
-**校准测试（决定性）**：
-
-```
-真机 -r8 探针 @0x3E957E : 0x3500 / 0x6c00 / 0xffffffffffffe800 / ...
-lifter reg6.csv @0x3E957A: 0x3500          <- 相等（0x3E957A 是 0x3E957E 的前一条）
-lifter reg6.csv @0x3E957E: 0x6c9128f2      <- 不等
-```
-
-**⇒ DR 的 `-r8` / `[regs]` 探针取「执行前」值；`reg6.csv` 记「执行后」值。**
-正确口径：**真机在指令 X 的执行前值 == lifter 在 X 前一条指令的执行后值。**
-
-**因此 7.6.7 / 7.6.8 / 7.6.9 关于「lifter 在 `rol r8b,1` 上多旋转一次」的结论
-作废** —— 那是口径不一致造成的假分歧（真机 `0x2c` 是执行前，lifter `0x58` 是执行后，
-`rol r8b,1` 两边语义一致）。
-
-### 7.6.12 不受口径影响的结论（最终）
-
-用正确口径重比关键点，结论不变且更硬：
-
-```
-真机 @0x2e17ee 的 RDI（执行前，21 次采样）:
-   0x7ff565d40000（模块基址）/ 0x7999947000（堆）/ 0x0 / 0x202 / 0x1
-lifter RDI 由 0x1402e17d5 写入（执行后）:
-   0x0 / 0x0 / 0x7ffd1000 / <符号> / 0x0 / <符号> …（其中某次为 0x58）
-```
-
-`0x58` 与 `0x202`/指针**不是「差一条指令」能解释的差异**（量级完全不同），
-所以：
-
-**根因：`0x1402e17d5`（`mov rdi,[rsp+r11]`，`r11=0x30`）从栈槽 `0x14FC90`
-读出了 `0x58`，而真机该槽里是指针 / flag 族值（`0x202`、`0x1`、模块基址、堆指针）。**
-
-该错误值经 `RDI → 0x2e17ee → [rbx] → 0x34ecfd(R11) → 0x34ed0e([r11])`
-传到派发目标，目标符号化 → 蹦床解不出 → 停在 13291 块。
-
-### 7.6.13 最外层产生点：`0x1403C4475`（`movsx r8w, bpl`）
-
-按执行序取**第一次** `R8 = 0x58`（不是自循环里那次）：
-
-```
-seq=6257  0x1403c444f   R11 = 0x140175f39        <- 字节码指针
-seq=6266  0x1403c4465   R8  = <符号>             (rcl r8w, 0xb8)
-seq=6269  0x1403c446d   R8  = <符号>             (btc r8d, ebp)
-seq=6270  0x1403c4471   R8  = 0x5f39             (movzx r8d, r11w = R11 低 16 位)
-seq=6271  0x1403c4475   R8  = 0x58               (movsx r8w, bpl)
-```
-
-对应反汇编：
-
-```asm
-0x1403c444b  movzx r9d, byte ptr [r11]   ; 字节码读
-0x1403c444f  add   r11, 1                ; 游标前进
-0x1403c4456  xor   r9b, r10b             ; rolling key
-0x1403c4459  sub   r9b, 0x17
-0x1403c445d  rol   r9b, 4
-0x1403c4461  sub   r9b, 6
-0x1403c4465  rcl   r8w, 0xb8             ; CF 依赖
-0x1403c446a  neg   r9b
-0x1403c446d  btc   r8d, ebp              ; 位测试并取反（CF 依赖）
-0x1403c4471  movzx r8d, r11w             ; R8 = 0x5f39
-0x1403c4475  movsx r8w, bpl              ; R8 低字节 = BP 低字节 = 0x58   <-- 首次 0x58
-0x1403c4481  movsx r8w, r8b
-0x1403c4486  shr   r8w, cl
-0x1403c448a  mov   r8, qword ptr [rsp + r9]
-```
-
-**⇒ `0x58` 来自 `RBP` 的低字节**（`movsx r8w, bpl`）。
-而 `0x1403c4471` 的 `0x5f39` 是 `R11` 的低 16 位（R11 = 字节码指针，其寻址已确认与真机一致）。
-
-**下一步唯一动作**：查 lifter 在 `0x1403c4475` 处的 `RBP` 低字节 ——
-若 lifter 是 `0x58` 而真机不是，则上溯到写 `RBP` 的指令；
-`RBP` 在 lifter 里常是 `%newreg = or i64 %X, 1375488`（= `0x14FE60` 一类伪栈基址），
-**若 `RBP` 被算成了伪栈地址而其低字节恰好是 `0x58`，那就是「伪栈地址低字节被当成数据」**。
-
-### 7.6.14 收束点：`RBP` 的低字节（`0x1403C4475` 的唯一输入）
-
-`RBP` 在 lifter 里的形态（早先 `[stb]` 探针记录）：
-
-```
-RBP = %newreg = or i64 %<符号>, 1375488      (1375488 = 0x14FE60，低字节 0x60)
-RBP = %newreg = or i64 %<符号>, 1375744      (1375744 = 0x14FE80，低字节 0x80)
-```
-
-即 **`RBP` 是「伪栈地址类」值**。注意 `STACKP_VALUE - 0x58 = 0x14FE48`，
-低字节 `0x58` 对应 `0x14FE58` 一类的地址。
-
-**但 `RBP` 在真机侧同样是栈指针类值 —— 真机 `RBP` 的低字节完全可能也是 `0x58`。**
-所以「`RBP` 低字节 = `0x58`」本身**可能不是错的**，`movsx r8w, bpl` 也可能正确。
-
-**⇒ 最后一层需要对比 `RBP` 的精确值**，而 `RBP` 不在寄存器流白名单里
-（与 `RDI` 同样的情况，见 7.8）。这是当前唯一的缺口。
-
-### 7.6.15 本次会话的最终上溯链（一条）
-
-```
-RBP 的低字节 = 0x58                       <- 最后的可定点（未与真机核对）
-      ↓ 0x1403C4475   movsx r8w, bpl
-R8 = 0x58
-      ↓ 反复 压栈(0x1403750eb/0x1403e9af2) ↔ 读回(0x14037ebaa)，构成自循环
-0x1402e17d5   mov rdi,[rsp+0x30]   读回 0x58              <- work.md 6.1 最初那条
-      ↓
-0x1402e17ee   mov [rbx],rdi        写 0x58 到 0x14FE48
-      ↓
-0x14034ecfd   mov r11,[rbx]        R11 = 0x58             <- 退化
-      ↓
-0x14034ed0e   mov ecx,[r11]        [0x58] -> 符号          <- 派发目标符号化
-      ↓
-0x3B4FF9      jmp r10 解不出 -> pv=0 -> 停在 13291 块（真机 30270）
-```
-
-### 7.6.16 根因确认：`RBP` 被建模成伪栈地址，其低字节漏进数据
-
-DR 探针（`vmpdrtrace8.dll`，新增 `0x3C444F/0x3C4471/0x3C4475/0x3C4481` 站点 + `RBP`/`RSP`）：
-
-```
-真机 @0x3C4475 (7 次):
-   RBP = 0x17b92ff9b8   R8 = 0x5d94
-   RBP = 0x17b92ff9c0   R8 = 0x5f39
-   RBP = 0x17b92ff9b6   R8 = 0x60d6
-   RBP = 0x17b92ff98c   R8 = 0x636b
-   RBP = 0x17b92ff950   R8 = 0x67be
-   （低字节 = 0xb8/0xc0/0xb6/0x8c/0x50 —— 从不是 0x58）
-```
-
-**口径更正（7.6.11）**：`@0x3C4475` 探针是执行前，此时 `R8` 仍是上一条
-`movzx r8d, r11w` 的结果，**不能**说「真机没做 `movsx r8w, bpl`」。
-`r8.regs` 里下一条 `0x3C4481` 的执行前 `R8` 就是 `movsx` 之后：
-visit2 `BPL=0x90` → `R8=0xff90`；visit1 `0x88` → `0xff88`。
-真机**执行了** `movsx`，输入是 `BPL`（7 次都不是 `0x58`）。
-lifter 对齐 visit2：`R8` 前值同为 `0x5f39`，之后 lifter 得到 `0x58`（`BPL` 错）。
-
-| | 真机 | lifter |
-|---|---|---|
-| `0x3C4471` 出的 `R8` | `0x5d94 / 0x5f39 / 0x60d6 / 0x636b / 0x67be` | `0x5d94 / 0x5f39` ✅ |
-| `0x3C4475` 出的 `R8` | 保持 `0x5f39`（低字节 `0x39`） | **`0x58`** |
-| 该处 `RBP` | `0x17b92ff9c0`（真实栈指针，模块外堆区） | **`0x14fe58`（伪栈地址）** |
-
-`0x3C4471` 两侧一致 ⇒ **字节码读与 `R11` 游标都正确**；
-分歧精确发生在 `0x3C4475`。
-
-**⇒ 根因：`RBP` 在 lifter 里被建模成伪栈地址（`0x14FE58`），真机 `RBP` 是真实栈指针
-（`0x17b92ff9c0`）。`movsx r8w, bpl` 把「伪造址的低字节 `0x58`」当作 VM 数据搬进 `R8`，
-经自循环与中转后成为那个错误的派发目标。**
-
-这条与 6.1 最初记录的 `lifter: [0x14FE48]=88 / 真值: 指针` 现象是同一件事。
-
-### 7.6.17 根因的本质：VM 把「栈指针的低字节」当数据用
-
-`RBP` 在 lifter 里的伪栈赋值来自**标准栈帧建立指令**（lift 本身正确）：
-
-```asm
-0x1403d7f88  488dac2440010000   lea rbp, [rsp + 0x140]   ; RBP = 栈上固定偏移（672 次）
-0x14036c47a  488bec             mov rbp, rsp             ; RBP = 栈指针
-0x14036c47d  4881ec80010000     sub rsp, 0x180
-0x1403c1d57  4881c508000000     add rbp, 8               ; 循环步进
-```
-
-⇒ **分歧不在指令语义，而在「栈放在哪」**：
-
-| | `RBP` | `bpl`（低字节） |
-|---|---|---|
-| 真机 | `0x17b92ff9c0`（真实栈，模块外堆区） | `0xc0` |
-| lifter | `0x14fe58`（伪栈，`STACKP_VALUE` 附近） | `0x58` |
-
-**而 VM 在 `0x1403c4475` 用 `movsx r8w, bpl` 读取 `RBP` 的低字节并当作 VM 数据使用**
-（见 7.6.16 的逐次对照：真机 `R8` 保持 `0x5f39`，lifter 变 `0x58`）。
-
-**⇒ 最终根因：VM 的混淆把「栈指针的一个字节」泄漏进了数据流。
-因此 VM 的语义依赖栈的实际落点；lifter 用固定伪栈基址
-`STACKP_VALUE = 0x14FEA0`（低字节 `0xA0`），与真机栈（低字节 `0xC0`）不同，
-于是 VM 算出的数据与真机不同 —— 该数据最终成为派发目标，导致 `jmp r10` 解不出。**
-
-这也解释了为什么此前所有「寻址/字节码/key/flags」方向都排除了：
-**它们全是对的；错的是「栈基址字节」这一个自由度。**
-
-**重要限定（勿据此写死常量）**：真机 `RBP` 的低字节**在不同运行/不同点都不同**：
-
-```
-rbp.regs : 0x00 0x16 0x50 0x8c 0x90 0xa8 0xaa 0xb6 0xb8 0xc0 0xdc
-r8.regs  : 0x16 0xa8 0xdc
-site.regs: 0x20 0x3a 0x90
-RSP 低字节（r8.regs）: 0x90(194) 0xb0 0xa8 0xa0 0x38
-```
-
-⇒ **「把 `STACKP_VALUE` 低字节改成 `0xC0` 去对齐」是错的**（那只是某一次运行的值）。
-
-**尚未确定的一点**：`0x58` 作为 `R8` 的**最终**值是否有意义。
-`0x3C4475` 之后还有 `0x3C4481 movsx r8w, r8b`、`0x3C4486 shr r8w, cl`、
-`0x3C448a mov r8, [rsp+r9]` 会继续改写 `R8` ——
-所以「`bpl` 的字节泄漏成数据」这一机制**已被证实存在**，
-但「它是否就是最终导致派发目标错误的那个值」还需在 `0x3C448a` 处再对照一次
-（真机该点可用 `vmpdrtrace8.dll` 的 `poff` 名单加 `0x3C448A` 采集）。
+1. **`[rdag]` 有 300 节点硬上限**。日志里看到的最大深度（如 278）**不代表链的真实深度** ——
+   根因常常在未打印的那一段。想靠 `[rdag]` 定位根，必须先确认它没被截断。
+2. **两侧口径必须校准后才能比较**：DR `-regs` 探针读的是**执行前**，lifter 写流记录的是**执行后**。
+   正确对照是「真机在 X 处的 pre 值」↔「lifter 在 X 的**前驱**的 post 值」。
+   不校准就对照，会得出整片假结论（原 7.6.7–7.6.9 就是这么错的）。
 
 ### 7.6.18 `0x37EBAA` 的 43 次真机对照（本轮新数据）
 
@@ -1152,7 +771,7 @@ watchW#1..#8  pre_entry=1  ip=image+0x88AFE2  size=1  逐字节写 EF850..EF857
 
 先前「磁盘 0 ⇒ 没有 runtime init」被否掉：有 init，只是在 **`0x7210` 之前**（壳/CRT 路径，来自 `AddressOfEntryPoint`）。
 
-### 7.6.32 promotion 全路径接上后块数仍未动
+### 7.6.32 历史：promotion 全路径接上后块数仍未动（已被 §7.9 的 24240/13s 取代）
 
 构建：`D:\sogen\tools\rebuild_mergen_msvc_dbg.cmd`（不是 `scripts\dev\configure_iced.cmd`）。
 运行：`work.md` 0.4 A，起点 **`0x140007210`**。
@@ -1215,7 +834,7 @@ Aftermath Labs《Static Devirtualization of Themida》2026-05-09 把 **VMP 也�
 
 运行前写了两层：指针在映像节里，**表在 HeapAlloc 出来的堆上**。只符号 `0xEF850`、只种空 `heapBase`、只读 PE 节，第一次 `load [heap+0x58]` 仍是 0/符号。
 
-### 7.6.36 入口 dump 的地址空间（硬约束，未实现）
+### 7.6.36 入口 dump 的地址空间（硬约束，已接线）
 
 dump 映像 ASLR 在 `0x7FF781290000`（`0xEF850` → `0x7FF78137F850`）；lifter 映像永远是 PE `ImageBase=0x140000000`（`0xEF850` → `0x1400EF850`）。堆是第三套 VA（本样本 `0x2910…`）。
 
@@ -1232,7 +851,9 @@ dump 映像 ASLR 在 `0x7FF781290000`（`0xEF850` → `0x7FF78137F850`）；lift
 
 **先前代码不还原。** `795f21b`（可执行未知节 CONCRETE、`shouldPromoteFileValue`、composed 0 → `stale.file`）继续留着：没有它会回到 `0+0x58`。主 lift 仍从 `0x7210`，不从 `0x4FD849`。不要整节 SYMBOLIC，不要 overlay 一个堆常量。
 
-需要做的是 **入口内存快照当初始 RAM**（不是跟 trace 抬、不是还原脚本）：
+dump overlay **已经接上**（§7.6.36 标题仍写「未实现」是旧文；以 0.4 C / 本节验收为准）。当前该做的是 **§7.11**：第 2 次 `0x301D45` 的栈槽 VIP，不是再采 dump。
+
+历史步骤（已完成，留作复现）：
 
 1. **DR**：第一次执行到 lift RVA 时 dump 已提交 RW（主模块映像页 + `MEM_PRIVATE` 堆）。不要 dump ntdll。格式 `MRGNDMP1`：`dump_image_base`、`SizeOfImage`、若干 `(va, size, prot, bytes)`。
    ```
@@ -1244,7 +865,7 @@ dump 映像 ASLR 在 `0x7FF781290000`（`0xEF850` → `0x7FF78137F850`）；lift
    lifter.exe D:\sogen\dr\vmptest\add_test_fixed4.exe 0x140007210 --mem-dump D:\sogen\dr\vmptest\entry_7210.dmp
    ```
 3. **再从 `0x7210` 抬**：RSP 仍具体。期望 `[0x1400EF850]` 是堆指针、`[heap+0x58]` 能读到表项。
-验收（分层 cache + dirty qword dump，exit 0）：**24240 blocks / 209049 insns**（真机 30270）。`[EF850]` 已是堆指针。旧蹦床间接跳诊断消失。卡点见 **7.10**。`buffer` 仍深拷。
+验收（分层 cache + dirty qword dump，exit 0）：**24240 blocks / 209049 insns**（真机 30270）。`[EF850]` 已是堆指针。旧蹦床间接跳诊断消失。**先修 §7.11 第 4 次 VIP，再谈 §7.10。** `buffer` 仍深拷。
 5. `foldOrigin` 仍不可信（6.4）。
 
 实现：`RuntimeMemDump.hpp`、`FileReader` overlay、`--mem-dump`、`vmpdrtrace -dumpmem` 已接线。`795f21b` 不还原。无 dump 时 policy 与 13291 路径相同。
@@ -1288,12 +909,450 @@ Unflatten 每个新块都 `branch_backup` 一份 `InstructionCache`。folder（�
 2. **嵌套 `load` 的 GEP 偏移不是常量**（`base + 4*(x&255)`，`x` 又是上一层 xor/load）。`computePossibleValues` / `solveLoad` 只在偏移已是 `ConstantInt` 时 `retrieveCombinedValue`；不会沿 use-def 把内层 load 先读成数再折外层。
 3. **不能按 `x&255` 枚举 256 路**。那是控制流分叉，每臂深拷 `buffer`，会 OOM。正确是 **unique-fold**：只对这条解不出的 `ret` 弹出值做整数 DAG 求值（const / cast / binop / 对 `%memory` 的 load），得到 **一个** RIP 再入队。不要在 lift 期对所有同类 load 做同样的折（会把已经对齐的 dispatcher `ret` 走歪）；不要把 `addrToBB` 里 `.pdata` outline 空壳当回边（会收成几十块）。
 
-所以：dump 已经把表字节备齐了，缺的是 **ret 目标这条嵌套表链的单值求值**，不是再 overlay、也不是从 `0x4FD849` 抬。
+**当前优先级低于 §7.11。** 真机从不执行 `0x32281c`；它出现是因为第 4 次 `0x3B4FF9` 已经走进 `0x369063`。先把 VIP/`R8` 对齐，这条 ROP 会自己从主路径消失。unique-fold 约束仍有效，只是不要再把它当「当前该解的题」。
+
+实现约束（若仍碰 Ret 嵌套表）：`tryFoldConcolicInt` **只**在 `PathSolveContext::Ret` 且弹出值还不是 `ConstantInt` 时跑；失败则保持 PATH_unsolved（Ret 上 `pvset>2` 清空，禁止 256 路）。lift 期 `solveLoad` 不动。Ret 求解中的 `retrieveCombinedValue` 不写 VIP。不要 `addrToBB` outline 当回边。
+
+## 7.11 第 4 次 `0x3B4FF9`：R8 错在 VIP，不在蹦床
+
+口径：DR `-regs` = **指令前**；lifter `[tramp] enter` / `[vip] pre` = **进块前**（与 §7.6.12 相同）。dump overlay 已加载。不要再开 `0xEF850`。
+
+蹦床本身（`0x3B4FF9` `sub/not/movsxd r8` + `add r10,r8` + `jmp r10 @ 0x3B501C`）两边一致。R10 稳定 `…57026` / `0x402E7026`。第 1–3 次入口 R8 一致；**第 4 次 dump 入口 R8=`0x3E13644` = 真机第 5 次**，真机第 4 次是 `0x3EA39D7` → 后继 `0x2D8CD0`。dump 因此跳到 `0x369063`。
+
+进蹦床前 native 前缀两边仍对齐：
+
+```
+0x2E6FF6  mov rsi, r9
+0x2E7043  mov r8d, [r9]      ← 从 VIP 取 dispatch dword
+0x2EB20F  xor r8d, esi
+0x3543AF  dec / bswap / neg
+0x2FD67F  dec / not / sub / ror
+0x3B4FF9  jmp r10
+```
+
+`0x2E7043` pre（`build_msvc_dbg/run_vip.out` vs `vmptest/vip.regs`，2026-10-04）：
+
+| 次 | dump R9 / dword[R9] | DR R9 RVA / dword[R9] |
+|---|---|---|
+| 1 | `0x14012E4EA` / `0x1DA6BFD9` | `0x12E4EA` / `0x1DA6BFD9` |
+| 2 | `0x14012CD1D` / `0x1BA60196` | `0x12CD1D` / `0x1BA60196` |
+| 3 | `0x140205928` / `0x1894DF79` | `0x205928` / `0x1894DF79` |
+| **4** | **`0x14014AAE0` / `0x18203851`** | **`0x20557A` / `0x1D940E49`** |
+| 5 | `0x1402266B6` / `0x1696D5A7` | `0x1E4887` / `0x182ADA3E` |
+
+`0x2E6FF6` 第 3 次（喂第 4 次 load）：dump R9=`0x14014AAE4`，DR=`image+0x20557E`。两块之间只把 R9 减 4，算术对。
+
+VIP 抄自 `0x301D45`（`mov rcx,[rbx]; mov r9,rcx`）。该块两边都只进 **2** 次（不是漏探）：
+
+| 次 | dump 进块 R8 | DR R8 = `[RBX]` |
+|---|---|---|
+| 1 | `0x14020592C` | `image+0x20592C`（随后蹦床第 3 次） |
+| **2** | **`0x14014AAE4`** | **`image+0x20557E`（应喂蹦床第 4 次）** |
+
+dump 的 RBX 是伪栈 **`0x14FDB0`**（`STACKP-0xF0`）；`file.readMemory` 读不到槽 SSA。第 2 次进 `0x301D45` 时 **VM 栈槽 / R8 已经是错 VIP**。`lastModuleLoad` 仍停在 `0x14020568B` 一带（和 DR 当时的 R9 同邻域），所以不是「整段字节码指针丢了」，是 **栈上那份 VIP 副本写错/写早**。
+
+上表是 flags 修之前的常数路径（VIP 被折死成 `0x14014AAE4`，蹦床第 4 次进 `0x369063`，块数 **24240**）。`0x217` 对齐之后现象变了，见下两小节。不要 256 枚举，不要 overlay 堆常量，不要 unique-fold 普通 load，不要 `GetRFLAGSValue |= 0x202`。
+
+探针（未提交）：lifter `[vip] pre` / `[tramp]`；`vmpdrtrace.c` 同址。
+
+### 7.11.1 `0x217` 怎么改了旧路径
+
+真机 `0x360B07` `[rbx] = 0x217` = CF|PF|AF|reserved1|IF（加法留下 `0x15`，再拼 bit1 和 IF）。VMP 会 `pushfq` / `pop [rbx]`，把这份 RFLAGS **当栈数据** 去做 `shr` / NAND，不是只给条件跳用。
+
+修之前 dump 同槽是 **`0x15` / `0x17`**（缺 IF，有时缺 reserved1）：
+
+| 原因 | 效果 |
+|---|---|
+| `InitRegisters` 写基类闲置 `FlagList`，`pushfq` 读 concolic `vecflag` | IF、bit1 入口就是 0 |
+| `lift_cli` 无条件清 IF；`popfq` 从栈装 IF | 用户态 CPL>IOPL 不该改 IF |
+| `FLAGS_END = FLAG_IOPL` 且 loop `< FLAGS_END` | 系统位拼不全（后来扩到 `FLAG_ID+1`） |
+
+错 flags 是**常数**。进 `shr rdx, cl`（`0x1402E6408`）和后面 NAND 时 KnownBits 全常数，`select(ZF,-1,0)` 被收成 `-1` 或 `0`。NAND 只剩一路：**`0x14014AAE4`**（`3C2BA9` 加法结果；`~0xFFFFFFFEBFEB551B`）。`2C28EC` 写过真 VIP `0x14020557E` 到 `0x14FE48`，被这条常数链盖掉。`0x301D45` 第 2 次弹出 `14AAE4`，蹦床第 4 次具体跳到错的 `0x369063`。
+
+**不是 SHR 当年算对了。** 是错的常数 flags 把符号路径折死了。
+
+已做（通用 x86，不是样本常数）：入口 `setFlag` 写 `vecflag`（IF=1、reserved1=1）；用户态 `cli`/`popfq` 在 IOPL<CPL 时不改 IF；bit1 保持 1；`GetRFLAGSValue` 只按 `getFlag` 拼。dump 现：`0x360B07` `[rbx]=0x217`、`0x3D0FB9` `[rbx]=0x286` 与 DR 一致。禁止再 `|= 0x202` 去凑 `0x217`。
+
+### 7.11.2 当前卡点：`shr rdx, cl` 的 ZF 折不掉
+
+flags 槽对了之后，那次 `shr rdx, cl` 的 **RDX 或 CL 有一边不是常数**。IR：
+
+`%76487 = icmp eq i64 %shr-lshr-…402E640B-, 0`
+
+（名里的地址是指令后 RIP 的 32 位：`0x1402E640B` → 移位在 `0x1402E6408`。）
+
+`0x403F5FE3` 一带把这个 ZF 扩成 `select(ZF, -1, 0)`。`getOrCreate` 把后续 and/not/add 拆进同一个 i1，VIP 变成：
+
+`select i1 %76487, 0x14014AAE4, 0x14020557E`
+
+DR 走 **false**（`20557E`，NAND 槽 `-1`）。Mergen 不能决定 ZF → `0x301D45`/`0x2E7043` 的 R9 是 select → 蹦床第 4 次 `r8` 是 `zext`/`sext`，解不出 `0x2D8CD0`。lift **13282** 块结束（不再 24240 / `0x32281c`），末尾是 unproven switch。
+
+`tryFoldConcolicInt` 仍 **只许 Ret**。不要在 `createSelectFolder` / 普通 load 里 unique-fold。不要为了消 select 去写死 VIP。
+
+### 7.11.3 `shr rdx, cl`：CL 已是常数，RDX = `(sym+1) & 0x40`
+
+探针（`run_shr.out`，VIP≈`0x205807`）：
+
+| 站点 | 事实 |
+|---|---|
+| `0x2E63E1` `mov rdx,[rbx]` | `buf[rbx]=and(realadd, 64)`，`buf[rbx+8]=0x6` |
+| `0x2E6408` `shr rdx, cl` | **`rcx=0x20006`（CL=6，常数）**；**`rdx=and i64 %realadd-…, 64`（符号）** |
+| `0x31EA2B` `and rbp, r11` | **`rbp=0x40`**；**`r11=%realadd-1077257398- = add (%realand-1077197814-, 1)`** |
+
+同一 BB 里 CL 来自 `mov cl,[rbx+8]`（前面的 `adc cl,0x3f` 被盖掉）。移位量不是问题。
+
+RDX 数据流：
+
+```
+… → and ?          @ ~0x34BBFx（IR 名 realand-1077197814）
+  → add …, 1         @ ~0x35A4Bx（IR 名 realadd-1077257398，邻域 0x35A499）
+  → and rbp, r11     @ 0x31EA2B   （rbp=0x40 → 取出 bit6）
+  → 进 VSP
+  → mov rdx,[rbx]    @ 0x2E63E1
+  → shr rdx, cl      @ 0x2E6408   （>>6）
+  → ZF = icmp eq (lshr, 0)        ← VIP select 的条件
+```
+
+因此 ZF 实际是在问：**`realadd` 的 bit6 是否为 0**。DR 走 VIP select 的 false 臂（`20557E`）⇒ 真机这次 ZF=0 ⇒ bit6 **置位**。Mergen 的 `realadd` / 内层 `realand` 仍是 SSA，bit6 未知 ⇒ select 消不掉。
+
+同 BB 在 `and` 前有 `not r11`（`0x31EA21`）。探针进 `0x31EA2B` 时 **R11 仍是未取反的 `realadd`**，而 `buf[rbx+8]` 里已经有 `xor realadd, -1`。需要确认：dispatch 是否直接落在 `0x31EA2B`（跳过 `not`），还是 `not` 没写回 R11。先别假定要强行补 `not`。
+
+### 7.11.4 日志：`realand` 的符号来自 AF≪4 的 DeMorgan 链
+
+探针（`run_andop.out`，`[andop]/[notop]/[addop]`）：
+
+`0x14034BBF3` `and rbp, r11`（IR 名 `realand-1077197814`，post=`0x4034BBF6`）：
+
+| | 值 |
+|---|---|
+| L（`~[rbx]`，`[rbx]=0x815`） | **`0xfffffffffffff7ea` = `-2070`（常数）** |
+| R（`~[rbx+8]`） | **`~(%not-PConsRegister-96463)`（符号）** |
+| 结果 | `and i64 %realnot-…, -2070` 仍符号 |
+
+`96463` 的 IR 定义链：
+
+```
+%68962 = icmp eq i32 %(L^R^(L-R))&16, 16     ; computeAuxFlag → AF
+%createrflag2-95864 = shl (zext %68962), 4     ; AF 装进 RFLAGS bit4
+%not_v96460 = xor %createrflag2-95864, -1
+%not-PConsRegister-96461 = and %not_v, -3      ; ~bit1
+%not-PConsRegister-96462 = and …, -129         ; ~bit7
+%not-PConsRegister-96463 = and …, -513         ; ~bit9 (IF)
+```
+
+即 `96463 = ~(AF≪4 | 0x282)`（`0x282` = reserved1|SF|IF）。随后 `realand = ~96463 & ~0x815`，再 `+1`（`0x35A4B3`），再 `&0x40`（`0x31EA2B`）→ `shr` ZF。
+
+**先前否掉「AF 链接到 select」不完整**：AF 确实不在 `0x2E6408` 的 RDX 上并行出现，但它是 **更早写进 VSP 的 `96463` 的源头**，经 NAND/`+1`/`&0x40` 才进 SHR。
+
+代数上若只有 AF 未知：`(AF≪4 | 0x282) & ~0x815` 应恒为 **`0x282`**（`~0x815` 清掉 bit4）。KnownBits 没折出来（链深超过默认递归）。但折成 `0x282` 后 `(0x282+1)&0x40=0` → SHR 的 ZF=1 → VIP 仍走 `14AAE4`，和 DR 不一致。
+
+### 7.11.5 DR 对照（`andop.regs`）：真机是 `~0x246`，不是 AF 链
+
+同 VIP `r9≈0x12c97a` 进 `0x34BBF3`（`andop.regs` 第 2 次；`3D0FB9` v35 两边都是 `[rbx]=0x203,[+8]=0x815`）：
+
+| | Mergen | DR |
+|---|---|---|
+| `[rbx]` | `0x815` | `0x815` |
+| `[rbx+8]` | **`and(…,-513)` = `~(AF≪4\|0x282)`（符号）** | **`0xfffffffffffffdb9` = `~0x246`（常数）** |
+| `and` 后（RBP∧R11） | 符号 `realand` | **`~0x815 & 0x246` = `0x242`** |
+| `+1`（`0x35A4B3`） | 符号 | **`0x246`**（DR `35a499` v12 槽是 `0x242+0x4`；`31ea2b` v03 的 R11=`0x246`） |
+| `&0x40` | 符号 | **`0x40`** → SHR ZF=0 → VIP `20557E` |
+
+`0x246` = ZF|PF|reserved1|IF（bit6 是 **ZF**，不是数据 bit6）。Mergen 把该槽做成了 `AF|SF|reserved1|IF`（`0x282|AF≪4`）的 DeMorgan，**缺 ZF/PF、多了错误的 SF/AF**。
+
+根因不在 `0x34BBF3` 的 AND 语义，而在更早写进 VSP 的 flags。
+
+### 7.11.6 `pushfq @ 0x2D353E` 读的是前面 `and ecx, edi` 的 flags
+
+`[pushfq]`：`0x1402D353E` 打出 `creatingrflag95867`，`CF=0 PF=0 AF=sym ZF=0 SF=1 IF=1`。
+
+同一 BB（`0x2D34FE` 起）：
+
+```
+mov ecx, [rbx]
+mov edi, [rbx+4]
+sub rbx, 4
+not ecx
+sbb r11d, 0x1d7777c0   ; 只搅 r11，随后被 AND 盖掉 flags
+not edi
+and ecx, edi           ; 状态位以这次为准
+pushfq
+pop [rbx]
+```
+
+`and`/`or`/`xor` 清 CF/OF，按结果设 ZF/SF/PF；AF 未定义。真机槽 `0x246` = ZF|PF|reserved1|IF ⇒ **NAND 结果为 0**。Mergen 这次 AND 看成非 0（SF=1），AF 还留着 SBB 的符号值。对照见 7.11.7。仍禁止 unique-fold / 写死 VIP / `|=0x202` / `STACKP±8`。
+
+### 7.11.7 NAND 操作数是 `0x5004f` 不是 `-1`：来自 `add eax, r11d` 回绕
+
+VIP `r9=0x14012CA20`（`run_dump.out` + `nand.regs`）。相对 VSP：Mergen `rbx=0x14FE34` ≡ DR `0x3280BEF7BC`（相对 `STACKP`/`RSP` 都是 `-0x6C`）。
+
+| 站点 | Mergen | DR |
+|---|---|---|
+| `3BC020` `r9=12CA4E` | `[rbx]=0x257`，`[+8]=0` | `[rbx]=0x257`，`[+8]=0x20200000000`（低 32 也是 0） |
+| `37507A` `r9=12CA2D` | `[rbx]=0x203`，`[+8]=0x5004f`，`r11=0xf1ffea81` | `[rbx]=0x286`，`RAX=-1`，`r11=0xd348eac1` |
+| `2D34FE` `r9=12CA20` | `[rbx]=0x5004f`，`[+8]=0`，`r11=0x5004f` | `[rbx]=-1`，`[+8]=0x20200000000`，`r11=-1` |
+
+`3BC020` 之后才分叉。`0x2D34FE` 的 NAND：
+
+```
+mov ecx, [rbx]       ; M 0x5004f / D -1
+mov edi, [rbx+4]     ; 两边 0
+not; not; and ecx, edi
+```
+
+Mergen：`~0x5004f & ~0 = 0xfffaffb0`（`[andop] @ 0x2D3524`，非 0 → SF=1）。  
+DR：`~(-1) & ~0 = 0` → `pushfq @ 0x2D353E` 得到 `FLG=0x246`。
+
+`0x5004f` 是 **4 字节** 写进 VSP 的。`0x14FE34` 窗口（`[vspwr]`）时间线，VIP `12CA4E→12CA20`：
+
+| insn | 指令 | 写 |
+|---|---|---|
+| `0x3D4517` | （8 字节） | `0x14FE34 = 0x257`（两边仍对齐） |
+| `0x3A861C` | `mov dword [rbx], ebp` | `0x14FE34 = 0xf1faea31`（盖掉 `0x257`） |
+| `0x3BD90B` | `mov dword [rbx+8], ebp` | `0x14FE34 = 0xe0515ce` |
+| `0x38447D` | `add eax, r11d` | **`0xF1FFEA81 + 0x0E0515CE = 0x10005004F` → 32 位 `0x5004F`** |
+| `0x384484` | `mov dword [rbx+8], eax` | `0x14FE38 = 0x5004f` |
+| `0x384492` | `pop qword [rbx]` | `0x14FE30 = 0x203`（高 4 字节清掉） |
+| `0x3DCE97` | `mov dword [rbx], r11d` | `0x14FE34 = 0x5004f`（NAND 读到的槽） |
+
+真机 `37507A` 时 `RAX` 已是 `-1`，即同一条 `add eax, r11d` 的和应是全 1，不是 `0x5004F`。闭合见 7.11.8：设计上是 `x + ~x`，Mergen 的两个加数不是同一份 `x`。不要在 `add`/`NAND`/`pushfq` 上特判结果。
+
+### 7.11.8 `0x5004f` 的加数：`[rsp+0x18]` 与 `[rsp+0xa8]` 不是同一份 `x`
+
+对照：`build_msvc_dbg\run_dump.out`（13282 blocks，dump overlay）+ `vmptest\nand.regs`（`add_only=21436587`）+ `entry_7210.dmp`。禁止贴 DR 活堆指针、禁止 unique-fold / VIP overlay / `STACKP±8` / `GetRFLAGSValue |= 0x202`。
+
+**真机靠 `add eax, r11d` 消掉堆 ASLR。** 令 `x` 为某次更早 NAND 的 32 位输出。DR 在 `0x38447D`：
+
+```
+EAX = 0xf18a153e = ~x
+R11 = 0x0e75eac1 = x
+EAX+R11d → 0xffffffff
+```
+
+`x ^ ~x = 0xffffffff`，与堆基址无关。dump 世界若两格是同一份 `x`，同样应得 `-1`。
+
+#### 不是 EA、不是 dump 读错
+
+`0x30D3FB` `mov ebp, [rsp+r8]`：两边 `r8=0x18`，相对 EA 对齐（Mergen `0x14FC78`，DR `rsp+0x18`）。格子里 dword：Mergen `0xf1ffeef7`，DR `0x0e75eeb7`，XOR `0xff8a0040`。
+
+这份 dword 的写入链：
+
+1. `0x3BB469` `mov dword [rsp+r8], ebp` → `0x14FC78 = 0xf1ffeef7`（native scratch，存本身没问题）。
+2. 值来自 `0x34ED0E` `mov ecx, dword [r11]` / `0x34ED19` `mov [rbx], ecx`（VIP `12CC73`）。
+3. `r11` 来自 `0x34ECFD` `mov r11, [rbx]`。VIP `12CCC3`/`0x37507A` 时两边 `[rbx]` 都还是 `0x3f2b205760414255`；到 `12CC73` DR 已换成堆指针 `0x21e0ecbd108`。
+4. 覆盖发生在 `0x2E17D5` `mov rdi, [rsp+r11]`（`r11=0x30`）+ `0x2E17EE` `mov [rbx], rdi`。native `[rsp+0x30]` 由 `0x3E9AF2` `mov [rsp+rdi], r8`（`rdi=0x30`）写入。相对偏移两边对齐。
+5. Mergen 写入/读出的是 overlay 堆对象 **`0x21cf141d148`**。`GetMemoryValue` 的 dword **就是 dump 字节**：qword `0x21cf1ffeef7`，低 32 `0xf1ffeef7`。dump 里没有 `0x0e75eeb7`。
+6. dump 与这次 DR 的堆 ASLR：`0x21cf141d148 ^ 0x21e0ecbd108 = 0x2ff8a0040`，字段 `0x21cf1ffeef7 ^ 0x21e0e75eeb7` 同差。低 32 XOR 即先前的 `0xff8a0040`。**不要贴 DR 的 `0x21e0ecbd108`。**
+
+更早两次 `34ED0E` 解引用 PE 镜像指针时两边对齐（例如 `0x906d9883`）。
+
+`0x34ED0E` 读到的堆指针低 32 **不是** 后面 `add` 用的 `x`。`x` 来自更早的 `0x2FF112` NAND（见下）。`34ED` 这条链把 dump 堆低 32 写进 `[rsp+0x18]` 的未掩码形态 `0xf1ffeef7`，再经 `0x3500D8` NAND（`& 0xfffffb89`）变成 dump 世界的 `0xf1ffea81`，只更新了 `0x18`。
+
+#### 分岔：`0x18` 对、`0xa8` 错
+
+| 槽 | dump 世界应有的 `x` | DR | Mergen |
+|---|---|---|---|
+| `[rsp+0x18]` `0x14FC78` | `0xf1ffea81` | `0x0e75eac1` | `0xf1ffea81`（`0x363F85` 写入，对） |
+| `[rsp+0xa8]` `0x14FD08` | 同一份 `x` | `0x0e75eac1` | **`0xf1faea31`**（`x XOR 0x500b0`） |
+
+`0x3A8609`（`r8=0xa8`）两边相对 EA 都对。DR 两格都是 `0x0e75eac1`。随后 `0x3D966D` 对 VSP 上两份相同值做 NAND 得 `~x`，`0x38447D` 与 `[rsp+0x18]` 的 `x` 相加。
+
+Mergen：`0x3A8609` 读到过期的 `0xf1faea31` → `0x3D966D` 对两份它做 NAND → `~0xf1faea31 = 0xe0515ce` → `0xe0515ce + 0xf1ffea81 = 0x5004f`。
+
+**不是 NAND 之后少写 `0xa8`。** `0x31BC29` `mov qword [rsp+rdi], r8`（`rdi=0xa8`，VIP `12CCE6`）比 `0x37EBAA`（VIP `12CCE1`）先执行。DR 此时 R8 已是 `0x0e75eac1`，一存到底。Mergen 存的是当时的 R8=`0xf1faea31`。`0x363F85` 只更新 `0x18`。
+
+#### `0xf1faea31` 出生在 `0x2FF112`
+
+VIP `12D636`，`0x2FF112`：`not ecx; not edi; and ecx, edi`。`rax` 两边都是 `0x84b3`。Mergen 结果 `0xf1faea31`，DR `rcx=0x0e75eac1`。验算 NAND 本身成立：
+
+```
+Mergen: ~(0x0e04050e) & ~(0x000110c0) = 0xf1faea31
+DR 槽:  ~(0xf100050e) & ~(0x008a1030) = 0x0e75eac1
+```
+
+操作数（VIP `12D63A`/`12D63F`）：
+
+| 槽 | Mergen | DR | 写入 |
+|---|---|---|---|
+| 低 dword | `0x0e04050e` | `0xf100050e` | `0x2F587A` `and ecx, edi; mov [rbx+8], ecx` |
+| 高 dword | `0x000110c0` | `0x008a1030` | `0x3AA40E` 同样 `and ecx, edi` |
+
+`0x3CDBD3` `mov ebp, [rsp+r8]; mov [rbx], ebp` 曾把 `0xf141d0f0`（dump 对象 `0x21cf141d0f0` 低 32，与 `34ED` 的 `0x21cf141d148` 差 `0x58`）写入低槽，随即被 `0x2F587A` 覆盖，**不是这次 NAND 的操作数**。
+
+VIP `12D65A` `0x3E9AF2`：VSP 已是 Mergen `0xff44c53e` vs DR `0xff41c58e`，XOR **`0x500b0`**，与 `0xf1faea31 ^ 0xf1ffea81` 同一份差。
+
+VIP `12CD57` `0x3357C6`：DR `[rbx]=0x0e75eac1`，Mergen `buf[0x14FE10]=0xf1faea31`，再进 R8 / `0x31BC29`。
+
+`0x2F587A` / `0x3AA40E` 的 `and` 本身按输入是对的；`0x500b0` 在它们之前已在 RAX 上。闭合见 7.11.9。不要特判 `0x5004f`/`-1`。
+
+### 7.11.9 `0x500b0` 在 `2FF112` 之前：RAX `0xbb3ac1` vs `0xbe3a71`
+
+对照仍是 `run_dump.out` + `nand.regs`。`0x2F587A` / `0x3AA40E` 不是语义 bug。
+
+#### `2FF112` 的输入来自 `[rsp+0x28]` 里已经错的 RAX
+
+VIP `12D668` `0x3A8609` `mov ebp, [rsp+r8]`（`r8=0x28`）：相对 EA 对齐（Mergen `0x14FC88`）。dword：
+
+| | Mergen | DR |
+|---|---|---|
+| `[rsp+0x28]` | `0xbb3ac1`（`[stkld]`） | `0xbe3a71`（`loadEA`） |
+
+`0xbb3ac1 ^ 0xbe3a71 = 0x500b0`，与 `0xf1faea31 ^ 0xf1ffea81` 同一份差。
+
+随后：
+
+| insn | 作用 | Mergen | DR |
+|---|---|---|---|
+| `0x3A861C` | 写进 VSP | `0xbb3ac1` | `0xbe3a71` |
+| `0x309660` | `mov [rbx+8], ebp`（NOT） | `0xff44c53e = ~0xbb3ac1` | `0xff41c58e = ~0xbe3a71` |
+| `0x3AA40E` | `and ecx, edi` 高 dword | `0x110c0` | `0x8a1030` |
+| `0x2F587A` | `and ecx, edi` 低 dword | `0xe04050e` | `0xf100050e` |
+
+`[rsp+0x28]` 不在 VSP 窗口 `[0x14FE30,0x14FE40)`，`3A8609` 读到 `0xbb3ac1` 之前没有 `[vspwr] 0x14FC88`。第一次打到该槽的写是更晚的 `0x3641D4 = 0xf1faea31`。值是当时 RAX 存进 native scratch。
+
+#### VIP `12D74C` 的 `35A499` 不写这份 RAX
+
+进 `0x35A499` 时 RAX **已经**分叉：Mergen `0xbb3ac1`，DR `0xbe3a71`。handler 是 `mov rcx, [rbx]; mov rbp, [rbx+8]; add rcx, rbp`。`[addop] @ 0x35A4B3`：`L=0 R=0x1402B2F36 res=0x1402B2F36`（handler 指针，DR `[rbx+8]` 同）。**不是** 7.11.5 的 `+1`，也不改 RAX。
+
+#### VIP `12DCFF` 的 `34BBF3` 是另一次（7.11.5 那条 SSA）
+
+`nand.regs` ~2232 / mergen `run_dump.out` ~8326。与 `12D74C` 不是同一次访问。
+
+| | Mergen | DR |
+|---|---|---|
+| `[rbx]` / `[rbx+8]` | SSA `or(realnot, 1)` → `not-PConst-52985 = and(realadd, -2)` | 两边 **`0xfffffffffffffd79`** |
+| NAND `0x34BBF3` | 仍是 SSA（`[andop]` 8331） | **`0x286`**（`~0xfd79` 的低 16 可见部分） |
+| `0x3E9AF2` VIP `12DCFA` | `rdi=0x10`，SSA 写入 `[rsp+0x10]`（`0x14FC70`） | 存 **R8=`0x202`（flags）**；`[rbx]=0x286` |
+
+这次 NAND 的 SSA **没有**在 `8331–9385` 折成 `0xbb3ac1`。`12DCFF` 与这份 `0x500b0` **尚未接上**。`[andop]` 白名单仍只有 `34BBF3/31EA2B/2D3524`，没有 `2F587A/3AA40E`。
+
+#### RAX 变成 `0xbb3ac1` 的窗口：VIP `12D7A2 → 12D74C`
+
+两边在 `0x30D3FB` VIP `12D7A2` 仍对齐：`RAX=0xa3a86`，`r8=0x48`，`[rsp+0x48]` dword **`0x332c00`**（DR `loadEA` = Mergen `[stkld]`）。
+
+下一探针对齐点 `0x35A499` VIP `12D74C` 时 RAX 已是 `0xbb3ac1` vs `0xbe3a71`。中间 Mergen：
+
+- `0x377027`：`mov ebp, [rsp+r8]; mov dword [rbx], ebp`，`[vspwr] 0x14FE3C size=4 val=0x880ec1`
+- `0x880ec1 + 0x332c00 = 0xbb3ac1`
+
+`0x332c00` 两边相同。闭合见 7.11.10：`377027` 拷贝 `0x880ec1`，`0x2D806B` `add eax, r11d` 把它和 `0x332c00` 加进 RAX。
+
+### 7.11.10 VIP `12D7A2–12D74C`：`2D806B` 按输入是对的；错在更早的 `0x880ec1`
+
+`[addop]` 只打 `35A4B3`/`38447D`，这条 add 原先不在日志里。`0x2D8072` 写回 `0x14FE40`，落在 `[vspwr]` 窗口 `[0x14FE30,0x14FE40)` 右开外面。
+
+`0x2D8040`（VIP `12D799`）：
+
+```
+mov eax, [rbx]
+mov r11d, [rbx+4]
+sub rbx, 4
+add eax, r11d          ; 0x2D806B
+mov [rbx+8], eax
+pushfq
+pop [rbx]              ; 0x2D807D → flags 0x202（有 [vspwr]）
+```
+
+加之前 VSP：
+
+| 槽 | Mergen | 来源 |
+|---|---|---|
+| `[rbx]` `0x14FE3C` | `0x880ec1` | `0x377027` `mov ebp, [rsp+r8]; mov [rbx], ebp` |
+| `[rbx+4]` `0x14FE40` | `0x332c00` | `0x30D415` VIP `12D7A2`（两边相同） |
+
+`0x880ec1 + 0x332c00 = 0xbb3ac1` → EAX = `12D74C` 进 `35A499` 时的 RAX。
+
+DR 无 `2D806B`/`377027`，但夹在中间：
+
+- `376FF7` VIP `12D79D`：`RAX` 仍 `0xa3a86`，`r8=0x6c`，`[rbx]` 低 32 仍是 `0x332c00`（`377013` `mov ebp,[rsp+r8]` 尚未执行）
+- `35A499` VIP `12D74C`：DR `RAX=0xbe3a71`
+
+`0xbe3a71 - 0x332c00 = 0x8b0e71`。真机同一条 add 是 **`0x8b0e71 + 0x332c00`**。`377027` 只是把 native `[rsp+r8]`（DR `r8=0x6c`）拷到 VSP。
+
+`0x880ec1` 出生在 VIP `12E2FF`/`12E2FB`，`0x3D44FB` `add eax, r11d` + `0x3D4502` `mov [rbx+8], eax`：
+
+| | Mergen | DR（`3D0FB9` VIP `12E2FB`） |
+|---|---|---|
+| `r11` / 一个加数 | `0x800800`（`0x31C1EE` 写入，两边同） | `0x800800` |
+| 另一个加数 | `0x0806c1`（`0x2F2499`） | **`0x0b0671`** |
+| 和 / RAX / `[rbx+8]` | `0x880ec1` | **`0x8b0e71`** |
+
+`0x806c1 ^ 0xb0671 = 0x300b0` = `0x880ec1 ^ 0x8b0e71`。再加同一个 `0x332c00` 后 `0xbb3ac1 ^ 0xbe3a71 = 0x500b0`（进位改了 XOR 图案，算术差仍是 `0x300b0`）。
+
+`0x2F2484`：`mov ebp, [rsp+r8]`；`0x2F2499`：`mov [rbx], ebp`。已用新探针验证（`nand_806.regs` + 新 `run_dump.out`）：
+
+- `2F2468` 时 DR `r8=0x6c` 是 **load 之前** 的混淆值。真正 `2F2484` 时 **两边 `r8=0x28`**，EA 对齐（Mergen `0x14FC88`）。
+- `[stkld]` / DR `loadEA` dword：Mergen **`0x806c1`**，DR **`0xb0671`**。索引对，格子内容错。
+- `[addop] 3D44FB` VIP `12E2FF`：Mergen `0x806c1+0x800800=0x880ec1`；DR EAX 进指令已是 `0xb0671`，出 `0x8b0e71`。
+- `[addop] 2D806B` VIP `12D799`：Mergen `0x880ec1+0x332c00=0xbb3ac1`；DR EAX=`0x8b0e71` R11=`0x332c00`。
+
+`0x14FC88` 的 Mergen 写入：`0x3F48CD` 在 VIP `12E4D6` 之后立刻把当时的 `0x806c1` 存进 `[rsp+0x28]`。DR 同槽应是 `0xb0671`（来自 `360B07` 的 `[rbx]`）。
+
+`0x14FDD8`（`360B07` 的 `[rbx]`）由 **`0x3FCC8F`** 写入 `0x806c1`（VIP `1A3322` 与 `1A3108` 各一次）。DR 同槽是 `0xb0671`。
+
+**未闭合（已闭合，见 7.11.11）**：`0x3FCC8F` 只是把已经错的 VM dword 存进 `0x14FDD8`。根因是 `lift_cpuid` 写死 leaf-1 EAX=`0x806C1`，本机 DR 为 `0xB0671`，差即 `0x300B0`。
+
+### 7.11.11 `0x806c1` 出生点：`CPUID`（seq 19642 `0x2CB5ED`）
+
+insn 流（`insn_lift.csv` / `insn_dr.csv`）从 `0x3FCC8F` 往回：
+
+| seq | RVA | 指令 | 作用 |
+|---|---|---|---|
+| 19642 | `0x2CB5ED` | `cpuid`（EAX=1） | lift EAX=`0x806c1`，DR EAX=`0xb0671` |
+| 19645 | `0x3884FB` | `mov [rbp+0xc], eax` | 把 CPUID.EAX 推进 VSP `0x14FE2C` |
+| 28721 | `0x3C449D` | `mov [rbp], r8` | 拷到 `0x14FE38`（r8 已是该 dword） |
+| 30789 | `0x2EA69E` | `mov rbx, [rbp]` | 从 `0x14FE38` 弹出 |
+| 30817 | `0x3B87F5` | `mov [rsp+rcx], rbx` | `rcx=0x10` → `0x14FC70` |
+| 35543 | `0x2DF516` | `mov [rbp], rcx` | 写入 `0x14FE08` |
+| 36864 | `0x339EC4` | `mov rdi, [rbx]` | 弹出 `0x14FE08` |
+| 42637 | `0x3FCC7A` | `mov rdi, [rsp+rcx]` | `rcx=0x88` → `0x14FCE8` |
+| 42642 | `0x3FCC8F` | `mov [rbx], rdi` | 写入 `0x14FDD8` |
+
+`0xb0671 - 0x806c1 = 0x300b0`。`lift_cpuid` 原先对所有 leaf 返回固定 Intel 模板（EAX=`0x000806C1`，EBX=`0x00800800`）；ECX/EDX 碰巧与本机 leaf 1 相同。VMP 把 CPUID 四寄存器当 VM 数据用，再与 `entry_7210.dmp`（真机 CPUID 世界）混合，中间常数无法对消。已改为常量 leaf 时走主机 `__cpuidex`。
+
+重 lift 后 `[vspwr]`：`3FCC8F`/`3F48CD` 写 `0xb0671`；`3D44FB` `0xb0671+0x800800=0x8b0e71`；`2D806B` `0x8b0e71+0x332c00=0xbe3a71`。日志里 `0x806c1`/`0x880ec1`/`0xbb3ac1`/`0x5004f`/`0xf1faea31` 为 0。
+
+### 7.11.12 CPUID 修复后 insn 流对照（`insn_lift.csv` / `insn_dr.csv`）
+
+产物：lift **178945** 行（与 `instructions_lifted` 同），DR **194330** 行。按 seq 对齐。这是诊断对照，不是用 trace 抬 IR。
+
+**已对齐、不再是分叉：**
+
+| seq | RVA | 备注 |
+|---|---|---|
+| 1 | `0x7210` | 入口 |
+| 19643 | `0x2CB5EF` | `cpuid` 之后 EAX/EBX/ECX/EDX 两边都是 `0xb0671` / `0x20800800` / `0x7ffafbbf` / `0xbfebfbff` |
+| 42642 | `0x3FCC8F` | `rdi=0xb0671`（旧流这里是 `0x806c1` vs `0xb0671`） |
+| 1–173740 | 同 RVA | 控制流一致 |
+
+忽略（环境，不是语义 bug）：映像基 `0x140…` vs `0x7ff7182a…`；`STACKP` vs DR 真栈；dump 堆 vs 本趟 DR 堆（含 `rdi=0` vs `0x7ff5d82a0000`）；lift 上大量 SSA `-`。禁止贴活堆指针、禁止 overlay。
+
+**控制流分叉（当前卡点）：seq 173741**
+
+```
+173739  0x335d4c  dec rax          lift RAX=0xa0   DR RAX=0x1
+173740  0x335d4f  jne 0x2ca58a     lift 已 dec 成 0x9f，跳转成立
+173741  lift → 0x2ca58a            DR 落空 → 0x335d55 pop rsi
+```
+
+`0x38d866` `jmp 0x335d4c` 进这条循环。lift 计数器 `0xa0`，DR `0x1`，所以多转一圈。lift 在 `0x14000723e` 先 `ret`；DR 后面还跑到 seq 194330（`0x6ca07`）。
+
+**分叉之前、过滤环境后仍在的 GP 差（未追）：**
+
+| seq | RVA | 差 |
+|---|---|---|
+| 287 | `0x36e7e7` | RCX `0xb0000` vs `0xb6b87` |
+| 336 | `0x35c8d6` | RCX `0x40164097` vs `0x18404097` |
+| 527 | `0x2ba795` | RCX `0x1` vs `0x0` |
+| 659+ | `0x350111` 一带 | RDX `0x206` vs `0x202`（flags；**不要** `GetRFLAGSValue \|= 0x202`） |
+
+下一刀：谁把 seq 173739 的 RAX 写成 `0xa0` 而不是 `0x1`；以及上面几条早期 RCX/flags 差是否喂进这个计数器。
 
 ## 7.8 诊断基础设施（默认关闭，零输出）
 
 | 环境变量 | 产物 | 用途 |
 |---|---|---|
+| `MERGEN_INSN_STREAM_FILE` | 全指令快照 `I,seq,rva,rax,rbx,rcx,rdx,rsi,rdi,rbp,rsp,r8,r9,r10,r11` | 与 DR `-insn` 按 RVA 对齐；默认关 |
 | `MERGEN_REG_STREAM_FILE` | 寄存器写流 `REG,seq,insn,reg,isconst,value` | 查"谁把某寄存器写成某值" |
 | `MERGEN_WRITE_STREAM_FILE` | 写流 `W,seq,insn,slot,size,value` | 与 DR `-trackmem` 写侧对齐 |
 | `MERGEN_READ_STREAM_FILE` | 读流 `R,insn,addr,size_bits` | 与 DR `-trackmem` 读侧对齐 |
@@ -1305,10 +1364,13 @@ Unflatten 每个新块都 `branch_backup` 一份 `InstructionCache`。folder（�
 「某条 store 执行时各寄存器是什么」的唯一手段（源码：`LifterClass.hpp`
 的 `SetRegisterValue_internal` 与 `GEPTracker.ipp` 的 `addValueReference`）。
 
-**DR 侧**：`D:\sogen\dr\vmpdrtrace.c` 已加 `-r8 <file>` 选项，输出
+**DR 侧**：`D:\sogen\dr\vmpdrtrace.c` 已加 `-insn <file>`（与 `MERGEN_INSN_STREAM_FILE` 同行格式，指令前快照，RVA 对齐）和 `-r8 <file>`，输出
 `R8,<rva>,<r8>,<r10>`；探针白名单含 R8 解密链的 5 个站点
-（`0x3E957E/0x3E9588/0x3E95A2/0x3E95A9/0x3E95C0`）。
+（`0x3E957E/0x3E9588/0x3E95A2/0x3E95A9/0x3E95C0`），以及
+`0x3B4FF9/0x3B501C`、`0x301D45/0x2E6FF6/0x2E7043`（§7.11）。
 构建脚本：`D:\sogen\dr\build_vmpdrtrace7.bat`（输出 `vmpdrtrace7.dll`）。
+
+lifter 侧默认会打 `[tramp]` / `[vip] pre`（定位用，未关）。不要开 `MERGEN_DIAG_LIFT_PROGRESS`。
 
 ## 8. 待清理
 

@@ -601,6 +601,183 @@ public:
 
       runDisassembler((void*)offset, size);
 
+      if (const char* insnPath = std::getenv("MERGEN_INSN_STREAM_FILE")) {
+        static std::ofstream* insnStream = nullptr;
+        static bool insnInit = false;
+        static unsigned long long insnSeq = 0;
+        if (!insnInit) {
+          insnInit = true;
+          insnStream = new std::ofstream(insnPath, std::ios::out);
+        }
+        if (insnStream && insnStream->is_open()) {
+          auto hexOrDash = [this](Register reg) -> std::string {
+            llvm::Value* v = GetRegisterValue(reg);
+            if (auto* ci = llvm::dyn_cast_or_null<llvm::ConstantInt>(v)) {
+              std::ostringstream os;
+              os << "0x" << std::hex << ci->getZExtValue();
+              return os.str();
+            }
+            return "-";
+          };
+          uint64_t rva = this->current_address;
+          if (rva >= 0x140000000ULL)
+            rva -= 0x140000000ULL;
+          else if ((rva & 0xFF000000ULL) == 0x40000000ULL)
+            rva &= 0x00FFFFFFULL;
+          ++insnSeq;
+          *insnStream << "I," << insnSeq << ",0x" << std::hex << rva << std::dec
+                      << "," << hexOrDash(Register::RAX) << ","
+                      << hexOrDash(Register::RBX) << ","
+                      << hexOrDash(Register::RCX) << ","
+                      << hexOrDash(Register::RDX) << ","
+                      << hexOrDash(Register::RSI) << ","
+                      << hexOrDash(Register::RDI) << ","
+                      << hexOrDash(Register::RBP) << ","
+                      << hexOrDash(Register::RSP) << ","
+                      << hexOrDash(Register::R8) << ","
+                      << hexOrDash(Register::R9) << ","
+                      << hexOrDash(Register::R10) << ","
+                      << hexOrDash(Register::R11) << "\n";
+        }
+      }
+
+      {
+        const uint64_t va = this->current_address;
+        const bool vipSite =
+            va == 0x140301D45ULL || va == 0x40301D45ULL ||
+            va == 0x1402E6FF6ULL || va == 0x402E6FF6ULL ||
+            va == 0x1402E7043ULL || va == 0x402E7043ULL ||
+            va == 0x1403357C6ULL || va == 0x403357C6ULL ||
+            va == 0x1403357D1ULL || va == 0x403357D1ULL ||
+            va == 0x1402C28ECULL || va == 0x402C28ECULL ||
+            va == 0x1403C2BA9ULL || va == 0x403C2BA9ULL ||
+            va == 0x1403F8AC4ULL || va == 0x403F8AC4ULL ||
+            va == 0x14031BE9DULL || va == 0x4031BE9DULL ||
+            va == 0x14035A499ULL || va == 0x4035A499ULL ||
+            va == 0x140360B07ULL || va == 0x40360B07ULL ||
+            va == 0x1403D0FB9ULL || va == 0x403D0FB9ULL ||
+            va == 0x1403BC020ULL || va == 0x403BC020ULL ||
+            va == 0x140389410ULL || va == 0x40389410ULL ||
+            va == 0x1403E3AB9ULL || va == 0x403E3AB9ULL ||
+            va == 0x1403D2682ULL || va == 0x403D2682ULL ||
+            va == 0x1403CC19CULL || va == 0x403CC19CULL ||
+            va == 0x1403EA92BULL || va == 0x403EA92BULL ||
+            va == 0x1403EA94DULL || va == 0x403EA94DULL ||
+            va == 0x1402E63E1ULL || va == 0x402E63E1ULL ||
+            va == 0x1402E6408ULL || va == 0x402E6408ULL ||
+            va == 0x14031EA21ULL || va == 0x4031EA21ULL ||
+            va == 0x14031EA2BULL || va == 0x4031EA2BULL ||
+            va == 0x14034BBD0ULL || va == 0x4034BBD0ULL ||
+            va == 0x14034BBE5ULL || va == 0x4034BBE5ULL ||
+            va == 0x14034BBEBULL || va == 0x4034BBEBULL ||
+            va == 0x14034BBF3ULL || va == 0x4034BBF3ULL ||
+            va == 0x1402D34FEULL || va == 0x402D34FEULL ||
+            va == 0x1402D3505ULL || va == 0x402D3505ULL ||
+            va == 0x1402D3524ULL || va == 0x402D3524ULL ||
+            va == 0x1402D353EULL || va == 0x402D353EULL ||
+            va == 0x140364A8FULL || va == 0x40364A8FULL ||
+            va == 0x14032415BULL || va == 0x4032415BULL ||
+            va == 0x14037507AULL || va == 0x4037507AULL ||
+            va == 0x14038447DULL || va == 0x4038447DULL ||
+            va == 0x140384484ULL || va == 0x40384484ULL ||
+            va == 0x1403DC6F9ULL || va == 0x403DC6F9ULL ||
+            va == 0x1403BD63FULL || va == 0x403BD63FULL ||
+            va == 0x1403A861CULL || va == 0x403A861CULL ||
+            va == 0x1403BD90BULL || va == 0x403BD90BULL ||
+            va == 0x1403DCE97ULL || va == 0x403DCE97ULL ||
+            va == 0x14030D3FBULL || va == 0x4030D3FBULL ||
+            va == 0x14030D415ULL || va == 0x4030D415ULL ||
+            va == 0x1403108ECULL || va == 0x403108ECULL ||
+            va == 0x14031BE9DULL || va == 0x4031BE9DULL ||
+            va == 0x1403A8609ULL || va == 0x403A8609ULL ||
+            va == 0x1402E17D5ULL || va == 0x402E17D5ULL ||
+            va == 0x1402E17EEULL || va == 0x402E17EEULL ||
+            va == 0x1403E9AF2ULL || va == 0x403E9AF2ULL ||
+            va == 0x14034ECFDULL || va == 0x4034ECFDULL ||
+            va == 0x14034ED0EULL || va == 0x4034ED0EULL ||
+            va == 0x1402F2468ULL || va == 0x402F2468ULL ||
+            va == 0x1402F2484ULL || va == 0x402F2484ULL ||
+            va == 0x1402F2499ULL || va == 0x402F2499ULL ||
+            va == 0x1402D8040ULL || va == 0x402D8040ULL ||
+            va == 0x1403D44FBULL || va == 0x403D44FBULL ||
+            va == 0x140377013ULL || va == 0x40377013ULL;
+        if (vipSite) {
+          auto hexOrIr = [](llvm::Value* v) -> std::string {
+            if (!v) {
+              return "<null>";
+            }
+            if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(v)) {
+              std::ostringstream os;
+              os << "0x" << std::hex << ci->getZExtValue();
+              return os.str();
+            }
+            std::string text;
+            llvm::raw_string_ostream os(text);
+            v->print(os);
+            return text.substr(0, 140);
+          };
+          auto dumpMem = [&](const char* tag, llvm::Value* ptrV, unsigned nbytes) {
+            auto* ci = llvm::dyn_cast_or_null<llvm::ConstantInt>(ptrV);
+            if (!ci) {
+              std::cout << " " << tag << "=<nonconst>";
+              return;
+            }
+            const uint64_t p = ci->getZExtValue();
+            uint64_t raw = 0;
+            if (!file.readMemory(p, nbytes, raw)) {
+              std::cout << " " << tag << "@0x" << std::hex << p << "=<unreadable>";
+              return;
+            }
+            if (nbytes == 4) {
+              raw &= 0xffffffffULL;
+            }
+            std::cout << " " << tag << "@0x" << std::hex << p << "=0x" << raw;
+          };
+          std::cout << "[vip] pre addr=0x" << std::hex << va
+                    << " rax=" << hexOrIr(this->GetRegisterValue(Register::RAX))
+                    << " rbx=" << hexOrIr(this->GetRegisterValue(Register::RBX))
+                    << " r9=" << hexOrIr(this->GetRegisterValue(Register::R9))
+                    << " rsi=" << hexOrIr(this->GetRegisterValue(Register::RSI))
+                    << " r8=" << hexOrIr(this->GetRegisterValue(Register::R8))
+                    << " r11=" << hexOrIr(this->GetRegisterValue(Register::R11))
+                    << " rbp=" << hexOrIr(this->GetRegisterValue(Register::RBP))
+                    << " rdx=" << hexOrIr(this->GetRegisterValue(Register::RDX))
+                    << " rsp=" << hexOrIr(this->GetRegisterValue(Register::RSP))
+                    << " rdi=" << hexOrIr(this->GetRegisterValue(Register::RDI))
+                    << " rcx=" << hexOrIr(this->GetRegisterValue(Register::RCX))
+                    << " lastmod=0x" << this->lastModuleLoadOffset;
+          dumpMem("[rbx]", this->GetRegisterValue(Register::RBX), 8);
+          dumpMem("[r9]", this->GetRegisterValue(Register::R9), 8);
+          dumpMem("dword[r9]", this->GetRegisterValue(Register::R9), 4);
+          if (auto* rspCi = llvm::dyn_cast_or_null<llvm::ConstantInt>(
+                  this->GetRegisterValue(Register::RSP))) {
+            if (auto* r8Ci = llvm::dyn_cast_or_null<llvm::ConstantInt>(
+                    this->GetRegisterValue(Register::R8))) {
+              const uint64_t ea =
+                  rspCi->getZExtValue() + r8Ci->getZExtValue();
+              std::cout << " rsp+r8=0x" << std::hex << ea;
+              dumpMem("[rsp+r8]", ConstantInt::get(rspCi->getType(), ea), 4);
+            }
+          }
+          auto dumpBuf = [&](const char* tag, uint64_t slot) {
+            auto it = this->buffer.find(slot);
+            if (it == this->buffer.end() || !it->second.value) {
+              std::cout << " " << tag << "=<empty>";
+            } else {
+              std::cout << " " << tag << "=" << hexOrIr(it->second.value)
+                        << " off=" << (unsigned)it->second.byteOffset;
+            }
+          };
+          if (auto* rbxCi = llvm::dyn_cast_or_null<llvm::ConstantInt>(
+                  this->GetRegisterValue(Register::RBX))) {
+            const uint64_t slot = rbxCi->getZExtValue();
+            dumpBuf("buf[rbx]", slot);
+            dumpBuf("buf[rbx+8]", slot + 8);
+          }
+          std::cout << std::dec << "\n" << std::flush;
+        }
+      }
+
       // RSP-drift tracker. The real machine keeps RSP fixed inside a VM handler
       // (the VM stack lives in a GPR); if the lifter's pseudo-RSP is seeded a
       // constant amount away from the machine's entry RSP, every absolute
@@ -1214,6 +1391,31 @@ public:
                 << "\n"
                 << std::flush;
     }
+    {
+      if (addr == 0x1403B4FF9ULL || addr == 0x403B4FF9ULL) {
+        auto hexOrIr = [](llvm::Value* v) -> std::string {
+          if (!v) {
+            return "<null>";
+          }
+          if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(v)) {
+            std::ostringstream os;
+            os << "0x" << std::hex << ci->getZExtValue();
+            return os.str();
+          }
+          std::string text;
+          llvm::raw_string_ostream os(text);
+          v->print(os);
+          return text.substr(0, 120);
+        };
+        static unsigned trampVisits = 0;
+        ++trampVisits;
+        std::cout << "[tramp] enter n=" << trampVisits << " addr=0x" << std::hex
+                  << addr << " r8=" << hexOrIr(this->GetRegisterValue(Register::R8))
+                  << " r10=" << hexOrIr(this->GetRegisterValue(Register::R10))
+                  << std::dec << "\n"
+                  << std::flush;
+      }
+    }
     printvalue2(this->finished);
     printvalue2(this->run);
     this->run = 1;
@@ -1809,6 +2011,36 @@ protected:
     return static_cast<Derived*>(this)->GetRegisterValue_impl(key);
   }
   void SetRegisterValue_internal(const Register key, llvm::Value* val) {
+    {
+      const Register canonicalReg = getBiggestEncoding<Register>(key);
+      const bool watchReg = canonicalReg == Register::RAX ||
+                            canonicalReg == Register::R11 ||
+                            canonicalReg == Register::RBP;
+      auto* ci = llvm::dyn_cast_or_null<llvm::ConstantInt>(val);
+      const bool isConst = ci != nullptr;
+      const uint64_t cval = isConst ? ci->getZExtValue() : 0;
+      const uint64_t lo32 = cval & 0xFFFFFFFFULL;
+      const uint64_t insnVA = current_address - instruction.length;
+      const bool watchInsn =
+          insnVA == 0x14038447DULL || insnVA == 0x4038447DULL ||
+          insnVA == 0x1403DC6F9ULL || insnVA == 0x403DC6F9ULL ||
+          insnVA == 0x1403BD63FULL || insnVA == 0x403BD63FULL ||
+          insnVA == 0x1403A861CULL || insnVA == 0x403A861CULL ||
+          insnVA == 0x1403BD90BULL || insnVA == 0x403BD90BULL;
+      const bool watchVal =
+          isConst && (lo32 == 0xF1FFEA81ULL || lo32 == 0xF1FAEA31ULL ||
+                      lo32 == 0xE0515CEULL || lo32 == 0x5004FULL ||
+                      lo32 == 0xD348EA81ULL || lo32 == 0xD348EAC1ULL);
+      if (watchReg && (watchInsn || watchVal)) {
+        std::cout << "[regwr] insn=0x" << std::hex << insnVA << " reg="
+                  << magic_enum::enum_name(canonicalReg)
+                  << " val=" << (isConst ? "" : "<ssa>");
+        if (isConst) {
+          std::cout << "0x" << cval;
+        }
+        std::cout << std::dec << "\n" << std::flush;
+      }
+    }
     if (const char* path = std::getenv("MERGEN_REG_STREAM_FILE")) {
       // One long-lived stream: opening the file per write would mean hundreds of
       // thousands of open/close cycles and dominate the lift.
@@ -1970,6 +2202,7 @@ public:
   }
 
   void SetMemoryValue(llvm::Value* address, llvm::Value* value);
+  llvm::Value* privilegeAllowsIF();
   void SetRFLAGSValue(llvm::Value* value);
   PATH_info solvePath(llvm::Function* function, uint64_t& dest,
                       llvm::Value* simplifyValue);
@@ -2182,6 +2415,8 @@ public:
   void insertMemoryOp(llvm::StoreInst* inst);
   std::set<llvm::APInt, APIntComparator>
   computePossibleValues(Value* V, const uint8_t Depth = 0);
+  bool tryFoldConcolicInt(llvm::Value* V, uint64_t& out);
+  void dumpRetPopSlot(llvm::Value* rspvalue, llvm::Value* realval);
 
   Value* extractBytes(Value* value, const uint8_t startOffset,
                       const uint8_t endOffset);

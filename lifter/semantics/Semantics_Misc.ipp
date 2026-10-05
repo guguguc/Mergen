@@ -1,4 +1,7 @@
 // Semantics_Misc.ipp — BMI, SIMD basics, test/cmp, setcc, bit scan, system instructions
+#ifdef _WIN32
+#include <intrin.h>
+#endif
 MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_bextr() {
   auto info = GetIndexValue(2);
   auto source = GetIndexValue(1);
@@ -522,25 +525,32 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_rdtsc() {
 }
 MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_cpuid() {
   LLVMContext& context = builder->getContext();
+  auto* i32 = Type::getInt32Ty(context);
 
-  // For static lifting / deobfuscation, CPUID is an opaque value barrier.
-  // Emitting inline asm makes all four output registers invisible to
-  // KnownBits analysis, which poisons downstream value chains and causes
-  // path solver bail-outs (e.g., VMP 3.6 ROP chain resolution fails
-  // because the dispatch address becomes fully unknown).
-  //
-  // Fix: model CPUID as returning fixed constants.  The exact values
-  // don't matter for deobfuscation — what matters is that they are
-  // deterministic so the path solver can reason through them.
-  // These represent a generic modern x86-64 processor (CPUID leaf 1).
+  int regs[4] = {static_cast<int>(0x000806C1), static_cast<int>(0x00800800),
+                 static_cast<int>(0x7FFAFBBF), static_cast<int>(0xBFEBFBFF)};
+  auto* leafV = GetRegisterValue(Register::EAX);
+  auto* subV = GetRegisterValue(Register::ECX);
+  if (auto* leafCi = llvm::dyn_cast_or_null<llvm::ConstantInt>(leafV)) {
+#ifdef _WIN32
+    unsigned subleaf = 0;
+    if (auto* subCi = llvm::dyn_cast_or_null<llvm::ConstantInt>(subV))
+      subleaf = static_cast<unsigned>(subCi->getZExtValue());
+    __cpuidex(regs, static_cast<int>(leafCi->getZExtValue()),
+              static_cast<int>(subleaf));
+#else
+    (void)subV;
+#endif
+  }
+
   SetRegisterValue(Register::EAX,
-                   ConstantInt::get(Type::getInt32Ty(context), 0x000806C1));
+                   ConstantInt::get(i32, static_cast<uint32_t>(regs[0])));
   SetRegisterValue(Register::EBX,
-                   ConstantInt::get(Type::getInt32Ty(context), 0x00800800));
+                   ConstantInt::get(i32, static_cast<uint32_t>(regs[1])));
   SetRegisterValue(Register::ECX,
-                   ConstantInt::get(Type::getInt32Ty(context), 0x7FFAFBBF));
+                   ConstantInt::get(i32, static_cast<uint32_t>(regs[2])));
   SetRegisterValue(Register::EDX,
-                   ConstantInt::get(Type::getInt32Ty(context), 0xBFEBFBFF));
+                   ConstantInt::get(i32, static_cast<uint32_t>(regs[3])));
 }
 
 MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_xgetbv() {
