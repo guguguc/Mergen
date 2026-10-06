@@ -1135,6 +1135,12 @@ public:
   // codegen appends the bytecode read as the final module load of a handler
   // (AddEndHandlerCommands, intel.cc:27836), so at a transfer this is the VIP.
   uint64_t lastModuleLoadOffset = 0;
+  // GPR that last fetched bytecode as [reg] (AddReadCommand's pcode_registr_).
+  // Each VM instance uses its own register (intel.cc:28633, 27776-27789); a
+  // switch pops the next instance's pcode off the VM stack and rebinds when
+  // that [reg] load is a bytecode address. Do not apply this pointer to other
+  // GPRs — that would mix two instances onto one cursor.
+  Register pcodeReg = Register::None;
   std::set<uint64_t> lmlSeen;
   uint64_t lmlLast = 0;
   std::deque<uint64_t> recentModuleLoads;
@@ -1215,6 +1221,31 @@ public:
     while (recentModuleLoads.size() > 64) {
       recentModuleLoads.pop_front();
     }
+  }
+  bool isSimpleRegMemOp() const {
+    return instruction.mem_base != Register::None &&
+           instruction.mem_index == Register::None &&
+           instruction.mem_disp == 0 &&
+           instruction.mem_segment != Register::GS &&
+           instruction.mem_segment != Register::FS;
+  }
+  void bindPcodeRegister(uint64_t addr) {
+    if (!isBytecodeAddress(addr) || !isSimpleRegMemOp()) {
+      return;
+    }
+    pcodeReg = getBiggestEncoding(instruction.mem_base);
+  }
+  bool isPcodeMemFetch() const {
+    return pcodeReg != Register::None && isSimpleRegMemOp() &&
+           getBiggestEncoding(instruction.mem_base) == pcodeReg &&
+           lastModuleLoadOffset != 0 &&
+           isBytecodeAddress(lastModuleLoadOffset);
+  }
+  void advancePcodePointer(int64_t delta) {
+    if (pcodeReg == Register::None || lastModuleLoadOffset == 0 || delta == 0) {
+      return;
+    }
+    lastModuleLoadOffset += static_cast<uint64_t>(delta);
   }
   uint64_t currentVipOffset = 0;
   bool currentVipIsExact = false;

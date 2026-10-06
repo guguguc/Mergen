@@ -1733,6 +1733,22 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::GetMemoryValue(Value* address,
       loadAddress = offset->getZExtValue();
     }
   }
+  // AddReadCommand (intel.cc:27793) reads [pcode_registr_], not the guest
+  // GPR SSA that may have been overwritten with seed. Only the register that
+  // last fetched bytecode is rebound; a VM switch (27776) uses a different
+  // GPR and binds on that instance's first bytecode [reg] load.
+  if (loadAddress == 0 && isPcodeMemFetch() &&
+      currentPathSolveContext != PathSolveContext::Ret) {
+    loadAddress = lastModuleLoadOffset;
+    address = builder->getInt64(loadAddress);
+    pointer = getPointer(address);
+    retval.setCalculation([this, pointer, size]() {
+      auto ret = builder->CreateLoad(builder->getIntNTy(size), pointer);
+      printvalue(ret);
+      return ret;
+    });
+    loadMemoryOp(pointer);
+  }
 
   Value* result = nullptr;
 
@@ -1835,6 +1851,7 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::GetMemoryValue(Value* address,
       currentPathSolveContext != PathSolveContext::Ret) {
     loadProvenance[result] = loadAddress;
     noteModuleLoad(loadAddress);
+    bindPcodeRegister(loadAddress);
   }
 
   return result;

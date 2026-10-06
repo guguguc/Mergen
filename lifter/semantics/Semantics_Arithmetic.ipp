@@ -1012,6 +1012,28 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_add_sub() {
   printvalue(Rvalue);
   printvalue(result);
 
+  {
+    const OperandType dstTy = instruction.types[0];
+    const OperandType srcTy = instruction.types[1];
+    const bool dstReg =
+        dstTy == OperandType::Register8 || dstTy == OperandType::Register16 ||
+        dstTy == OperandType::Register32 || dstTy == OperandType::Register64;
+    const bool srcImm =
+        srcTy == OperandType::Immediate8 || srcTy == OperandType::Immediate16 ||
+        srcTy == OperandType::Immediate32 || srcTy == OperandType::Immediate64;
+    if (dstReg && srcImm && pcodeReg != Register::None &&
+        getBiggestEncoding(instruction.regs[0]) == pcodeReg) {
+      const uint64_t step = instruction.immediate;
+      if (step == 1 || step == 2 || step == 4 || step == 8) {
+        if (instruction.mnemonic == Mnemonic::ADD) {
+          advancePcodePointer(static_cast<int64_t>(step));
+        } else if (instruction.mnemonic == Mnemonic::SUB) {
+          advancePcodePointer(-static_cast<int64_t>(step));
+        }
+      }
+    }
+  }
+
   SetIndexValue(0, result);
 }
 

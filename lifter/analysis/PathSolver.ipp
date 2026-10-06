@@ -230,7 +230,8 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
     return os.str();
   };
   auto dumpRetDestDag = [&](const char* tag, uint64_t solvedDest) {
-    if (maskedRVA(pathSolveSite) != 0x35a716ULL &&
+    const uint64_t siteRva = maskedRVA(pathSolveSite);
+    if (siteRva != 0x35a716ULL && siteRva != 0x3ec79eULL &&
         (solvedDest & 0x00FFFFFFULL) != 0x113eb5ULL) {
       return;
     }
@@ -759,7 +760,6 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
   };
   std::set<uint64_t> vipLoadAddrs;
   std::set<SelectInst*> vipLoadSelects;
-  std::vector<LoadInst*> vipLoads;
   llvm::PHINode* basePhi = nullptr;
   llvm::ConstantInt* baseConst = nullptr;
   {
@@ -780,7 +780,6 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
           if (t && f) {
             // Address mux for [pcode], not ltJmpWithFlag dests.
             vipLoadSelects.insert(sel);
-            vipLoads.push_back(li);
             vipLoadAddrs.insert(t->getZExtValue());
             vipLoadAddrs.insert(f->getZExtValue());
             vipLoadAddrs.insert(fetchRva(t->getZExtValue()));
