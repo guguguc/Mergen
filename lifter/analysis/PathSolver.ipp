@@ -276,19 +276,14 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
   }
 
   // Lift PCs are often 0x40xxxxxx while imageBase is 0x140000000, so
-  // address_to_mapped_address misses handlers that are still paged.
+  // address_to_mapped_address misses handlers that are still paged. Use the
+  // file-backed normalization (not pageMap, which the dump overlay fragments).
   auto isHandlerPointer = [&](uint64_t addr) -> bool {
     if (addr == 0 || isStackAddress(addr)) {
       return false;
     }
-    if (isBytecodeAddress(addr) || isModuleAddress(addr)) {
-      return true;
-    }
-    if ((addr & 0xFF000000ULL) == 0x40000000ULL) {
-      const uint64_t n = normalizeTargetAddress(addr);
-      return n != 0 && isMemPaged(n);
-    }
-    return false;
+    const uint64_t norm = normalizeFileBackedRuntimeTargetAddress(addr);
+    return norm != 0 && (isBytecodeAddress(norm) || isModuleAddress(norm));
   };
 
   // Transfer-only sticky recovery. Dest: a single module pointer covered by
@@ -511,53 +506,70 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
   // the dispatcher forks instead of collapsing to one destination. Only the
   // transfer's DAG is inspected, so mutated junk never contributes.
   std::vector<std::pair<llvm::Value*, llvm::Constant*>> subs;
+  // Memoized constant fold of a transfer DAG under `subs`. The dispatch target
+  // is cumulative (handler = previous target + delta), so later dispatches nest
+  // earlier ones; without memoization and a higher depth they cannot fold.
+  llvm::DenseMap<llvm::Value*, llvm::Constant*> foldMemo;
   std::function<llvm::Constant*(llvm::Value*, llvm::Value*,
                                 llvm::Constant*, int)>
       jccFold = [&](llvm::Value* v, llvm::Value* node, llvm::Constant* repl,
                     int depth) -> llvm::Constant* {
-      if (depth > 24 || !v) return nullptr;
+      if (depth > 256 || !v) return nullptr;
       for (auto& s : subs) {
         if (v == s.first) return s.second;
       }
       if (v == node) return repl;
       if (auto* k = llvm::dyn_cast<llvm::Constant>(v)) return k;
+      auto memoIt = foldMemo.find(v);
+      if (memoIt != foldMemo.end()) return memoIt->second;
+      llvm::Constant* result = nullptr;
       if (auto* bo = llvm::dyn_cast<llvm::BinaryOperator>(v)) {
         auto* a = jccFold(bo->getOperand(0), node, repl, depth + 1);
         auto* b = jccFold(bo->getOperand(1), node, repl, depth + 1);
-        if (!a || !b) return nullptr;
-        return llvm::ConstantFoldBinaryOpOperands(bo->getOpcode(), a, b,
-                                                  M->getDataLayout());
-      }
-      if (auto* cmp = llvm::dyn_cast<llvm::CmpInst>(v)) {
+        if (a && b) {
+          result = llvm::ConstantFoldBinaryOpOperands(bo->getOpcode(), a, b,
+                                                      M->getDataLayout());
+        }
+      } else if (auto* cmp = llvm::dyn_cast<llvm::CmpInst>(v)) {
         auto* a = jccFold(cmp->getOperand(0), node, repl, depth + 1);
         auto* b = jccFold(cmp->getOperand(1), node, repl, depth + 1);
-        if (!a || !b) return nullptr;
-        return llvm::ConstantFoldCompareInstruction(cmp->getPredicate(), a, b);
-      }
-      if (auto* cast = llvm::dyn_cast<llvm::CastInst>(v)) {
+        if (a && b) {
+          result = llvm::ConstantFoldCompareInstruction(cmp->getPredicate(), a,
+                                                        b);
+        }
+      } else if (auto* cast = llvm::dyn_cast<llvm::CastInst>(v)) {
         auto* a = jccFold(cast->getOperand(0), node, repl, depth + 1);
-        if (!a) return nullptr;
-        return llvm::ConstantFoldCastInstruction(cast->getOpcode(), a,
-                                                 cast->getType());
-      }
-      if (auto* sel = llvm::dyn_cast<llvm::SelectInst>(v)) {
+        if (a) {
+          result = llvm::ConstantFoldCastInstruction(cast->getOpcode(), a,
+                                                     cast->getType());
+        }
+      } else if (auto* sel = llvm::dyn_cast<llvm::SelectInst>(v)) {
         auto* cd = jccFold(sel->getCondition(), node, repl, depth + 1);
         auto* tv = jccFold(sel->getTrueValue(), node, repl, depth + 1);
         auto* fv = jccFold(sel->getFalseValue(), node, repl, depth + 1);
-        if (!cd || !tv || !fv) return nullptr;
-        return llvm::ConstantFoldSelectInstruction(cd, tv, fv);
-      }
-      if (auto* p2 = llvm::dyn_cast<llvm::PHINode>(v)) {
+        if (cd && tv && fv) {
+          result = llvm::ConstantFoldSelectInstruction(cd, tv, fv);
+        }
+      } else if (auto* p2 = llvm::dyn_cast<llvm::PHINode>(v)) {
         llvm::Constant* all = nullptr;
+        bool ok = true;
         for (unsigned i = 0; i < p2->getNumIncomingValues(); ++i) {
           auto* f2 = jccFold(p2->getIncomingValue(i), node, repl, depth + 1);
-          if (!f2) return nullptr;
-          if (!all) all = f2;
-          else if (all != f2) return nullptr;
+          if (!f2) {
+            ok = false;
+            break;
+          }
+          if (!all) {
+            all = f2;
+          } else if (all != f2) {
+            ok = false;
+            break;
+          }
         }
-        return all;
+        if (ok) result = all;
       }
-      return nullptr;
+      foldMemo[v] = result;
+      return result;
   };
 
   // Virtualized conditional control flow (Themida article; VMProtect encodes
@@ -607,7 +619,74 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
         for (auto& op : u->operands()) selWork.push_back(op.get());
       }
     }
-    if (!selects.empty()) {
+    // Enumerate by root *condition*, not by select: selects that share a
+    // condition are one boolean, and a select whose condition depends on
+    // another select is derived. Substituting each select independently
+    // cross-products them and inflates selectArms past the 2..4 adoption
+    // window (turning a recoverable fork into an empty switch). Keep only real
+    // handler arms.
+    std::vector<llvm::Value*> rootConds;
+    {
+      std::set<llvm::Value*> seenConds;
+      for (auto* sel : selects) {
+        llvm::Value* c = sel->getCondition();
+        if (c == nullptr || !c->getType()->isIntegerTy(1) ||
+            !seenConds.insert(c).second) {
+          continue;
+        }
+        bool derivedFromSelect = false;
+        std::set<llvm::Value*> condSeen;
+        std::vector<llvm::Value*> condWork{c};
+        unsigned condVisited = 0;
+        while (!condWork.empty() && condVisited < 4000 && !derivedFromSelect) {
+          llvm::Value* v = condWork.back();
+          condWork.pop_back();
+          if (!v || !condSeen.insert(v).second) continue;
+          ++condVisited;
+          for (auto* sel2 : selects) {
+            if (v == sel2) {
+              derivedFromSelect = true;
+              break;
+            }
+          }
+          if (derivedFromSelect) break;
+          if (auto* u = llvm::dyn_cast<llvm::User>(v)) {
+            for (auto& op : u->operands()) condWork.push_back(op.get());
+          }
+        }
+        if (!derivedFromSelect) rootConds.push_back(c);
+      }
+    }
+    auto subscribeCondition = [&](unsigned mask) {
+      subs.clear();
+      for (unsigned i = 0; i < rootConds.size(); ++i) {
+        subs.push_back({rootConds[i],
+                        llvm::ConstantInt::get(rootConds[i]->getType(),
+                                               (mask >> i) & 1u)});
+      }
+      // VMProtect's dispatch target is jmp_registr_ (the per-instance base) +
+      // decrypt(vip); pin that base phi too so the combination folds to the
+      // concrete handler.
+      if (basePhi && baseConst) {
+        subs.push_back({basePhi, baseConst});
+      }
+    };
+    if (!rootConds.empty() && rootConds.size() <= 4) {
+      const unsigned combos = 1u << rootConds.size();
+      for (unsigned mask = 0; mask < combos && selectArms.size() <= 8; ++mask) {
+        subscribeCondition(mask);
+        foldMemo.clear();
+        if (auto* folded = jccFold(simplifyValue, nullptr, nullptr, 0)) {
+          if (auto* fci = llvm::dyn_cast<llvm::ConstantInt>(folded)) {
+            if (isHandlerPointer(fci->getZExtValue())) {
+              selectArms.insert(fci->getValue());
+            }
+          }
+        }
+      }
+    } else if (!selects.empty()) {
+      // Fallback: no independent condition found (or too many). Keep the
+      // per-select scan so existing behaviour is preserved.
       const unsigned combos = 1u << selects.size();
       for (unsigned mask = 0; mask < combos && selectArms.size() <= 8; ++mask) {
         subs.clear();
@@ -618,20 +697,20 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
                   : llvm::cast<llvm::Constant>(selects[i]->getFalseValue());
           subs.push_back({selects[i], arm});
         }
-        // VMProtect's dispatch target is jmp_registr_ (the per-instance base)
-        // + decrypt(vip); pin that base phi too so the combination folds to the
-        // concrete handler (the bytecode encodes the next handler address).
         if (basePhi && baseConst) {
           subs.push_back({basePhi, baseConst});
         }
+        foldMemo.clear();
         if (auto* folded = jccFold(simplifyValue, nullptr, nullptr, 0)) {
           if (auto* fci = llvm::dyn_cast<llvm::ConstantInt>(folded)) {
-            selectArms.insert(fci->getValue());
+            if (isHandlerPointer(fci->getZExtValue())) {
+              selectArms.insert(fci->getValue());
+            }
           }
         }
       }
-      subs.clear();
     }
+    subs.clear();
   }
   bool selectDerived = false;
   if (selectArms.size() >= 2 && selectArms.size() <= 4) {
