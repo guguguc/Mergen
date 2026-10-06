@@ -139,6 +139,17 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::addValueReference(Value* value,
     }
   }
 
+  // Sticky last non-argument concrete per stack slot. SSA (including
+  // argument-derived xorshift) does not overwrite it. Consulted only at
+  // transfer: dest if the sticky value is a module pointer, cond if it is a
+  // predicate/counter and both select arms are handlers.
+  if (value != nullptr && value->getType()->isIntegerTy() &&
+      isStackAddress(address)) {
+    if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(value)) {
+      stickyNonArgSlot[address] = ci->getZExtValue();
+    }
+  }
+
   // Report the value as actually stored, after peeling.
   if (std::getenv("MERGEN_DIAG_SLOTSTORE") &&
       (address == 0x14FE68ULL || address == 0x14FE70ULL)) {

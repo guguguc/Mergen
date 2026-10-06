@@ -3,6 +3,7 @@
 #include "CommonDisassembler.hpp"
 #include "PathSolver.h"
 #include "LifterClass.hpp"
+#include "LifterDiagHelpers.hpp"
 #include "Utils.h"
 #include <llvm/Analysis/AliasAnalysis.h>
 #include <llvm/Analysis/MemorySSA.h>
@@ -274,6 +275,214 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
     }
   }
 
+  // Lift PCs are often 0x40xxxxxx while imageBase is 0x140000000, so
+  // address_to_mapped_address misses handlers that are still paged.
+  auto isHandlerPointer = [&](uint64_t addr) -> bool {
+    if (addr == 0 || isStackAddress(addr)) {
+      return false;
+    }
+    if (isBytecodeAddress(addr) || isModuleAddress(addr)) {
+      return true;
+    }
+    if ((addr & 0xFF000000ULL) == 0x40000000ULL) {
+      const uint64_t n = normalizeTargetAddress(addr);
+      return n != 0 && isMemPaged(n);
+    }
+    return false;
+  };
+
+  // Transfer-only sticky recovery. Dest: a single module pointer covered by
+  // data SSA. Cond: argument-tainted predicate on a two-handler select, only
+  // if a stack slot still holds a non-argument flag/counter.
+  if (!isa<ConstantInt>(simplifyValue) &&
+      (currentPathSolveContext == PathSolveContext::Ret ||
+       currentPathSolveContext == PathSolveContext::IndirectJump)) {
+    auto* topSel = dyn_cast<SelectInst>(simplifyValue);
+    auto isModuleArm = [&](Value* arm) -> bool {
+      auto* ci = dyn_cast<ConstantInt>(arm);
+      return ci != nullptr && isHandlerPointer(ci->getZExtValue());
+    };
+    const bool virtualizedJcc =
+        topSel != nullptr && isModuleArm(topSel->getTrueValue()) &&
+        isModuleArm(topSel->getFalseValue());
+
+    auto collectDag = [&](Value* root) {
+      std::set<Value*> seen;
+      std::vector<Value*> work{root};
+      unsigned visited = 0;
+      while (!work.empty() && visited < 4000) {
+        Value* v = work.back();
+        work.pop_back();
+        if (!v || !seen.insert(v).second) {
+          continue;
+        }
+        ++visited;
+        if (auto* u = dyn_cast<User>(v)) {
+          for (auto& op : u->operands()) {
+            work.push_back(op.get());
+          }
+        }
+      }
+      return seen;
+    };
+
+    auto foldWithSubs = [&](Value* root,
+                            const std::vector<std::pair<Value*, Constant*>>&
+                                subsIn) -> Constant* {
+      std::function<Constant*(Value*, int)> fold =
+          [&](Value* v, int depth) -> Constant* {
+        if (depth > 24 || v == nullptr) {
+          return nullptr;
+        }
+        for (auto& s : subsIn) {
+          if (v == s.first) {
+            return s.second;
+          }
+        }
+        if (auto* k = dyn_cast<Constant>(v)) {
+          return k;
+        }
+        if (auto* bo = dyn_cast<BinaryOperator>(v)) {
+          auto* a = fold(bo->getOperand(0), depth + 1);
+          auto* b = fold(bo->getOperand(1), depth + 1);
+          if (!a || !b) {
+            return nullptr;
+          }
+          return ConstantFoldBinaryOpOperands(bo->getOpcode(), a, b,
+                                              M->getDataLayout());
+        }
+        if (auto* cmp = dyn_cast<CmpInst>(v)) {
+          auto* a = fold(cmp->getOperand(0), depth + 1);
+          auto* b = fold(cmp->getOperand(1), depth + 1);
+          if (!a || !b) {
+            return nullptr;
+          }
+          return ConstantFoldCompareInstruction(cmp->getPredicate(), a, b);
+        }
+        if (auto* cast = dyn_cast<CastInst>(v)) {
+          auto* a = fold(cast->getOperand(0), depth + 1);
+          if (!a) {
+            return nullptr;
+          }
+          return ConstantFoldCastInstruction(cast->getOpcode(), a,
+                                             cast->getType());
+        }
+        if (auto* sel = dyn_cast<SelectInst>(v)) {
+          auto* cd = fold(sel->getCondition(), depth + 1);
+          auto* tv = fold(sel->getTrueValue(), depth + 1);
+          auto* fv = fold(sel->getFalseValue(), depth + 1);
+          if (!cd || !tv || !fv) {
+            return nullptr;
+          }
+          return ConstantFoldSelectInstruction(cd, tv, fv);
+        }
+        return nullptr;
+      };
+      return fold(root, 0);
+    };
+
+    auto emitSolvedBr = [&](uint64_t target, const char* name) -> PATH_info {
+      dest = normalizeTargetAddress(target);
+      auto resolved = resolveTargetBlock(dest, name);
+      builder->CreateBr(resolved.block);
+      if (!resolved.reusedBackedge) {
+        blockInfo = BBInfo(dest, resolved.block);
+        backupQueuedTarget(blockInfo.block, resolved.generalizedBackup);
+        unvisitedBlocks.push_back(blockInfo);
+      }
+      run = 0;
+      return PATH_solved;
+    };
+
+    if (virtualizedJcc && isArgumentDerived(topSel->getCondition()) &&
+        !stickyNonArgSlot.empty()) {
+      auto condSeen = collectDag(topSel->getCondition());
+      Value* condSsa = nullptr;
+      uint64_t predShadow = 0;
+      unsigned predHits = 0;
+      for (const auto& slotCopy : stickyNonArgSlot) {
+        if (!isStickyPredicate(slotCopy.second)) {
+          continue;
+        }
+        auto bufIt = buffer.find(slotCopy.first);
+        if (bufIt == buffer.end() || bufIt->second.value == nullptr) {
+          continue;
+        }
+        Value* occupied = bufIt->second.value;
+        if (isa<ConstantInt>(occupied) || condSeen.count(occupied) == 0) {
+          continue;
+        }
+        ++predHits;
+        condSsa = occupied;
+        predShadow = slotCopy.second;
+      }
+      if (predHits == 1 && condSsa != nullptr) {
+        std::vector<std::pair<Value*, Constant*>> condSubs{
+            {condSsa, builder->getIntN(condSsa->getType()->getIntegerBitWidth(),
+                                       predShadow)}};
+        if (auto* folded = foldWithSubs(topSel->getCondition(), condSubs)) {
+          if (auto* fci = dyn_cast<ConstantInt>(folded)) {
+            if (fci->getBitWidth() == 1) {
+              static int condLogs = 0;
+              if (condLogs < 40) {
+                ++condLogs;
+                std::cout << "[sticky-cond] rva=0x" << std::hex
+                          << maskedRVA(pathSolveSite) << " pred=0x"
+                          << predShadow << " taken=" << fci->getZExtValue()
+                          << std::dec << "\n"
+                          << std::flush;
+              }
+              auto* takenArm = fci->isOne() ? topSel->getTrueValue()
+                                            : topSel->getFalseValue();
+              if (auto* armCI = dyn_cast<ConstantInt>(takenArm)) {
+                return emitSolvedBr(armCI->getZExtValue(), "bb_sticky_cond");
+              }
+            }
+          }
+        }
+      }
+    }
+
+    if (!virtualizedJcc && !stickyNonArgSlot.empty()) {
+      auto destSeen = collectDag(simplifyValue);
+      std::vector<std::pair<Value*, Constant*>> vipSubs;
+      for (const auto& slotCopy : stickyNonArgSlot) {
+        if (!isModuleAddress(slotCopy.second) &&
+            !isBytecodeAddress(slotCopy.second)) {
+          continue;
+        }
+        auto bufIt = buffer.find(slotCopy.first);
+        if (bufIt == buffer.end() || bufIt->second.value == nullptr) {
+          continue;
+        }
+        Value* occupied = bufIt->second.value;
+        if (isa<ConstantInt>(occupied) || destSeen.count(occupied) == 0) {
+          continue;
+        }
+        vipSubs.push_back(
+            {occupied, builder->getIntN(
+                           occupied->getType()->getIntegerBitWidth(),
+                           slotCopy.second)});
+      }
+      if (vipSubs.size() == 1) {
+        if (auto* folded = foldWithSubs(simplifyValue, vipSubs)) {
+          if (auto* fci = dyn_cast<ConstantInt>(folded)) {
+            static int vipcopyLogs = 0;
+            if (vipcopyLogs < 40) {
+              ++vipcopyLogs;
+              std::cout << "[sticky-dest] fold rva=0x" << std::hex
+                        << maskedRVA(pathSolveSite) << " dest=0x"
+                        << fci->getZExtValue() << std::dec
+                        << " subs=" << vipSubs.size() << "\n"
+                        << std::flush;
+            }
+            return emitSolvedBr(fci->getZExtValue(), "bb_sticky_dest");
+          }
+        }
+      }
+    }
+  }
+
   // unsolved
   printvalue(simplifyValue);
   run = 0;
@@ -430,6 +639,48 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
     selectDerived = true;
   } else if (pvset.size() < 2) {
     pvset.insert(selectArms.begin(), selectArms.end());
+  }
+  // ltJmpWithFlag: two module-constant handler arms. KnownBits cross-product
+  // invents extra targets (mix: 0x20...... plus 0x403234c8/0x4034e2f2); the
+  // N-way switch then drops unvisited handlers. Use the two arms and fork.
+  {
+    std::set<uint64_t> handlerArms;
+    std::set<Value*> handlerSeen;
+    std::vector<Value*> handlerWork{simplifyValue};
+    unsigned handlerVisited = 0;
+    while (!handlerWork.empty() && handlerVisited < 4000) {
+      Value* v = handlerWork.back();
+      handlerWork.pop_back();
+      if (!v || !handlerSeen.insert(v).second) {
+        continue;
+      }
+      ++handlerVisited;
+      if (auto* sel = dyn_cast<SelectInst>(v)) {
+        auto* t = dyn_cast<ConstantInt>(sel->getTrueValue());
+        auto* f = dyn_cast<ConstantInt>(sel->getFalseValue());
+        if (t && f) {
+          const uint64_t ta = t->getZExtValue();
+          const uint64_t fa = f->getZExtValue();
+          if (isHandlerPointer(ta) && isHandlerPointer(fa)) {
+            handlerArms.insert(ta);
+            handlerArms.insert(fa);
+          }
+        }
+      }
+      if (auto* u = dyn_cast<User>(v)) {
+        for (auto& op : u->operands()) {
+          handlerWork.push_back(op.get());
+        }
+      }
+    }
+    if (handlerArms.size() == 2) {
+      pvset.clear();
+      const unsigned bw = simplifyValue->getType()->getIntegerBitWidth();
+      for (uint64_t arm : handlerArms) {
+        pvset.insert(APInt(bw, arm));
+      }
+      selectDerived = true;
+    }
   }
   std::vector<APInt> pv(pvset.begin(), pvset.end());
   // Virtualized-JCC rewrite (Themida article "Virtualized Conditional Control
@@ -780,6 +1031,9 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
       function->getParent()->print(OS, nullptr);
       std::cout << "created a new path\n" << std::flush;
     });
+    result = PATH_solved;
+    dest = firstTarget;
+    return result;
   }
 
   if (pv.size() > 2) {

@@ -42,6 +42,7 @@
 #include <memory>
 #include <set>
 #include <type_traits>
+#include <unordered_map>
 #include <utility>
 
 using namespace llvm;
@@ -1092,10 +1093,19 @@ public:
             memoryAlloc->stripPointerCasts()) {
             if (auto* off =
                     llvm::dyn_cast<llvm::ConstantInt>(gep->getOperand(1))) {
-              // Only module-backed loads are VIP candidates; a stack/pseudo
-              // slot in the DAG must not be mistaken for the bytecode read.
-              if (isModuleAddress(off->getZExtValue())) {
-                fromLoad = off->getZExtValue();
+              const uint64_t gepOff = off->getZExtValue();
+              // Module-backed loads are VIP candidates. A stack slot that
+              // currently forwards SSA may still be a copy of a recent fetch
+              // pointer; only use that when no image load is in the DAG.
+              if (isModuleAddress(gepOff)) {
+                fromLoad = gepOff;
+              } else if (fromLoad == 0) {
+                auto stickyIt = stickyNonArgSlot.find(gepOff);
+                if (stickyIt != stickyNonArgSlot.end() &&
+                    (isModuleAddress(stickyIt->second) ||
+                     isBytecodeAddress(stickyIt->second))) {
+                  fromLoad = stickyIt->second;
+                }
               }
             }
           }
@@ -1127,6 +1137,72 @@ public:
   uint64_t lastModuleLoadOffset = 0;
   std::set<uint64_t> lmlSeen;
   uint64_t lmlLast = 0;
+  std::deque<uint64_t> recentModuleLoads;
+  std::unordered_map<uint64_t, uint64_t> stickyNonArgSlot;
+  static uint64_t fetchRva(uint64_t addr) {
+    if (addr >= 0x140000000ULL) {
+      return addr - 0x140000000ULL;
+    }
+    if ((addr & 0xFF000000ULL) == 0x40000000ULL) {
+      return addr & 0x00FFFFFFULL;
+    }
+    return addr;
+  }
+  bool isRecentModuleFetch(uint64_t addr) {
+    if (addr == 0) {
+      return false;
+    }
+    if (!isBytecodeAddress(addr) && !isModuleAddress(addr)) {
+      return false;
+    }
+    const uint64_t rva = fetchRva(addr);
+    auto matches = [&](uint64_t other) {
+      return other != 0 && (other == addr || fetchRva(other) == rva);
+    };
+    if (matches(lastModuleLoadOffset)) {
+      return true;
+    }
+    for (uint64_t recent : recentModuleLoads) {
+      if (matches(recent)) {
+        return true;
+      }
+    }
+    return false;
+  }
+  bool isArgumentDerived(llvm::Value* v) {
+    if (v == nullptr) {
+      return false;
+    }
+    std::set<llvm::Value*> seen;
+    std::vector<llvm::Value*> work{v};
+    unsigned visited = 0;
+    while (!work.empty() && visited < 4000) {
+      llvm::Value* x = work.back();
+      work.pop_back();
+      if (!x || !seen.insert(x).second) {
+        continue;
+      }
+      ++visited;
+      if (llvm::isa<llvm::Argument>(x)) {
+        return true;
+      }
+      if (llvm::isa<llvm::Constant>(x)) {
+        continue;
+      }
+      if (auto* u = llvm::dyn_cast<llvm::User>(x)) {
+        for (auto& op : u->operands()) {
+          work.push_back(op.get());
+        }
+      }
+    }
+    return false;
+  }
+  bool isStickyPredicate(uint64_t v) {
+    if (v > 0xFFFULL) {
+      return false;
+    }
+    return !isModuleAddress(v) && !isBytecodeAddress(v);
+  }
   void noteModuleLoad(uint64_t addr) {
     if (!lmlSeen.insert(addr).second && addr != lmlLast) {
       std::cout << "[lmlrep] addr=0x" << std::hex << addr << " cur=0x"
@@ -1135,6 +1211,10 @@ public:
     }
     lmlLast = addr;
     lastModuleLoadOffset = addr;
+    recentModuleLoads.push_back(addr);
+    while (recentModuleLoads.size() > 64) {
+      recentModuleLoads.pop_front();
+    }
   }
   uint64_t currentVipOffset = 0;
   bool currentVipIsExact = false;
