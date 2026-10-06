@@ -1159,7 +1159,7 @@ public:
     auto matches = [&](uint64_t other) {
       return other != 0 && (other == addr || fetchRva(other) == rva);
     };
-    if (matches(lastModuleLoadOffset)) {
+    if (matches(lastModuleLoadOffset) || matches(currentVipOffset)) {
       return true;
     }
     for (uint64_t recent : recentModuleLoads) {

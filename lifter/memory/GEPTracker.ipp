@@ -932,7 +932,16 @@ using pvalueset = std::set<APInt, APIntComparator>;
 MERGEN_LIFTER_DEFINITION_TEMPLATES(pvalueset)::getPossibleValues(
     const llvm::KnownBits& known, unsigned max_unknown) {
 
-  if ((max_unknown == 0) || (max_unknown >= 10)) {
+  if ((known.hasConflict())) {
+    return {};
+  }
+  // Zero unknown bits means the value is fully known, not a contradiction.
+  if (max_unknown == 0) {
+    std::set<APInt, APIntComparator> values;
+    values.insert(known.One);
+    return values;
+  }
+  if (max_unknown >= 10) {
     debugging::doIfDebug([&]() {
       std::string Filename = "output_too_many_unk.ll";
       std::error_code EC;
@@ -941,7 +950,6 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(pvalueset)::getPossibleValues(
     });
     printvalueforce2(max_unknown);
     // Graceful bail: return empty set so caller treats this as PATH_unsolved.
-    // max_unknown==0 means contradictory analysis (no solutions exist).
     // max_unknown>=10 means too many unknowns (2^N blowup, >512 values).
     return {};
   }
@@ -1860,6 +1868,15 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::solveLoad(LazyValue load,
 
     if (getControlFlow() == ControlFlow::Unflatten) {
       auto possibleValues = computePossibleValues(loadOffset, 0);
+      pvalueset stackOnly;
+      for (const auto& candidate : possibleValues) {
+        const uint64_t addr = candidate.getZExtValue();
+        if (isStackAddress(addr) ||
+            isStackAddress(normalizeRuntimeTargetAddress(addr))) {
+          stackOnly.insert(candidate);
+        }
+      }
+      possibleValues.swap(stackOnly);
       if (liftProgressDiagEnabled &&
           current_address - instruction.length == 0x1400237F9ULL) {
         std::cout << "[diag] solveLoad offset current=0x1400237f9 pv_count="
@@ -1875,7 +1892,7 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::solveLoad(LazyValue load,
         }
         std::cout << "\n";
       }
-      if (possibleValues.empty()) {
+      if (possibleValues.empty() && !isArgumentDerived(loadOffset)) {
         possibleValues = inferIndexedOffsetsFromAssumptions(loadOffset);
       }
 

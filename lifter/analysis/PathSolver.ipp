@@ -20,6 +20,7 @@
 #include <llvm/Support/Casting.h>
 #include <functional>
 #include <limits>
+#include <optional>
 
 MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
     llvm::Function* function, uint64_t& dest, Value* simplifyValue) {
@@ -228,6 +229,43 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
     value->print(os);
     return os.str();
   };
+  auto dumpRetDestDag = [&](const char* tag, uint64_t solvedDest) {
+    if (maskedRVA(pathSolveSite) != 0x35a716ULL &&
+        (solvedDest & 0x00FFFFFFULL) != 0x113eb5ULL) {
+      return;
+    }
+    static int dumps = 0;
+    if (dumps >= 8) {
+      return;
+    }
+    ++dumps;
+    std::cout << "[dest-dag] " << tag << " site=0x" << std::hex << pathSolveSite
+              << " dest=0x" << solvedDest << std::dec
+              << " ctx=" << static_cast<int>(currentPathSolveContext) << "\n";
+    std::set<llvm::Value*> seen;
+    std::vector<std::pair<llvm::Value*, int>> work{{simplifyValue, 0}};
+    unsigned visited = 0;
+    while (!work.empty() && visited < 80) {
+      auto entry = work.back();
+      work.pop_back();
+      llvm::Value* v = entry.first;
+      if (!v || !seen.insert(v).second) {
+        continue;
+      }
+      ++visited;
+      std::cout << "  [" << entry.second << "] "
+                << formatPathValue(v).substr(0, 140) << "\n";
+      if (auto* u = llvm::dyn_cast<llvm::User>(v)) {
+        if (entry.second < 6) {
+          for (auto& op : u->operands()) {
+            work.push_back({op.get(), entry.second + 1});
+          }
+        }
+      }
+    }
+    std::cout << std::flush;
+  };
+  dumpRetDestDag("enter", 0);
 
   PATH_info result = PATH_unsolved;
   if (shouldTraceHotPathSolve()) {
@@ -240,6 +278,7 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
     dest = normalizeTargetAddress(constInt->getZExtValue());
     result = PATH_solved;
     run = 0;
+    dumpRetDestDag("const", dest);
 
     auto resolved = resolveTargetBlock(dest, "bb_solved_const");
 
@@ -258,6 +297,7 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
       dest = normalizeTargetAddress(dest);
     if (solved == PATH_solved) {
       run = 0;
+      dumpRetDestDag("constraint", dest);
       std::cout << "Solved the constraint and moving to next path\n"
                 << std::flush;
 
@@ -278,12 +318,20 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
   // Lift PCs are often 0x40xxxxxx while imageBase is 0x140000000, so
   // address_to_mapped_address misses handlers that are still paged. Use the
   // file-backed normalization (not pageMap, which the dump overlay fragments).
+  auto isPreferredImageVa = [&](uint64_t addr) -> bool {
+    return file.imageBase != 0 && addr >= file.imageBase &&
+           file.address_to_mapped_address(addr) != 0;
+  };
   auto isHandlerPointer = [&](uint64_t addr) -> bool {
-    if (addr == 0 || isStackAddress(addr)) {
+    if (addr == 0 || isStackAddress(addr) || isPreferredImageVa(addr)) {
       return false;
     }
     const uint64_t norm = normalizeFileBackedRuntimeTargetAddress(addr);
-    return norm != 0 && (isBytecodeAddress(norm) || isModuleAddress(norm));
+    if (norm == 0 || isPreferredImageVa(norm) || isBytecodeAddress(norm) ||
+        isBytecodeAddress(addr)) {
+      return false;
+    }
+    return isModuleAddress(norm) || isModuleAddress(addr);
   };
 
   // Transfer-only sticky recovery. Dest: a single module pointer covered by
@@ -371,6 +419,59 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
           }
           return ConstantFoldSelectInstruction(cd, tv, fv);
         }
+        if (auto* li = dyn_cast<LoadInst>(v)) {
+          if (!li->getType()->isIntegerTy()) {
+            return nullptr;
+          }
+          ConstantInt* offCI = nullptr;
+          auto* po = li->getPointerOperand()->stripPointerCasts();
+          if (auto* gep = dyn_cast<GetElementPtrInst>(po)) {
+            if (gep->getPointerOperand()->stripPointerCasts() ==
+                memoryAlloc->stripPointerCasts()) {
+              offCI = dyn_cast_or_null<ConstantInt>(
+                  fold(gep->getOperand(1), depth + 1));
+            }
+          }
+          if (offCI == nullptr) {
+            if (auto* itp = dyn_cast<IntToPtrInst>(po)) {
+              offCI = dyn_cast_or_null<ConstantInt>(
+                  fold(itp->getOperand(0), depth + 1));
+            }
+          }
+          if (offCI == nullptr) {
+            return nullptr;
+          }
+          const unsigned bits = li->getType()->getIntegerBitWidth();
+          if (bits % 8 != 0 || bits > 64) {
+            return nullptr;
+          }
+          const uint8_t nbytes = static_cast<uint8_t>(bits / 8);
+          const uint64_t addr = offCI->getZExtValue();
+          if (isStackAddress(addr) ||
+              isStackAddress(normalizeRuntimeTargetAddress(addr))) {
+            LazyValue nestedLoad([li]() -> Value* { return li; });
+            if (auto* resolved =
+                    retrieveCombinedValue(addr, nbytes, nestedLoad)) {
+              if (auto* rci = dyn_cast<ConstantInt>(resolved)) {
+                return ConstantInt::get(
+                    li->getType(),
+                    rci->getValue().zextOrTrunc(bits).getZExtValue());
+              }
+            }
+            return nullptr;
+          }
+          uint64_t raw = 0;
+          const uint64_t rva = fetchRva(addr);
+          const uint64_t cands[] = {
+              addr, normalizeFileBackedRuntimeTargetAddress(addr),
+              file.imageBase + rva, 0x140000000ULL + rva, 0x40000000ULL + rva};
+          for (uint64_t cand : cands) {
+            if (cand != 0 && file.readMemory(cand, nbytes, raw)) {
+              return ConstantInt::get(li->getType(), raw);
+            }
+          }
+          return nullptr;
+        }
         return nullptr;
       };
       return fold(root, 0);
@@ -378,6 +479,7 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
 
     auto emitSolvedBr = [&](uint64_t target, const char* name) -> PATH_info {
       dest = normalizeTargetAddress(target);
+      dumpRetDestDag(name, dest);
       auto resolved = resolveTargetBlock(dest, name);
       builder->CreateBr(resolved.block);
       if (!resolved.reusedBackedge) {
@@ -430,7 +532,9 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
               auto* takenArm = fci->isOne() ? topSel->getTrueValue()
                                             : topSel->getFalseValue();
               if (auto* armCI = dyn_cast<ConstantInt>(takenArm)) {
-                return emitSolvedBr(armCI->getZExtValue(), "bb_sticky_cond");
+                if (isHandlerPointer(armCI->getZExtValue())) {
+                  return emitSolvedBr(armCI->getZExtValue(), "bb_sticky_cond");
+                }
               }
             }
           }
@@ -461,18 +565,23 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
       }
       if (vipSubs.size() == 1) {
         if (auto* folded = foldWithSubs(simplifyValue, vipSubs)) {
-          if (auto* fci = dyn_cast<ConstantInt>(folded)) {
-            static int vipcopyLogs = 0;
-            if (vipcopyLogs < 40) {
-              ++vipcopyLogs;
-              std::cout << "[sticky-dest] fold rva=0x" << std::hex
-                        << maskedRVA(pathSolveSite) << " dest=0x"
-                        << fci->getZExtValue() << std::dec
-                        << " subs=" << vipSubs.size() << "\n"
-                        << std::flush;
+            if (auto* fci = dyn_cast<ConstantInt>(folded)) {
+              const uint64_t destAddr = fci->getZExtValue();
+              auto* vipCI = dyn_cast<ConstantInt>(vipSubs[0].second);
+              if (vipCI && isHandlerPointer(destAddr) &&
+                  fetchRva(destAddr) != fetchRva(vipCI->getZExtValue())) {
+                static int vipcopyLogs = 0;
+                if (vipcopyLogs < 40) {
+                  ++vipcopyLogs;
+                  std::cout << "[sticky-dest] fold rva=0x" << std::hex
+                            << maskedRVA(pathSolveSite) << " dest=0x"
+                            << destAddr << std::dec
+                            << " subs=" << vipSubs.size() << "\n"
+                            << std::flush;
+                }
+                return emitSolvedBr(destAddr, "bb_sticky_dest");
+              }
             }
-            return emitSolvedBr(fci->getZExtValue(), "bb_sticky_dest");
-          }
         }
       }
     }
@@ -550,6 +659,59 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
         if (cd && tv && fv) {
           result = llvm::ConstantFoldSelectInstruction(cd, tv, fv);
         }
+      } else if (auto* li = llvm::dyn_cast<llvm::LoadInst>(v)) {
+        if (li->getType()->isIntegerTy()) {
+          llvm::ConstantInt* offCI = nullptr;
+          auto* po = li->getPointerOperand()->stripPointerCasts();
+          if (auto* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(po)) {
+            if (gep->getPointerOperand()->stripPointerCasts() ==
+                memoryAlloc->stripPointerCasts()) {
+              offCI = llvm::dyn_cast_or_null<llvm::ConstantInt>(
+                  jccFold(gep->getOperand(1), node, repl, depth + 1));
+            }
+          }
+          if (offCI == nullptr) {
+            if (auto* itp = llvm::dyn_cast<llvm::IntToPtrInst>(po)) {
+              offCI = llvm::dyn_cast_or_null<llvm::ConstantInt>(
+                  jccFold(itp->getOperand(0), node, repl, depth + 1));
+            }
+          }
+          if (offCI) {
+            const unsigned bits = li->getType()->getIntegerBitWidth();
+            if (bits % 8 == 0 && bits <= 64) {
+              const uint8_t nbytes = static_cast<uint8_t>(bits / 8);
+              const uint64_t addr = offCI->getZExtValue();
+              if (isStackAddress(addr) ||
+                  isStackAddress(normalizeRuntimeTargetAddress(addr))) {
+                LazyValue nestedLoad([li]() -> Value* { return li; });
+                if (auto* resolved =
+                        retrieveCombinedValue(addr, nbytes, nestedLoad)) {
+                  if (auto* rci =
+                          llvm::dyn_cast<llvm::ConstantInt>(resolved)) {
+                    result = llvm::ConstantInt::get(
+                        li->getType(),
+                        rci->getValue().zextOrTrunc(bits).getZExtValue());
+                  }
+                }
+              } else {
+                uint64_t raw = 0;
+                const uint64_t rva = fetchRva(addr);
+                const uint64_t cands[] = {
+                    addr,
+                    normalizeFileBackedRuntimeTargetAddress(addr),
+                    file.imageBase + rva,
+                    0x140000000ULL + rva,
+                    0x40000000ULL + rva};
+                for (uint64_t cand : cands) {
+                  if (cand != 0 && file.readMemory(cand, nbytes, raw)) {
+                    result = llvm::ConstantInt::get(li->getType(), raw);
+                    break;
+                  }
+                }
+              }
+            }
+          }
+        }
       } else if (auto* p2 = llvm::dyn_cast<llvm::PHINode>(v)) {
         llvm::Constant* all = nullptr;
         bool ok = true;
@@ -572,6 +734,80 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
       return result;
   };
 
+  auto peelInt = [&](llvm::Value* off) -> llvm::Value* {
+    while (auto* cast = llvm::dyn_cast<llvm::CastInst>(off)) {
+      if (!cast->getSrcTy()->isIntegerTy() ||
+          !cast->getDestTy()->isIntegerTy()) {
+        break;
+      }
+      off = cast->getOperand(0);
+    }
+    return off;
+  };
+  auto loadAddrExpr = [&](llvm::LoadInst* li) -> llvm::Value* {
+    auto* po = li->getPointerOperand()->stripPointerCasts();
+    if (auto* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(po)) {
+      if (gep->getPointerOperand()->stripPointerCasts() ==
+          memoryAlloc->stripPointerCasts()) {
+        return peelInt(gep->getOperand(1));
+      }
+    }
+    if (auto* itp = llvm::dyn_cast<llvm::IntToPtrInst>(po)) {
+      return peelInt(itp->getOperand(0));
+    }
+    return nullptr;
+  };
+  std::set<uint64_t> vipLoadAddrs;
+  std::set<SelectInst*> vipLoadSelects;
+  std::vector<LoadInst*> vipLoads;
+  llvm::PHINode* basePhi = nullptr;
+  llvm::ConstantInt* baseConst = nullptr;
+  {
+    std::set<Value*> loadSeen;
+    std::vector<Value*> loadWork{simplifyValue};
+    unsigned loadVisited = 0;
+    while (!loadWork.empty() && loadVisited < 4000) {
+      Value* v = loadWork.back();
+      loadWork.pop_back();
+      if (!v || !loadSeen.insert(v).second) {
+        continue;
+      }
+      ++loadVisited;
+      if (auto* li = dyn_cast<LoadInst>(v)) {
+        if (auto* sel = dyn_cast<SelectInst>(loadAddrExpr(li))) {
+          auto* t = dyn_cast<ConstantInt>(sel->getTrueValue());
+          auto* f = dyn_cast<ConstantInt>(sel->getFalseValue());
+          if (t && f) {
+            // Address mux for [pcode], not ltJmpWithFlag dests.
+            vipLoadSelects.insert(sel);
+            vipLoads.push_back(li);
+            vipLoadAddrs.insert(t->getZExtValue());
+            vipLoadAddrs.insert(f->getZExtValue());
+            vipLoadAddrs.insert(fetchRva(t->getZExtValue()));
+            vipLoadAddrs.insert(fetchRva(f->getZExtValue()));
+          }
+        }
+      }
+      if (!basePhi) {
+        if (auto* ph = dyn_cast<PHINode>(v)) {
+          for (unsigned k = 0; k < ph->getNumIncomingValues(); ++k) {
+            if (auto* kc =
+                    dyn_cast<ConstantInt>(ph->getIncomingValue(k))) {
+              basePhi = ph;
+              baseConst = kc;
+              break;
+            }
+          }
+        }
+      }
+      if (auto* u = dyn_cast<User>(v)) {
+        for (auto& op : u->operands()) {
+          loadWork.push_back(op.get());
+        }
+      }
+    }
+  }
+
   // Virtualized conditional control flow (Themida article; VMProtect encodes
   // the destinations of ltJmpWithFlag through a select on a VM flag,
   // intel.cc:11721). Fold the transfer once per select arm and keep those
@@ -587,8 +823,6 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
     // condition and fail. Substituting every select keeps the traversal out of
     // the conditions, so each arm combination folds to a real destination.
     std::vector<llvm::SelectInst*> selects;
-    llvm::PHINode* basePhi = nullptr;
-    llvm::ConstantInt* baseConst = nullptr;
     std::set<llvm::Value*> selSeen;
     std::vector<llvm::Value*> selWork{simplifyValue};
     unsigned selVisited = 0;
@@ -598,21 +832,10 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
       if (!v || !selSeen.insert(v).second) continue;
       ++selVisited;
       if (auto* sel = llvm::dyn_cast<llvm::SelectInst>(v)) {
-        if (llvm::isa<llvm::ConstantInt>(sel->getTrueValue()) &&
+        if (vipLoadSelects.count(sel) == 0 &&
+            llvm::isa<llvm::ConstantInt>(sel->getTrueValue()) &&
             llvm::isa<llvm::ConstantInt>(sel->getFalseValue())) {
           selects.push_back(sel);
-        }
-      }
-      if (!basePhi) {
-        if (auto* ph = llvm::dyn_cast<llvm::PHINode>(v)) {
-          for (unsigned k = 0; k < ph->getNumIncomingValues(); ++k) {
-            if (auto* kc =
-                    llvm::dyn_cast<llvm::ConstantInt>(ph->getIncomingValue(k))) {
-              basePhi = ph;
-              baseConst = kc;
-              break;
-            }
-          }
         }
       }
       if (auto* u = llvm::dyn_cast<llvm::User>(v)) {
@@ -671,6 +894,13 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
         subs.push_back({basePhi, baseConst});
       }
     };
+    // A load-address mux is an uncommitted pcode pointer, not two dests.
+    // Folding the sibling decrypt-immediate select still yields both handlers
+    // and forks this transfer. That select is the same ltJmpWithFlag cond.
+    if (!vipLoadSelects.empty()) {
+      selects.clear();
+      rootConds.clear();
+    }
     if (!rootConds.empty() && rootConds.size() <= 4) {
       const unsigned combos = 1u << rootConds.size();
       for (unsigned mask = 0; mask < combos && selectArms.size() <= 8; ++mask) {
@@ -678,7 +908,9 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
         foldMemo.clear();
         if (auto* folded = jccFold(simplifyValue, nullptr, nullptr, 0)) {
           if (auto* fci = llvm::dyn_cast<llvm::ConstantInt>(folded)) {
-            if (isHandlerPointer(fci->getZExtValue())) {
+            if (isHandlerPointer(fci->getZExtValue()) &&
+                vipLoadAddrs.count(fci->getZExtValue()) == 0 &&
+                vipLoadAddrs.count(fetchRva(fci->getZExtValue())) == 0) {
               selectArms.insert(fci->getValue());
             }
           }
@@ -703,12 +935,170 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
         foldMemo.clear();
         if (auto* folded = jccFold(simplifyValue, nullptr, nullptr, 0)) {
           if (auto* fci = llvm::dyn_cast<llvm::ConstantInt>(folded)) {
-            if (isHandlerPointer(fci->getZExtValue())) {
+            if (isHandlerPointer(fci->getZExtValue()) &&
+                vipLoadAddrs.count(fci->getZExtValue()) == 0 &&
+                vipLoadAddrs.count(fetchRva(fci->getZExtValue())) == 0) {
               selectArms.insert(fci->getValue());
             }
           }
         }
       }
+    }
+    subs.clear();
+  }
+  if (!vipLoadSelects.empty()) {
+    pvset.clear();
+    auto destFromFolded = [&](Constant* folded, uint64_t pcode) -> ConstantInt* {
+      auto* fci = dyn_cast_or_null<ConstantInt>(folded);
+      if (fci == nullptr) {
+        return nullptr;
+      }
+      const uint64_t destAddr = fci->getZExtValue();
+      if (isHandlerPointer(destAddr) && fetchRva(destAddr) != fetchRva(pcode) &&
+          vipLoadAddrs.count(destAddr) == 0 &&
+          vipLoadAddrs.count(fetchRva(destAddr)) == 0) {
+        return fci;
+      }
+      return nullptr;
+    };
+    auto foldDestWithSelectArm = [&](SelectInst* sel,
+                                     ConstantInt* arm) -> ConstantInt* {
+      subs.clear();
+      subs.push_back({sel, arm});
+      if (basePhi && baseConst) {
+        subs.push_back({basePhi, baseConst});
+      }
+      foldMemo.clear();
+      auto* folded = jccFold(simplifyValue, nullptr, nullptr, 0);
+      subs.clear();
+      return destFromFolded(folded, arm->getZExtValue());
+    };
+    // AddReadCommand consumes the dword/qword then increments pcode
+    // (intel.cc:27802). lastModuleLoadOffset can already sit just past the
+    // load address dest = base+decrypt(load) still uses.
+    auto isCurrentPcode = [&](uint64_t arm) {
+      if (arm == 0 || lastModuleLoadOffset == 0) {
+        return false;
+      }
+      if (arm == lastModuleLoadOffset ||
+          fetchRva(arm) == fetchRva(lastModuleLoadOffset)) {
+        return true;
+      }
+      const uint64_t ar = fetchRva(arm);
+      const uint64_t pr = fetchRva(lastModuleLoadOffset);
+      return pr >= ar && (pr - ar) <= 8;
+    };
+
+    ConstantInt* pinnedDest = nullptr;
+    bool pinConflict = false;
+    auto takePin = [&](ConstantInt* d) {
+      if (d == nullptr) {
+        return;
+      }
+      if (pinnedDest && pinnedDest->getValue() != d->getValue()) {
+        pinConflict = true;
+        return;
+      }
+      pinnedDest = d;
+    };
+
+    if (pinnedDest == nullptr && !pinConflict && lastModuleLoadOffset != 0 &&
+        (isBytecodeAddress(lastModuleLoadOffset) ||
+         isModuleAddress(lastModuleLoadOffset))) {
+      for (SelectInst* sel : vipLoadSelects) {
+        auto* tArm = dyn_cast<ConstantInt>(sel->getTrueValue());
+        auto* fArm = dyn_cast<ConstantInt>(sel->getFalseValue());
+        ConstantInt* pinArm = nullptr;
+        const bool tHit = tArm && isCurrentPcode(tArm->getZExtValue());
+        const bool fHit = fArm && isCurrentPcode(fArm->getZExtValue());
+        if (tHit != fHit) {
+          pinArm = tHit ? tArm : fArm;
+        }
+        if (pinArm == nullptr) {
+          continue;
+        }
+        subs.clear();
+        subs.push_back({sel, pinArm});
+        const bool takeTrue = pinArm == tArm;
+        subs.push_back(
+            {sel->getCondition(),
+             ConstantInt::get(sel->getCondition()->getType(), takeTrue ? 1 : 0)});
+        {
+          std::set<Value*> seenSel;
+          std::vector<Value*> workSel{simplifyValue};
+          unsigned visSel = 0;
+          while (!workSel.empty() && visSel < 4000) {
+            Value* v = workSel.back();
+            workSel.pop_back();
+            if (!v || !seenSel.insert(v).second) {
+              continue;
+            }
+            ++visSel;
+            if (auto* other = dyn_cast<SelectInst>(v)) {
+              if (other != sel && other->getCondition() == sel->getCondition()) {
+                Value* arm = takeTrue ? other->getTrueValue()
+                                      : other->getFalseValue();
+                if (auto* aci = dyn_cast<ConstantInt>(arm)) {
+                  subs.push_back({other, aci});
+                }
+              }
+            }
+            if (auto* u = dyn_cast<User>(v)) {
+              for (auto& op : u->operands()) {
+                workSel.push_back(op.get());
+              }
+            }
+          }
+        }
+        if (basePhi && baseConst) {
+          subs.push_back({basePhi, baseConst});
+        }
+        foldMemo.clear();
+        Constant* folded = jccFold(simplifyValue, nullptr, nullptr, 0);
+        subs.clear();
+        auto* d = destFromFolded(folded, pinArm->getZExtValue());
+        if (maskedRVA(pathSolveSite) == 0x35a716ULL) {
+          std::cout << "[dest-dag] pin lastmod=0x" << std::hex
+                    << lastModuleLoadOffset << " arm=0x"
+                    << pinArm->getZExtValue() << " raw=";
+          if (auto* fci = dyn_cast_or_null<ConstantInt>(folded)) {
+            std::cout << "0x" << fci->getZExtValue();
+          } else {
+            std::cout << "null";
+          }
+          std::cout << " kept=0x" << (d ? d->getZExtValue() : 0) << std::dec
+                    << "\n"
+                    << std::flush;
+        }
+        takePin(d);
+      }
+    }
+
+    if (pinnedDest == nullptr && !pinConflict) {
+      for (SelectInst* sel : vipLoadSelects) {
+        subs.clear();
+        if (basePhi && baseConst) {
+          subs.push_back({basePhi, baseConst});
+        }
+        foldMemo.clear();
+        Constant* foldedCond =
+            jccFold(sel->getCondition(), nullptr, nullptr, 0);
+        subs.clear();
+        auto* condCI = dyn_cast_or_null<ConstantInt>(foldedCond);
+        if (condCI == nullptr || condCI->getBitWidth() != 1) {
+          continue;
+        }
+        auto* arm = condCI->isOne() ? cast<ConstantInt>(sel->getTrueValue())
+                                    : cast<ConstantInt>(sel->getFalseValue());
+        takePin(foldDestWithSelectArm(sel, arm));
+      }
+    }
+
+    if (pinnedDest && !pinConflict) {
+      selectArms.clear();
+      selectArms.insert(pinnedDest->getValue());
+      pvset.clear();
+      pvset.insert(pinnedDest->getValue());
     }
     subs.clear();
   }
@@ -719,49 +1109,30 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
   } else if (pvset.size() < 2) {
     pvset.insert(selectArms.begin(), selectArms.end());
   }
-  // ltJmpWithFlag: two module-constant handler arms. KnownBits cross-product
-  // invents extra targets (mix: 0x20...... plus 0x403234c8/0x4034e2f2); the
-  // N-way switch then drops unvisited handlers. Use the two arms and fork.
-  {
-    std::set<uint64_t> handlerArms;
-    std::set<Value*> handlerSeen;
-    std::vector<Value*> handlerWork{simplifyValue};
-    unsigned handlerVisited = 0;
-    while (!handlerWork.empty() && handlerVisited < 4000) {
-      Value* v = handlerWork.back();
-      handlerWork.pop_back();
-      if (!v || !handlerSeen.insert(v).second) {
+  if (!vipLoadAddrs.empty() && !pvset.empty()) {
+    pvalueset filtered;
+    for (const auto& val : pvset) {
+      const uint64_t addr = val.getZExtValue();
+      if (vipLoadAddrs.count(addr) || vipLoadAddrs.count(fetchRva(addr))) {
         continue;
       }
-      ++handlerVisited;
-      if (auto* sel = dyn_cast<SelectInst>(v)) {
-        auto* t = dyn_cast<ConstantInt>(sel->getTrueValue());
-        auto* f = dyn_cast<ConstantInt>(sel->getFalseValue());
-        if (t && f) {
-          const uint64_t ta = t->getZExtValue();
-          const uint64_t fa = f->getZExtValue();
-          if (isHandlerPointer(ta) && isHandlerPointer(fa)) {
-            handlerArms.insert(ta);
-            handlerArms.insert(fa);
-          }
-        }
-      }
-      if (auto* u = dyn_cast<User>(v)) {
-        for (auto& op : u->operands()) {
-          handlerWork.push_back(op.get());
-        }
-      }
+      filtered.insert(val);
     }
-    if (handlerArms.size() == 2) {
-      pvset.clear();
-      const unsigned bw = simplifyValue->getType()->getIntegerBitWidth();
-      for (uint64_t arm : handlerArms) {
-        pvset.insert(APInt(bw, arm));
-      }
-      selectDerived = true;
-    }
+    pvset.swap(filtered);
   }
   std::vector<APInt> pv(pvset.begin(), pvset.end());
+  if (maskedRVA(pathSolveSite) == 0x35a716ULL) {
+    std::cout << "[dest-dag] pv site=0x" << std::hex << pathSolveSite
+              << std::dec << " n=" << pv.size();
+    for (const auto& c : pv) {
+      std::cout << " 0x" << std::hex << c.getZExtValue() << std::dec;
+    }
+    std::cout << " selectDerived=" << selectDerived << " lastmod=0x" << std::hex
+              << lastModuleLoadOffset << " vip=0x" << currentVipOffset
+              << " vipSels=" << std::dec << vipLoadSelects.size()
+              << " selArms=" << selectArms.size() << "\n"
+              << std::flush;
+  }
   // Virtualized-JCC rewrite (Themida article "Virtualized Conditional Control
   // Flow"; VMProtect encodes the destinations through ltJmpWithFlag and the
   // vm-instance selector through set_jmp_value, intel.cc:11721/11734).
@@ -917,6 +1288,7 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
     printvalue2(pv[0]);
     dest = normalizeTargetAddress(pv[0].getZExtValue());
     result = PATH_solved;
+    dumpRetDestDag("single", dest);
 
     auto resolved = resolveTargetBlock(dest, "bb_single");
     builder->CreateBr(resolved.block);
@@ -964,6 +1336,7 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
                         pv[1].getZExtValue()));
           dest = firstViable ? filteredFirstTarget : filteredSecondTarget;
           result = PATH_solved;
+          dumpRetDestDag("filtered-sel", dest);
           auto resolved = resolveTargetBlock(dest, "bb_filtered");
           auto* trueBlock = trueGoesToViable ? resolved.block : liftAbortBlock;
           auto* falseBlock = trueGoesToViable ? liftAbortBlock : resolved.block;
@@ -979,6 +1352,7 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
         }
         dest = firstViable ? filteredFirstTarget : filteredSecondTarget;
         result = PATH_solved;
+        dumpRetDestDag("filtered", dest);
         auto resolved = resolveTargetBlock(dest, "bb_filtered");
         builder->CreateBr(resolved.block);
         if (!resolved.reusedBackedge) {
@@ -1112,6 +1486,7 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
     });
     result = PATH_solved;
     dest = firstTarget;
+    dumpRetDestDag("twoway", dest);
     return result;
   }
 
