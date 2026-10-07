@@ -328,8 +328,9 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
       return false;
     }
     const uint64_t norm = normalizeFileBackedRuntimeTargetAddress(addr);
-    if (norm == 0 || isPreferredImageVa(norm) || isBytecodeAddress(norm) ||
-        isBytecodeAddress(addr)) {
+    if (norm == 0 || isPreferredImageVa(norm) ||
+        vmp.dispatch.excludeBytecodeDest(isBytecodeAddress(addr),
+                                         isBytecodeAddress(norm))) {
       return false;
     }
     return isModuleAddress(norm) || isModuleAddress(addr);
@@ -758,10 +759,7 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
     }
     return nullptr;
   };
-  std::set<uint64_t> vipLoadAddrs;
-  std::set<SelectInst*> vipLoadSelects;
-  llvm::PHINode* basePhi = nullptr;
-  llvm::ConstantInt* baseConst = nullptr;
+  typename VmpDispatch<Register>::TransferScan vmpScan;
   {
     std::set<Value*> loadSeen;
     std::vector<Value*> loadWork{simplifyValue};
@@ -775,29 +773,11 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
       ++loadVisited;
       if (auto* li = dyn_cast<LoadInst>(v)) {
         if (auto* sel = dyn_cast<SelectInst>(loadAddrExpr(li))) {
-          auto* t = dyn_cast<ConstantInt>(sel->getTrueValue());
-          auto* f = dyn_cast<ConstantInt>(sel->getFalseValue());
-          if (t && f) {
-            // Address mux for [pcode], not ltJmpWithFlag dests.
-            vipLoadSelects.insert(sel);
-            vipLoadAddrs.insert(t->getZExtValue());
-            vipLoadAddrs.insert(f->getZExtValue());
-            vipLoadAddrs.insert(fetchRva(t->getZExtValue()));
-            vipLoadAddrs.insert(fetchRva(f->getZExtValue()));
-          }
+          vmpScan.noteAddressMux(sel);
         }
       }
-      if (!basePhi) {
-        if (auto* ph = dyn_cast<PHINode>(v)) {
-          for (unsigned k = 0; k < ph->getNumIncomingValues(); ++k) {
-            if (auto* kc =
-                    dyn_cast<ConstantInt>(ph->getIncomingValue(k))) {
-              basePhi = ph;
-              baseConst = kc;
-              break;
-            }
-          }
-        }
+      if (auto* ph = dyn_cast<PHINode>(v)) {
+        vmpScan.noteInstanceBase(ph);
       }
       if (auto* u = dyn_cast<User>(v)) {
         for (auto& op : u->operands()) {
@@ -831,9 +811,7 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
       if (!v || !selSeen.insert(v).second) continue;
       ++selVisited;
       if (auto* sel = llvm::dyn_cast<llvm::SelectInst>(v)) {
-        if (vipLoadSelects.count(sel) == 0 &&
-            llvm::isa<llvm::ConstantInt>(sel->getTrueValue()) &&
-            llvm::isa<llvm::ConstantInt>(sel->getFalseValue())) {
+        if (vmpScan.keepDestSelect(sel)) {
           selects.push_back(sel);
         }
       }
@@ -889,14 +867,14 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
       // VMProtect's dispatch target is jmp_registr_ (the per-instance base) +
       // decrypt(vip); pin that base phi too so the combination folds to the
       // concrete handler.
-      if (basePhi && baseConst) {
-        subs.push_back({basePhi, baseConst});
+      if (vmpScan.basePhi && vmpScan.baseConst) {
+        subs.push_back({vmpScan.basePhi, vmpScan.baseConst});
       }
     };
     // A load-address mux is an uncommitted pcode pointer, not two dests.
     // Folding the sibling decrypt-immediate select still yields both handlers
     // and forks this transfer. That select is the same ltJmpWithFlag cond.
-    if (!vipLoadSelects.empty()) {
+    if (vmpScan.suppressDestFork()) {
       selects.clear();
       rootConds.clear();
     }
@@ -907,9 +885,8 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
         foldMemo.clear();
         if (auto* folded = jccFold(simplifyValue, nullptr, nullptr, 0)) {
           if (auto* fci = llvm::dyn_cast<llvm::ConstantInt>(folded)) {
-            if (isHandlerPointer(fci->getZExtValue()) &&
-                vipLoadAddrs.count(fci->getZExtValue()) == 0 &&
-                vipLoadAddrs.count(fetchRva(fci->getZExtValue())) == 0) {
+            if (vmp.dispatch.isLiveHandler(vmpScan, fci->getZExtValue(),
+                                           isHandlerPointer(fci->getZExtValue()))) {
               selectArms.insert(fci->getValue());
             }
           }
@@ -928,15 +905,14 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
                   : llvm::cast<llvm::Constant>(selects[i]->getFalseValue());
           subs.push_back({selects[i], arm});
         }
-        if (basePhi && baseConst) {
-          subs.push_back({basePhi, baseConst});
+        if (vmpScan.basePhi && vmpScan.baseConst) {
+          subs.push_back({vmpScan.basePhi, vmpScan.baseConst});
         }
         foldMemo.clear();
         if (auto* folded = jccFold(simplifyValue, nullptr, nullptr, 0)) {
           if (auto* fci = llvm::dyn_cast<llvm::ConstantInt>(folded)) {
-            if (isHandlerPointer(fci->getZExtValue()) &&
-                vipLoadAddrs.count(fci->getZExtValue()) == 0 &&
-                vipLoadAddrs.count(fetchRva(fci->getZExtValue())) == 0) {
+            if (vmp.dispatch.isLiveHandler(vmpScan, fci->getZExtValue(),
+                                           isHandlerPointer(fci->getZExtValue()))) {
               selectArms.insert(fci->getValue());
             }
           }
@@ -945,7 +921,7 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
     }
     subs.clear();
   }
-  if (!vipLoadSelects.empty()) {
+  if (vmpScan.suppressDestFork()) {
     pvset.clear();
     auto destFromFolded = [&](Constant* folded, uint64_t pcode) -> ConstantInt* {
       auto* fci = dyn_cast_or_null<ConstantInt>(folded);
@@ -953,9 +929,8 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
         return nullptr;
       }
       const uint64_t destAddr = fci->getZExtValue();
-      if (isHandlerPointer(destAddr) && fetchRva(destAddr) != fetchRva(pcode) &&
-          vipLoadAddrs.count(destAddr) == 0 &&
-          vipLoadAddrs.count(fetchRva(destAddr)) == 0) {
+      if (vmp.dispatch.isLiveHandler(vmpScan, destAddr,
+                                     isHandlerPointer(destAddr), pcode)) {
         return fci;
       }
       return nullptr;
@@ -964,28 +939,13 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
                                      ConstantInt* arm) -> ConstantInt* {
       subs.clear();
       subs.push_back({sel, arm});
-      if (basePhi && baseConst) {
-        subs.push_back({basePhi, baseConst});
+      if (vmpScan.basePhi && vmpScan.baseConst) {
+        subs.push_back({vmpScan.basePhi, vmpScan.baseConst});
       }
       foldMemo.clear();
       auto* folded = jccFold(simplifyValue, nullptr, nullptr, 0);
       subs.clear();
       return destFromFolded(folded, arm->getZExtValue());
-    };
-    // AddReadCommand consumes the dword/qword then increments pcode
-    // (intel.cc:27802). lastModuleLoadOffset can already sit just past the
-    // load address dest = base+decrypt(load) still uses.
-    auto isCurrentPcode = [&](uint64_t arm) {
-      if (arm == 0 || lastModuleLoadOffset == 0) {
-        return false;
-      }
-      if (arm == lastModuleLoadOffset ||
-          fetchRva(arm) == fetchRva(lastModuleLoadOffset)) {
-        return true;
-      }
-      const uint64_t ar = fetchRva(arm);
-      const uint64_t pr = fetchRva(lastModuleLoadOffset);
-      return pr >= ar && (pr - ar) <= 8;
     };
 
     ConstantInt* pinnedDest = nullptr;
@@ -1001,18 +961,13 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
       pinnedDest = d;
     };
 
-    if (pinnedDest == nullptr && !pinConflict && lastModuleLoadOffset != 0 &&
-        (isBytecodeAddress(lastModuleLoadOffset) ||
-         isModuleAddress(lastModuleLoadOffset))) {
-      for (SelectInst* sel : vipLoadSelects) {
+    if (pinnedDest == nullptr && !pinConflict &&
+        vmp.dispatch.canPinDest(isBytecodeAddress(vmp.vipOffset()) ||
+                                isModuleAddress(vmp.vipOffset()))) {
+      for (SelectInst* sel : vmpScan.vipLoadSelects) {
         auto* tArm = dyn_cast<ConstantInt>(sel->getTrueValue());
         auto* fArm = dyn_cast<ConstantInt>(sel->getFalseValue());
-        ConstantInt* pinArm = nullptr;
-        const bool tHit = tArm && isCurrentPcode(tArm->getZExtValue());
-        const bool fHit = fArm && isCurrentPcode(fArm->getZExtValue());
-        if (tHit != fHit) {
-          pinArm = tHit ? tArm : fArm;
-        }
+        ConstantInt* pinArm = vmp.dispatch.pinLoadSelectArm(tArm, fArm);
         if (pinArm == nullptr) {
           continue;
         }
@@ -1049,8 +1004,8 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
             }
           }
         }
-        if (basePhi && baseConst) {
-          subs.push_back({basePhi, baseConst});
+        if (vmpScan.basePhi && vmpScan.baseConst) {
+          subs.push_back({vmpScan.basePhi, vmpScan.baseConst});
         }
         foldMemo.clear();
         Constant* folded = jccFold(simplifyValue, nullptr, nullptr, 0);
@@ -1058,7 +1013,7 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
         auto* d = destFromFolded(folded, pinArm->getZExtValue());
         if (maskedRVA(pathSolveSite) == 0x35a716ULL) {
           std::cout << "[dest-dag] pin lastmod=0x" << std::hex
-                    << lastModuleLoadOffset << " arm=0x"
+                    << vmp.vipOffset() << " arm=0x"
                     << pinArm->getZExtValue() << " raw=";
           if (auto* fci = dyn_cast_or_null<ConstantInt>(folded)) {
             std::cout << "0x" << fci->getZExtValue();
@@ -1074,10 +1029,10 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
     }
 
     if (pinnedDest == nullptr && !pinConflict) {
-      for (SelectInst* sel : vipLoadSelects) {
+      for (SelectInst* sel : vmpScan.vipLoadSelects) {
         subs.clear();
-        if (basePhi && baseConst) {
-          subs.push_back({basePhi, baseConst});
+        if (vmpScan.basePhi && vmpScan.baseConst) {
+          subs.push_back({vmpScan.basePhi, vmpScan.baseConst});
         }
         foldMemo.clear();
         Constant* foldedCond =
@@ -1108,11 +1063,11 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
   } else if (pvset.size() < 2) {
     pvset.insert(selectArms.begin(), selectArms.end());
   }
-  if (!vipLoadAddrs.empty() && !pvset.empty()) {
+  if (!vmpScan.vipLoadAddrs.empty() && !pvset.empty()) {
     pvalueset filtered;
     for (const auto& val : pvset) {
       const uint64_t addr = val.getZExtValue();
-      if (vipLoadAddrs.count(addr) || vipLoadAddrs.count(fetchRva(addr))) {
+      if (vmpScan.isVipLoadAddr(addr)) {
         continue;
       }
       filtered.insert(val);
@@ -1127,8 +1082,8 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
       std::cout << " 0x" << std::hex << c.getZExtValue() << std::dec;
     }
     std::cout << " selectDerived=" << selectDerived << " lastmod=0x" << std::hex
-              << lastModuleLoadOffset << " vip=0x" << currentVipOffset
-              << " vipSels=" << std::dec << vipLoadSelects.size()
+              << vmp.vipOffset() << " vip=0x" << currentVipOffset
+              << " vipSels=" << std::dec << vmpScan.vipLoadSelects.size()
               << " selArms=" << selectArms.size() << "\n"
               << std::flush;
   }

@@ -1021,15 +1021,12 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_add_sub() {
     const bool srcImm =
         srcTy == OperandType::Immediate8 || srcTy == OperandType::Immediate16 ||
         srcTy == OperandType::Immediate32 || srcTy == OperandType::Immediate64;
-    if (dstReg && srcImm && pcodeReg != Register::None &&
-        getBiggestEncoding(instruction.regs[0]) == pcodeReg) {
-      const uint64_t step = instruction.immediate;
-      if (step == 1 || step == 2 || step == 4 || step == 8) {
-        if (instruction.mnemonic == Mnemonic::ADD) {
-          advancePcodePointer(static_cast<int64_t>(step));
-        } else if (instruction.mnemonic == Mnemonic::SUB) {
-          advancePcodePointer(-static_cast<int64_t>(step));
-        }
+    if (dstReg && srcImm) {
+      const bool isAdd = instruction.mnemonic == Mnemonic::ADD;
+      const bool isSub = instruction.mnemonic == Mnemonic::SUB;
+      if (isAdd || isSub) {
+        vmp.onPointerStep(getBiggestEncoding(instruction.regs[0]), isAdd,
+                          instruction.immediate);
       }
     }
   }

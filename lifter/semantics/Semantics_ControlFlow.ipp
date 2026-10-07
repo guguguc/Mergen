@@ -50,6 +50,22 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_mov() {
 
   SetIndexValue(0, Rvalue);
 
+  if (instruction.mnemonic == Mnemonic::MOV &&
+      instruction.types[0] == OperandType::Register64) {
+    const bool srcIsMemory =
+        instruction.types[1] >= OperandType::Memory8 &&
+        instruction.types[1] <= OperandType::Memory128;
+    Register srcReg = Register::None;
+    if (instruction.types[1] == OperandType::Register64) {
+      srcReg = getBiggestEncoding(instruction.regs[1]);
+    }
+    auto* ci = llvm::dyn_cast_or_null<llvm::ConstantInt>(Rvalue);
+    vmp.onMov(
+        getBiggestEncoding(instruction.regs[0]), srcReg,
+        srcIsMemory ? getBiggestEncoding(instruction.mem_base) : Register::None,
+        srcIsMemory, Rvalue, ci && isBytecodeAddress(ci->getZExtValue()));
+  }
+
   // Provenance tagging: if this is `mov reg, [rip+disp]` and disp+RIP
   // resolves to an IAT slot, remember which import the register now holds.
   // A later `call reg` can then emit a named external call without needing
@@ -536,7 +552,7 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_ret() { // fix
     currentVipOffset = vipFromFoldChain(realval);
   }
   if (currentVipOffset == 0) {
-    currentVipOffset = lastModuleLoadOffset;
+    currentVipOffset = vmp.vipOffset();
   }
   {
     static bool dumped = false;
@@ -552,7 +568,7 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_ret() { // fix
                 << " bufHas14fc58=" << buffer.count(0x14fc58)
                 << " bufSize=" << buffer.size()
                 << " provSize=" << loadProvenance.size()
-                << " lastModLoad=0x" << std::hex << lastModuleLoadOffset
+                << " lastModLoad=0x" << std::hex << vmp.vipOffset()
                 << std::dec
                 << " realval=" << os.str().substr(0, 200) << "\n"
                 << std::flush;
@@ -682,7 +698,7 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_jmp() {
     currentVipOffset = vipFromFoldChain(trunc);
   }
   if (currentVipOffset == 0) {
-    currentVipOffset = lastModuleLoadOffset;
+    currentVipOffset = vmp.vipOffset();
   }
   if (liftProgressDiagEnabled &&
       (current_address - instruction.length == 0x1403B1543ULL ||
@@ -697,7 +713,7 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_jmp() {
                 << " isConst=" << llvm::isa<llvm::Constant>(trunc)
                 << " vip=0x" << currentVipOffset << " chain=0x"
                 << vipFromFoldChain(trunc) << " lastModLoad=0x"
-                << lastModuleLoadOffset << std::dec << "\n"
+                << vmp.vipOffset() << std::dec << "\n"
                 << std::flush;
     }
   }

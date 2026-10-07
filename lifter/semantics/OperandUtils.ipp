@@ -1733,21 +1733,37 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::GetMemoryValue(Value* address,
       loadAddress = offset->getZExtValue();
     }
   }
-  // AddReadCommand (intel.cc:27793) reads [pcode_registr_], not the guest
-  // GPR SSA that may have been overwritten with seed. Only the register that
-  // last fetched bytecode is rebound; a VM switch (27776) uses a different
-  // GPR and binds on that instance's first bytecode [reg] load.
-  if (loadAddress == 0 && isPcodeMemFetch() &&
+  if (loadAddress == 0 &&
+      vmp.isFetch(getBiggestEncoding(instruction.mem_base),
+                  isSimpleRegMemOp()) &&
       currentPathSolveContext != PathSolveContext::Ret) {
-    loadAddress = lastModuleLoadOffset;
-    address = builder->getInt64(loadAddress);
-    pointer = getPointer(address);
-    retval.setCalculation([this, pointer, size]() {
-      auto ret = builder->CreateLoad(builder->getIntNTy(size), pointer);
-      printvalue(ret);
-      return ret;
-    });
-    loadMemoryOp(pointer);
+    bool wroteRegister = false;
+    const uint64_t cursor = vmp.resolveFetch(
+        GetRegisterValue(vmp.pcodeRegister()),
+        [&](uint64_t slot, llvm::Value* org) -> uint64_t {
+          LazyValue nested(org);
+          if (auto* popped = retrieveCombinedValue(slot, 8, nested)) {
+            if (auto* pci = llvm::dyn_cast<llvm::ConstantInt>(popped)) {
+              return pci->getZExtValue();
+            }
+          }
+          return 0;
+        },
+        wroteRegister);
+    if (wroteRegister) {
+      SetRegisterValue(vmp.pcodeRegister(), builder->getInt64(cursor));
+    }
+    if (cursor != 0) {
+      loadAddress = cursor;
+      address = builder->getInt64(loadAddress);
+      pointer = getPointer(address);
+      retval.setCalculation([this, pointer, size]() {
+        auto ret = builder->CreateLoad(builder->getIntNTy(size), pointer);
+        printvalue(ret);
+        return ret;
+      });
+      loadMemoryOp(pointer);
+    }
   }
 
   Value* result = nullptr;
@@ -1801,6 +1817,7 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::GetMemoryValue(Value* address,
   } else {
     result = retval.get();
   }
+  vmp.noteStackQword(result, size, loadAddress);
   {
     const uint64_t insnVA = current_address - instruction.length;
     if (insnVA == 0x1403D50FEULL || loadAddress == 0x1400EF850ULL) {
@@ -1851,7 +1868,8 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::GetMemoryValue(Value* address,
       currentPathSolveContext != PathSolveContext::Ret) {
     loadProvenance[result] = loadAddress;
     noteModuleLoad(loadAddress);
-    bindPcodeRegister(loadAddress);
+    vmp.onBytecodeLoad(getBiggestEncoding(instruction.mem_base),
+                       isSimpleRegMemOp(), loadAddress);
   }
 
   return result;

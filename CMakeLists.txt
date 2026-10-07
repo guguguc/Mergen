@@ -90,6 +90,7 @@ set(lifter_SOURCES
 	"lifter/core/LifterClass.hpp"
 	"lifter/core/LifterClass_Concolic.hpp"
 	"lifter/core/LifterClass_Symbolic.hpp"
+	"lifter/core/LifterDiagHelpers.hpp"
 	"lifter/core/LifterPipeline.hpp"
 	"lifter/core/LifterPipelineStages.hpp"
 	"lifter/core/LifterStages.hpp"
@@ -122,6 +123,9 @@ set(lifter_SOURCES
 	"lifter/analysis/PathSolver.h"
 	"lifter/analysis/CustomPasses.hpp"
 	"lifter/analysis/PathSolver.ipp"
+	"lifter/vmp/VmpDispatch.hpp"
+	"lifter/vmp/VmpModel.hpp"
+	"lifter/vmp/VmpPcodeCursor.hpp"
 	"lifter/test/TestInstructions.h"
 	"lifter/test/Tester.hpp"
 	cmake.toml
@@ -155,6 +159,7 @@ target_include_directories(lifter PRIVATE
 	"lifter/disasm"
 	"lifter/memory"
 	"lifter/analysis"
+	"lifter/vmp"
 	"lifter/test"
 )
 
@@ -207,6 +212,7 @@ set(rewrite_microtests_SOURCES
 	"lifter/core/LifterClass.hpp"
 	"lifter/core/LifterClass_Concolic.hpp"
 	"lifter/core/LifterClass_Symbolic.hpp"
+	"lifter/core/LifterDiagHelpers.hpp"
 	"lifter/core/LifterPipeline.hpp"
 	"lifter/core/LifterPipelineStages.hpp"
 	"lifter/core/LifterStages.hpp"
@@ -239,6 +245,9 @@ set(rewrite_microtests_SOURCES
 	"lifter/analysis/PathSolver.h"
 	"lifter/analysis/CustomPasses.hpp"
 	"lifter/analysis/PathSolver.ipp"
+	"lifter/vmp/VmpDispatch.hpp"
+	"lifter/vmp/VmpModel.hpp"
+	"lifter/vmp/VmpPcodeCursor.hpp"
 	"lifter/test/TestInstructions.h"
 	"lifter/test/Tester.hpp"
 	cmake.toml
@@ -270,6 +279,7 @@ target_include_directories(rewrite_microtests PRIVATE
 	"lifter/disasm"
 	"lifter/memory"
 	"lifter/analysis"
+	"lifter/vmp"
 	"lifter/test"
 )
 

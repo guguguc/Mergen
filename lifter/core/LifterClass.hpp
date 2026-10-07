@@ -17,6 +17,7 @@
 #include "IcedDisassemblerRegisters.h"
 #include "Includes.h"
 #include "Utils.h"
+#include "../vmp/VmpModel.hpp"
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 
@@ -746,7 +747,7 @@ public:
                     << " rsp=" << hexOrIr(this->GetRegisterValue(Register::RSP))
                     << " rdi=" << hexOrIr(this->GetRegisterValue(Register::RDI))
                     << " rcx=" << hexOrIr(this->GetRegisterValue(Register::RCX))
-                    << " lastmod=0x" << this->lastModuleLoadOffset;
+                    << " lastmod=0x" << this->vmp.vipOffset();
           dumpMem("[rbx]", this->GetRegisterValue(Register::RBX), 8);
           dumpMem("[r9]", this->GetRegisterValue(Register::R9), 8);
           dumpMem("dword[r9]", this->GetRegisterValue(Register::R9), 4);
@@ -1026,12 +1027,11 @@ public:
   // VMProtect keeps its VM stack on the native stack; in the flat memory model
   // that region overlaps the image's virtual range, so address_to_mapped_address
   // alone cannot separate a bytecode read from a VM-stack read.
-  std::vector<std::pair<uint64_t, uint64_t>> bytecodeRanges;
+  void addBytecodeRange(uint64_t start, uint64_t end) {
+    vmp.addBytecodeRange(start, end);
+  }
   bool isBytecodeAddress(uint64_t address) const {
-    for (const auto& range : bytecodeRanges) {
-      if (address >= range.first && address < range.second) return true;
-    }
-    return false;
+    return vmp.isBytecodeAddress(address);
   }
   bool isStackAddress(uint64_t address) {
     constexpr uint64_t kReserve = 0x100000;
@@ -1124,7 +1124,7 @@ public:
     // folded constant's provenance is ambiguous: dozens of distinct bytecode
     // reads collapse onto one ConstantInt and overwrite each other, fabricating
     // a VIP and therefore a bogus loop backedge. Returning 0 lets the caller
-    // fall back to the pre-fold chain and then to lastModuleLoadOffset, which
+    // fall back to the pre-fold chain and then to vmp.vipOffset(), which
     // VMP's codegen makes exact (the dispatch bytecode read is the last module
     // load appended to a handler, intel.cc:27836).
     return fromLoad;
@@ -1134,13 +1134,7 @@ public:
   // Address of the most recent module-backed load that was lifted. VMProtect's
   // codegen appends the bytecode read as the final module load of a handler
   // (AddEndHandlerCommands, intel.cc:27836), so at a transfer this is the VIP.
-  uint64_t lastModuleLoadOffset = 0;
-  // GPR that last fetched bytecode as [reg] (AddReadCommand's pcode_registr_).
-  // Each VM instance uses its own register (intel.cc:28633, 27776-27789); a
-  // switch pops the next instance's pcode off the VM stack and rebinds when
-  // that [reg] load is a bytecode address. Do not apply this pointer to other
-  // GPRs — that would mix two instances onto one cursor.
-  Register pcodeReg = Register::None;
+  VmpModel<Register> vmp;
   std::set<uint64_t> lmlSeen;
   uint64_t lmlLast = 0;
   std::deque<uint64_t> recentModuleLoads;
@@ -1165,7 +1159,7 @@ public:
     auto matches = [&](uint64_t other) {
       return other != 0 && (other == addr || fetchRva(other) == rva);
     };
-    if (matches(lastModuleLoadOffset) || matches(currentVipOffset)) {
+    if (matches(vmp.vipOffset()) || matches(currentVipOffset)) {
       return true;
     }
     for (uint64_t recent : recentModuleLoads) {
@@ -1216,7 +1210,7 @@ public:
                 << std::flush;
     }
     lmlLast = addr;
-    lastModuleLoadOffset = addr;
+    vmp.onModuleLoad(addr);
     recentModuleLoads.push_back(addr);
     while (recentModuleLoads.size() > 64) {
       recentModuleLoads.pop_front();
@@ -1228,24 +1222,6 @@ public:
            instruction.mem_disp == 0 &&
            instruction.mem_segment != Register::GS &&
            instruction.mem_segment != Register::FS;
-  }
-  void bindPcodeRegister(uint64_t addr) {
-    if (!isBytecodeAddress(addr) || !isSimpleRegMemOp()) {
-      return;
-    }
-    pcodeReg = getBiggestEncoding(instruction.mem_base);
-  }
-  bool isPcodeMemFetch() const {
-    return pcodeReg != Register::None && isSimpleRegMemOp() &&
-           getBiggestEncoding(instruction.mem_base) == pcodeReg &&
-           lastModuleLoadOffset != 0 &&
-           isBytecodeAddress(lastModuleLoadOffset);
-  }
-  void advancePcodePointer(int64_t delta) {
-    if (pcodeReg == Register::None || lastModuleLoadOffset == 0 || delta == 0) {
-      return;
-    }
-    lastModuleLoadOffset += static_cast<uint64_t>(delta);
   }
   uint64_t currentVipOffset = 0;
   bool currentVipIsExact = false;
@@ -1829,7 +1805,9 @@ public:
       if (hasChain(it->second.lhs) && hasChain(it->second.rhs)) {
         // Both sides continue; the base is the module-address constant, so the
         // other side is the decrypt chain that reaches the bytecode load.
-        next = isModuleConst(it->second.lhs) ? it->second.rhs : it->second.lhs;
+        next = vmp.pickDecryptOperand(
+            it->second.lhs, it->second.rhs, isModuleConst(it->second.lhs),
+            hasChain(it->second.lhs), hasChain(it->second.rhs));
       } else if (hasChain(it->second.lhs)) {
         next = it->second.lhs;
       } else if (hasChain(it->second.rhs)) {

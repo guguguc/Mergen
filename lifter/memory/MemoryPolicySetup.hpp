@@ -29,7 +29,7 @@ inline void configureDefaultMemoryPolicy(lifterConcolic<>* lifter,
 
     if (section.characteristics.mem_execute &&
         std::strncmp(sectionName, ".text", 5) != 0) {
-      lifter->bytecodeRanges.emplace_back(sectionStart, sectionEnd);
+      lifter->addBytecodeRange(sectionStart, sectionEnd);
     }
   }
 
