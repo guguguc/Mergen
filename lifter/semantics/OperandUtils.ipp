@@ -1867,6 +1867,25 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::GetMemoryValue(Value* address,
   if (loadAddress != 0 && isModuleAddress(loadAddress) &&
       currentPathSolveContext != PathSolveContext::Ret) {
     loadProvenance[result] = loadAddress;
+    // Verbose (=2): every module load. Default (=1): only non-bytecode loads
+    // that can clobber a live bytecode cursor (the Ultra failure mode).
+    const char* vipDiag = std::getenv("MERGEN_DIAG_VIP");
+    if (vipDiag && vipDiag[0] != '\0' && vipDiag[0] != '0') {
+      const bool verbose = vipDiag[0] == '2';
+      const bool loadBc = isBytecodeAddress(loadAddress);
+      const uint64_t cur = vmp.vipOffset();
+      if (verbose || (!loadBc && isBytecodeAddress(cur))) {
+        const Register memBase = getBiggestEncoding(instruction.mem_base);
+        const bool simple = isSimpleRegMemOp();
+        std::cout << "[vipload] insn=0x" << std::hex
+                  << (current_address - instruction.length) << " addr=0x"
+                  << loadAddress << std::dec << " bc=" << (loadBc ? 1 : 0)
+                  << " fetch=" << (vmp.isFetch(memBase, simple) ? 1 : 0)
+                  << " bound=" << (vmp.bound() ? 1 : 0) << " cursor=0x"
+                  << std::hex << cur << std::dec << "\n"
+                  << std::flush;
+      }
+    }
     noteModuleLoad(loadAddress);
     vmp.onBytecodeLoad(getBiggestEncoding(instruction.mem_base),
                        isSimpleRegMemOp(), loadAddress);

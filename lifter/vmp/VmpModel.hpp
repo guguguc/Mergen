@@ -88,7 +88,18 @@ public:
     return addr;
   }
 
-  void onModuleLoad(uint64_t addr) { cursor.noteModule(addr); }
+  void onModuleLoad(uint64_t addr) {
+    // Last bytecode fetch is the VIP (AddEndHandlerCommands). Ultra handlers
+    // also load native RX / tables afterwards; those must not replace a live
+    // bytecode cursor or transfer keys loops on a handler VA.
+    if (addr == 0) {
+      return;
+    }
+    if (isBytecodeAddress(cursor.offset) && !isBytecodeAddress(addr)) {
+      return;
+    }
+    cursor.noteModule(addr);
+  }
   void onBytecodeLoad(Register memBase, bool simple, uint64_t addr) {
     cursor.bind(memBase, simple, isBytecodeAddress(addr));
   }

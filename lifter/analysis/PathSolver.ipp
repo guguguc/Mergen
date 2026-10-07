@@ -139,8 +139,11 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
     // address from them (intel.cc:11731/11734), so a backward native target is
     // not a stable loop key: the same handler recurs across the 10 vm instances
     // without the virtual program counter repeating. Only generalize a loop
-    // when the VIP itself has been seen before.
-    bool vipConfirmsBackedge = true;
+    // when an *exact* VIP (from the transfer load DAG) has been seen before.
+    // Cursor-heuristic VIP (exact=0) repeats across Ultra handlers without the
+    // pcode PC advancing and would close the lift early (sticky 0x1402e47e4 →
+    // 105k) or on a clobbered handler VA (0x403c48fc → 405604).
+    bool vipConfirmsBackedge = false;
     bool vipRepeat = false;
     if (currentVipOffset != 0) {
       // Key the backedge on (VIP, native target). Repeating a native block is
@@ -151,7 +154,7 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
           currentVipOffset * 1099511628211ULL + target;
       vipRepeat = seenVipOffsets.contains(backedgeKey);
       seenVipOffsets.insert(backedgeKey);
-      vipConfirmsBackedge = vipRepeat;
+      vipConfirmsBackedge = vipRepeat && currentVipIsExact;
     }
     if (backwardVisitedTarget) {
       std::cout << "[vip] backward target=0x" << std::hex << target

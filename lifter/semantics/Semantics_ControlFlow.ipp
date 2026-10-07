@@ -547,13 +547,22 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_ret() { // fix
 
   ScopedPathSolveContext pathSolveContext(this, PathSolveContext::Ret);
   currentTransferValue = realval;
-  currentVipOffset = vipModuleOffset(realval, &currentVipIsExact);
-  if (currentVipOffset == 0) {
-    currentVipOffset = vipFromFoldChain(realval);
+  currentVipIsExact = false;
+  const uint64_t vipFromMod = vipModuleOffset(realval, &currentVipIsExact);
+  const uint64_t vipFromChain =
+      vipFromMod == 0 ? vipFromFoldChain(realval) : 0;
+  const uint64_t vipFromCur = vmp.vipOffset();
+  if (vipFromMod != 0) {
+    currentVipOffset = vipFromMod;
+  } else if (vipFromChain != 0) {
+    currentVipOffset = vipFromChain;
+    currentVipIsExact = isBytecodeAddress(vipFromChain);
+  } else if (isBytecodeAddress(vipFromCur)) {
+    currentVipOffset = vipFromCur;
+  } else {
+    currentVipOffset = 0;
   }
-  if (currentVipOffset == 0) {
-    currentVipOffset = vmp.vipOffset();
-  }
+  logTransferVipPick("ret", realval, vipFromMod, vipFromChain, vipFromCur);
   {
     static bool dumped = false;
     if (!dumped) {
@@ -693,13 +702,23 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_jmp() {
       this, isDirectJump ? PathSolveContext::DirectJump
                          : PathSolveContext::IndirectJump);
   currentTransferValue = trunc;
-  currentVipOffset = vipModuleOffset(trunc, &currentVipIsExact);
-  if (currentVipOffset == 0) {
-    currentVipOffset = vipFromFoldChain(trunc);
+  currentVipIsExact = false;
+  const uint64_t vipFromMod = vipModuleOffset(trunc, &currentVipIsExact);
+  const uint64_t vipFromChain =
+      vipFromMod == 0 ? vipFromFoldChain(trunc) : 0;
+  const uint64_t vipFromCur = vmp.vipOffset();
+  if (vipFromMod != 0) {
+    currentVipOffset = vipFromMod;
+  } else if (vipFromChain != 0) {
+    currentVipOffset = vipFromChain;
+    currentVipIsExact = isBytecodeAddress(vipFromChain);
+  } else if (isBytecodeAddress(vipFromCur)) {
+    currentVipOffset = vipFromCur;
+  } else {
+    currentVipOffset = 0;
   }
-  if (currentVipOffset == 0) {
-    currentVipOffset = vmp.vipOffset();
-  }
+  logTransferVipPick(isDirectJump ? "djmp" : "ijmp", trunc, vipFromMod,
+                     vipFromChain, vipFromCur);
   if (liftProgressDiagEnabled &&
       (current_address - instruction.length == 0x1403B1543ULL ||
        current_address - instruction.length == 0x1403B4FF9ULL)) {

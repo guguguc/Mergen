@@ -1094,16 +1094,15 @@ public:
             if (auto* off =
                     llvm::dyn_cast<llvm::ConstantInt>(gep->getOperand(1))) {
               const uint64_t gepOff = off->getZExtValue();
-              // Module-backed loads are VIP candidates. A stack slot that
-              // currently forwards SSA may still be a copy of a recent fetch
-              // pointer; only use that when no image load is in the DAG.
-              if (isModuleAddress(gepOff)) {
+              // VIP candidates are bytecode-range loads only. Handler RX /
+              // table module addresses in the transfer DAG must not become
+              // exact VIP (that fabricated confirm=1 on 0x403c48fc).
+              if (isBytecodeAddress(gepOff)) {
                 fromLoad = gepOff;
               } else if (fromLoad == 0) {
                 auto stickyIt = stickyNonArgSlot.find(gepOff);
                 if (stickyIt != stickyNonArgSlot.end() &&
-                    (isModuleAddress(stickyIt->second) ||
-                     isBytecodeAddress(stickyIt->second))) {
+                    isBytecodeAddress(stickyIt->second)) {
                   fromLoad = stickyIt->second;
                 }
               }
@@ -1204,6 +1203,7 @@ public:
     return !isModuleAddress(v) && !isBytecodeAddress(v);
   }
   void noteModuleLoad(uint64_t addr) {
+    const uint64_t prevCursor = vmp.vipOffset();
     if (!lmlSeen.insert(addr).second && addr != lmlLast) {
       std::cout << "[lmlrep] addr=0x" << std::hex << addr << " cur=0x"
                 << lmlLast << std::dec << "\n"
@@ -1215,6 +1215,59 @@ public:
     while (recentModuleLoads.size() > 64) {
       recentModuleLoads.pop_front();
     }
+    // MERGEN_DIAG_VIP=1: every cursor write. Look for loadBc=0 while prevBc=1
+    // (handler RX / table clobbering a live bytecode VIP).
+    const char* vipDiag = std::getenv("MERGEN_DIAG_VIP");
+    if (vipDiag && vipDiag[0] != '\0' && vipDiag[0] != '0') {
+      const uint64_t now = vmp.vipOffset();
+      const bool loadBc = isBytecodeAddress(addr);
+      const bool prevBc = isBytecodeAddress(prevCursor);
+      const bool nowBc = isBytecodeAddress(now);
+      const bool clobber = prevBc && !loadBc && now == addr;
+      const bool skip = prevBc && !loadBc && now == prevCursor && now != addr;
+      if (now != prevCursor || skip || clobber) {
+        std::cout << "[vipcur] insn=0x" << std::hex
+                  << (current_address - instruction.length) << " load=0x" << addr
+                  << " prev=0x" << prevCursor << " now=0x" << now << std::dec
+                  << " loadBc=" << (loadBc ? 1 : 0) << " prevBc="
+                  << (prevBc ? 1 : 0) << " nowBc=" << (nowBc ? 1 : 0)
+                  << " clobber=" << (clobber ? 1 : 0)
+                  << " skip=" << (skip ? 1 : 0) << "\n"
+                  << std::flush;
+      }
+    }
+  }
+  void logTransferVipPick(const char* kind, llvm::Value* /*transferVal*/,
+                          uint64_t fromMod, uint64_t fromChain, uint64_t fromCur) {
+    const char* env = std::getenv("MERGEN_DIAG_VIP");
+    if (!env || env[0] == '\0' || env[0] == '0') {
+      return;
+    }
+    const bool verbose = env[0] == '2';
+    const char* src = "none";
+    if (fromMod != 0 && currentVipOffset == fromMod) {
+      src = "mod";
+    } else if (fromChain != 0 && currentVipOffset == fromChain) {
+      src = "chain";
+    } else if (fromCur != 0 && currentVipOffset == fromCur) {
+      src = "cursor";
+    } else if (currentVipOffset != 0) {
+      src = "other";
+    }
+    // =1: only suspicious picks (cursor fallback that is not bytecode).
+    // =2: every transfer.
+    const bool cursorBad =
+        src[0] == 'c' && !isBytecodeAddress(currentVipOffset);
+    if (!verbose && !cursorBad) {
+      return;
+    }
+    std::cout << "[vippick] kind=" << kind << " insn=0x" << std::hex
+              << (current_address - instruction.length) << " mod=0x" << fromMod
+              << " chain=0x" << fromChain << " cursor=0x" << fromCur
+              << " pick=0x" << currentVipOffset << std::dec
+              << " exact=" << (currentVipIsExact ? 1 : 0) << " src=" << src
+              << " cursorBc=" << (isBytecodeAddress(fromCur) ? 1 : 0) << "\n"
+              << std::flush;
   }
   bool isSimpleRegMemOp() const {
     return instruction.mem_base != Register::None &&

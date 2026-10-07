@@ -1884,6 +1884,105 @@ NaC-L / `DEVIRT_STRATEGY.md` 同一条：concolic buffer 按字节跟踪先前 s
 
 保留 peel（通用、add 不回归）。下一步不是再 overlay FLAGS，而是让 VIP 取回在数据槽为 SSA 时仍读出具体指针（或避免把 SSA 写进 VIP 槽）——仍禁止 unique-fold / VIP overlay / STACKP±8 / `|= 0x202`。
 
+### 7.12.19 两层停点根因（DR 对照 + RCX 诊断）：二次 `ret` SYM vs 假 VIP `confirm=1`
+
+入口 `0x140007450`，dump `entry_7450.dmp`，`MERGEN_MAX_BLOCK_BUDGET=131072`。DR：`mix_dr_insn.csv`（19 列含 r12–r15）。LF：`MERGEN_INSN_STREAM_FILE`。
+
+#### A. 无 `--reg`（产品路径）
+
+停在第二次 `ret @0x3ec79e`（insn ≈ **301739**；更早口径曾写 221160 / `0x35a716`，同一类 unresolved ROP）。栈顶目标不是常数：`r8` 经 `add r8,rcx` 仍依赖 **ABI 第一参 `%RCX`（必须保持 SYM）**。第一次 `0x3ec79e`（≈224254）能过（目标具体）；第二次不能。
+
+**不是** entry 非 ABI 种子问题：无 seed 已是 301739；`--reg R12=0` 等不推进停点。
+
+#### B. `--reg RCX=0x12345678`（诊断，非通用解）
+
+| | 无 seed | `RCX=0x12345678` |
+|---|---|---|
+| insn | ≈301739 | **405604** |
+| 两次 `0x3ec79e` | 第二次 unresolved | **都过**（224254→`0x2e8e10`，301739→`0x2feda7`） |
+| 与 DR RVA | — | **全程对齐到 405604**（DR 总长 ≈425181） |
+
+停点 **不是** 又一次 unresolved ret。末尾：
+
+```
+[lmlrep] addr=0x403c4a18 cur=0x14014684a
+[vip] … target=0x403fccd1 cur=0x404170fa vip=0x403c4a18 repeat=1 exact=0 confirm=1
+[vip] … target=0x403f48de cur=0x403fccd1 vip=0x403c4a18 repeat=1 exact=0 confirm=1
+```
+
+DR 下一条是 `417112 → 3fccd1 → 3f48de`（同一圈再转）。LF 用假 VIP 触发 `replaceWithGeneralizedLoopBlock`，迭代不再展开。优化 IR 见 §7.12.17 的 `bb1: br bb1`。
+
+真 VIP 本在 `0x14020051d` 一带递减；`noteModule` /「最后一次 module load = VIP」（intel `AddEndHandlerCommands`）在 Ultra 上不成立——handler 里还有原生 RX / 表读，cursor 被 `0x403c4a18` ↔ `0x14014684a` 盖掉。transfer fallback `vmp.vipOffset()` 把假地址送进 `(VIP, native target)` backedge 键。
+
+更早语义偏差（RVA 仍对齐）：循环计数 rcx 在 ≈405536 已是 DR=`0x5` / LF=`0x14`；≈405586 LF rcx 变 SYM。
+
+#### C. 试过的 VIP「收紧」全部撤回（回归 ≈105668）
+
+| 试法 | 结果 |
+|---|---|
+| PathSolver 对 `backedgeKey` 加 `exact`/bytecode 门闸 | **补丁**（VIP 已错还堵 confirm）；已撤 |
+| `noteModule` / `loadProvenance` 一律 `isBytecodeAddress` | insn 掉到 **≈105668**，无 `3ec79e`；路径早分叉 |
+| 仅 VIP cursor bytecode / sticky，不动 provenance | 同样 ≈105668 |
+| `vipConfirmsBackedge` 默认改 `false` + fallback 只认 bytecode | noseed/rcx 都 ≈105668 |
+
+「正确」sticky VIP 会更早 `confirm=1`，说明还要动 **loop generalize 与状态**，不能只堵 `noteModule`。代码已全部 `git checkout` 回撤；基线仍是 rcx seed → **405604**。
+
+#### D. 一句话与下一步
+
+控制靠 VIP/槽位保持具体，数据（含 RCX）保持符号。当前 VIP cursor 被非 pcode 的 module load 污染 → 无 seed 卡二次 ret；指定 RCX 后假 VIP 触发 generalize。
+
+下一步仍是 **(2) VIP 取回**（数据槽 SSA 时控制槽仍读出具体指针 / 避免 SSA 进 VIP 槽），并审 loop generalize 在 VIP 正确重复时不要收掉仍在推进的具体状态。禁止：unique-fold、VIP overlay、STACKP±8、`GetRFLAGSValue |= 0x202`、把 RCX 具体化当产品解、PathSolver backedgeKey 补丁。
+
+**日志（先分析再改）：** `MERGEN_DIAG_VIP=1`
+
+| 标签 | 含义 |
+|---|---|
+| `[vipcur]` | `noteModuleLoad` 写 cursor：`load/prev/now` + `loadBc/prevBc/nowBc` + `clobber`（prev 是 bytecode、load 不是且 now==load） |
+| `[vipload]` | 即将 `noteModuleLoad` 的 module 读；`=1` 只打「非 bytecode 且 cursor 已是 bytecode」；`=2` 全量 |
+| `[vippick]` | transfer（ret/djmp/ijmp）选 VIP：`mod` / `chain` / `cursor` 三源与最终 `src=` |
+
+```
+set MERGEN_DIAG_VIP=1
+set MERGEN_MAX_BLOCK_BUDGET=131072
+set MERGEN_INSN_STREAM_FILE=mix_lift_insn_rcx.csv
+lifter.exe … 0x140007450 --mem-dump entry_7450.dmp --reg RCX=0x12345678 2>vip_diag.err 1>vip_diag.out
+findstr /C:"clobber=1" /C:"[vippick]" /C:"confirm=1" vip_diag.out
+```
+
+先看末段 `clobber=1` 的 insn VA 与随后 `src=cursor pick=0x403c…` / `confirm=1` 是否同一条链；再决定改 cursor 还是改 pick。
+
+**首轮 `MERGEN_DIAG_VIP=1` + `--reg RCX=0x12345678`（`vip_diag.out`）：**
+
+- `clobber=1` 共 29 次；末段决定性一次：
+  - `[vipcur] insn=0x403f48ee load=0x403c48fc prev=0x14037d46a now=0x403c48fc loadBc=0 prevBc=1 clobber=1`
+  - 紧接着 `[vippick] kind=djmp insn=0x403f48f9 … src=cursor pick=0x403c48fc cursorBc=0`（`mod=0 chain=0`）
+  - 再 `[vip] … vip=0x403c48fc confirm=1`（`3fccd1` / `3f48de`）→ 停在 ≈405604
+- 说明：**卡住链是 cursor 被非 bytecode load 盖掉 → transfer 只能 `src=cursor` → 假 VIP 进 backedge 键**；不是计数器直接收 worklist。
+- `[vipload]` 在 `=1` 下 0 条而 `[vipcur] clobber` 有，说明部分 clobber 来自 **GEPTracker 嵌套 `noteModuleLoad`**（不经 GetMemoryValue）。
+- 早期还有多次 `0x1402e47xx` → `0x1400b1xxx`（`loadBc=0`）clobber，同一机制。
+- 全量 `[vippick]` 曾把 stdout 打爆（进程 `0xC0000005`）；现 `=1` 只打 `src=cursor && !cursorBc`，`=2` 才全量。
+
+**只挡 clobber（`VmpModel::onModuleLoad`：bytecode cursor 存活时拒非 bytecode load）实测：** `clobber=0`、`skip=174`、末段不再 `pick=0x403c…`，但 insn **105668**、无 `3ec79e`。sticky VIP `0x1402e47e4` 上 `confirm=1`。与 §7.12.19.C 同一回归。单挡不够。
+
+#### E. 落地修（不回退）：cursor 守卫 + exact-only confirm
+
+三处一起改（缺一仍会 105k 或 405604）：
+
+1. **`VmpModel::onModuleLoad`**：bytecode cursor 存活时拒非 bytecode load（挡 `0x403c48fc` clobber）。
+2. **`vipModuleOffset`**：只认 `isBytecodeAddress`（transfer DAG 里的 handler RX 不能变 exact VIP）。
+3. **`PathSolver`**：`vipConfirmsBackedge = vipRepeat && currentVipIsExact`；无 VIP 时默认 `false`。cursor 启发式（`exact=0`）不得关 loop。
+4. **transfer pick**：fallback cursor 仅当 `isBytecodeAddress`；非 bytecode cursor → pick=0。
+
+| | 基线 rcx | 只挡 clobber | **E 全套** |
+|---|---|---|---|
+| insn | 405604 | 105668 | **≥426929** |
+| `405605` | 无（停） | 无 | **`0x3fccd1`（过）** |
+| clobber | 有 | 0 | 0 |
+| `confirm=1 exact=0` | 有 | 有（sticky） | **0** |
+| 无 seed | ≈301739 | 105668 | ≈301739（二次 ret 仍要 VIP 取回） |
+
+`0x403f48ee` 现为 `skip=1`，cursor 留在 `0x14022184c` 并继续推进。诊断日志保留。下一步仍是无 seed 的 VIP 槽取回（RCX 保持 SYM）。
+
 ### 7.12.4 早期 `movabs` / overlay（已否证为「把 PC 拓宽就能修 mix」）
 
 seq 43 `0x3e28a1` `movabs rbx, imm64`：dump 已是 `0x7ff5e0460000`，文件是 0。lift rbx=0。拓宽 PC / 拒 FileReader underflow 后 mix 的 movabs 对了，但 add 从 ~26069 块客户 `ret` 塌成 11 块 Unresolved ROP。已 `git checkout HEAD -- FileReader.hpp LifterClass.hpp LifterStages.hpp`。mix 前 221160 条 PC 仍对齐，停在 7.12.5→7.12.3，不是取指 RVA 分叉。
@@ -1893,7 +1992,7 @@ seq 43 `0x3e28a1` `movabs rbx, imm64`：dump 已是 `0x7ff5e0460000`，文件是
 
 | 环境变量 | 产物 | 用途 |
 |---|---|---|
-| `MERGEN_INSN_STREAM_FILE` | 全指令快照 `I,seq,rva,rax,rbx,rcx,rdx,rsi,rdi,rbp,rsp,r8,r9,r10,r11` | 与 DR `-insn` 按 RVA 对齐；默认关 |
+| `MERGEN_INSN_STREAM_FILE` | 全指令快照 `I,seq,rva,rax,rbx,rcx,rdx,rsi,rdi,rbp,rsp,r8..r15` | 与 DR `-insn` 按 RVA 对齐；默认关 |
 | `MERGEN_REG_STREAM_FILE` | 寄存器写流 `REG,seq,insn,reg,isconst,value` | 查"谁把某寄存器写成某值" |
 | `MERGEN_WRITE_STREAM_FILE` | 写流 `W,seq,insn,slot,size,value` | 与 DR `-trackmem` 写侧对齐 |
 | `MERGEN_READ_STREAM_FILE` | 读流 `R,insn,addr,size_bits` | 与 DR `-trackmem` 读侧对齐 |
@@ -1902,24 +2001,26 @@ seq 43 `0x3e28a1` `movabs rbx, imm64`：dump 已是 `0x7ff5e0460000`，文件是
 | `MERGEN_DIAG_RFLAGS` | 哪些 flag 位是符号 + 其 IR | 只听 `pushfq` @`0x396B77` 与 `0x14fe6{0,6,8}` / `0x410840` 几个槽（§7.12.8） |
 | `MERGEN_DIAG_SLOTSTORE` | store 操作数的真实 IR 类型 | 只听 `0x14fe68` / `0x14fe70` 两个 qword 槽（§7.12.10、§7.12.12） |
 | `MERGEN_DIAG_PEEL` | cast 折叠生效处 | 打印 `peelToConstantInt` 折成的值（§7.12.13；实测在 mix 上触发 0 次） |
+| `MERGEN_DIAG_VIP` | VIP cursor / transfer pick | `=1`：`[vipcur]`/`[vippick]` + 可疑 `[vipload]`；`=2`：全量 module 读。见 §7.12.19 |
 
 **两条流共用 `nextMemEventSeq()`（`mergen_events::memEventSeq`）**，
 序号在同一执行轴上，可按 seq 合并成一条时间线 —— 这是定位
 「某条 store 执行时各寄存器是什么」的唯一手段（源码：`LifterClass.hpp`
 的 `SetRegisterValue_internal` 与 `GEPTracker.ipp` 的 `addValueReference`）。
 
-**DR 侧**：`D:\sogen\dr\vmpdrtrace.c` 已加 `-insn <file>`（与 `MERGEN_INSN_STREAM_FILE` 同行格式，指令前快照，RVA 对齐）和 `-r8 <file>`，输出
+**DR 侧**：`D:\sogen\dr\vmpdrtrace.c` 已加 `-insn <file>`（与 `MERGEN_INSN_STREAM_FILE` 同行格式，指令前快照，RVA 对齐，列含 `r12..r15`）和 `-r8 <file>`，输出
 `R8,<rva>,<r8>,<r10>`；探针白名单含 R8 解密链的 5 个站点
 （`0x3E957E/0x3E9588/0x3E95A2/0x3E95A9/0x3E95C0`），以及
 `0x3B4FF9/0x3B501C`、`0x301D45/0x2E6FF6/0x2E7043`（§7.11）。
 构建脚本：`D:\sogen\dr\build_vmpdrtrace7.bat`（输出 `vmpdrtrace7.dll`）。
+旧 15 列（止于 `r11`）CSV 仍可被 tracer 读；新抓的 19 列才能直接对 `push r12` 等。
 
 lifter 侧默认会打 `[tramp]` / `[vip] pre`（定位用，未关）。不要开 `MERGEN_DIAG_LIFT_PROGRESS`。
 
 **所有按指令卡点的探针都必须比 `maskedRVA(va)`，不能比裸地址。** lift 把映像重基到
 `0x40000000`，写死 `0x140000000` 的探针在重基 lane 上静默不触发——0 命中看起来像
 「那段代码没执行」，实际是基址不匹配（§7.12.8 踩过）。`OperandUtils.ipp` 提供了
-「怎么修」的当前状态见 §7.12.13（cast 折叠实测无效）、§7.12.15（167342 的 `0x206` 是 shld 在已符号 dword 上的 FLAGS）与 §7.12.16（`0x98fb1a05` 是嵌套 32-bit NAND，原料 `0x98fb5678`/`0x4c7d` 进 NAND 前已是 `-`）。§7.12.14 的 SSA `%134186`/`%138038` 不是当前主线。
+「怎么修」的当前状态见 §7.12.13（cast 折叠实测无效）、§7.12.15（167342 的 `0x206` 是 shld 在已符号 dword 上的 FLAGS）、§7.12.16（`0x98fb1a05` 是嵌套 32-bit NAND）、§7.12.17（`--reg rcx` 诊断）与 **§7.12.19（两层停点：二次 ret SYM vs 假 VIP confirm=1）**。§7.12.14 的 SSA `%134186`/`%138038` 不是当前主线。
 
 **别拿 DR 的寄存器值当基准**：DR 是真机进程状态（入口 `rbx=0x1fc45d23d40`、`rsp=0x11eb8ffe08`），lifter 是空寄存器 + 伪栈 `rsp=0x14fea0`。两条流 RVA 100% 对齐，但寄存器从第 0 条就不同，这是设计如此。「DR 有 X / lift 无」不是缺陷证据（§7.12.11 实测否证）。
 
