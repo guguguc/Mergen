@@ -342,7 +342,8 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::createMemcpy(Value* src, Value* dest,
   printvalue2(C_size);
 
   // check memory policy for source and destination
-  if (memoryPolicy.isSymbolic(C_src) || memoryPolicy.isSymbolic(C_dest)) {
+  if (memoryPolicy.isSymbolic(memoryPolicyAddress(C_src)) ||
+      memoryPolicy.isSymbolic(memoryPolicyAddress(C_dest))) {
     // At least one endpoint is in a symbolic memory range. We cannot
     // track the copy in the concolic buffer, but we must preserve the
     // operation in the IR so downstream passes see the data flow.
@@ -374,6 +375,48 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::createMemcpy(Value* src, Value* dest,
 MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::retrieveCombinedValue(
     const uint64_t startAddress, const uint8_t byteCount, LazyValue orgLoad) {
   Value* result = retrieveCombinedValueImpl(startAddress, byteCount, orgLoad);
+  // Mix exit ret decrypt table (~0x3c47d8 / rebased 0x403c47d8).
+  {
+    const uint64_t rva = maskedRVA(startAddress);
+    if (rva >= 0x3c47d0ull && rva < 0x3c4a00ull) {
+      static unsigned hits = 0;
+      if (hits < 24) {
+        ++hits;
+        uint64_t fileVal = 0;
+        const bool fileOk = file.readMemory(startAddress, byteCount, fileVal);
+        const bool promote =
+            fileOk &&
+            file.shouldPromoteFileValue(startAddress, byteCount, fileVal);
+        const uint64_t policyStart = memoryPolicyAddress(startAddress);
+        const bool symRange = memoryPolicy.isRangeFullyCovered(
+            policyStart, policyStart + byteCount, MemoryAccessMode::SYMBOLIC);
+        const bool bufCover = [&]() {
+          for (uint8_t i = 0; i < byteCount; ++i) {
+            auto it = buffer.find(startAddress + i);
+            if (it == buffer.end() || !it->second.value)
+              return false;
+          }
+          return true;
+        }();
+        auto* ci = llvm::dyn_cast_or_null<llvm::ConstantInt>(result);
+        std::cout << "[ret-tbl] insn=0x" << std::hex
+                  << (current_address - instruction.length) << " va=0x"
+                  << startAddress << " policyVa=0x" << policyStart
+                  << " rva=0x" << rva << std::dec
+                  << " n=" << (int)byteCount << " fileOk=" << (fileOk ? 1 : 0)
+                  << " file=0x" << std::hex << fileVal << std::dec
+                  << " promote=" << (promote ? 1 : 0)
+                  << " symRange=" << (symRange ? 1 : 0)
+                  << " bufCover=" << (bufCover ? 1 : 0)
+                  << " mode=" << magic_enum::enum_name(
+                         memoryPolicy.getAccessMode(policyStart))
+                  << " isCI=" << (ci ? 1 : 0) << " ci=0x" << std::hex
+                  << (ci ? ci->getZExtValue() : 0) << std::dec
+                  << " ir=" << irText(result, 100) << "\n"
+                  << std::flush;
+      }
+    }
+  }
   if (startAddress == 0x1400EF850ULL || startAddress == 0xEF850ULL) {
     static int efHits = 0;
     if (efHits < 30) {
@@ -511,7 +554,10 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::retrieveCombinedValueImpl(
     }
   }
 
-  if (memoryPolicy.isRangeFullyCovered(startAddress, startAddress + byteCount,
+  const uint64_t policyStartAddress = memoryPolicyAddress(startAddress);
+
+  if (memoryPolicy.isRangeFullyCovered(policyStartAddress,
+                                       policyStartAddress + byteCount,
                                        MemoryAccessMode::SYMBOLIC) &&
       !bufferFullyCoversRange(startAddress, byteCount)) {
     // Fully SYMBOLIC with no tracked bytes: never fall back to the PE image.
@@ -529,9 +575,10 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::retrieveCombinedValueImpl(
   // bool contiguous = true;
   SmallVector<ValueByteReferenceRange, 64>
       values; // we can just create an array here
-  auto lastAccessMode = memoryPolicy.getAccessMode(startAddress);
+  auto lastAccessMode = memoryPolicy.getAccessMode(policyStartAddress);
   for (uint8_t i = 0; i < byteCount; ++i) {
     uint64_t currentAddress = startAddress + i;
+    const uint64_t policyCurrentAddress = policyStartAddress + i;
 
     auto isDifferentReferenceOrDiscontinuousOffset =
         [this](const ValueByteReferenceRange& lastRef,
@@ -547,7 +594,7 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::retrieveCombinedValueImpl(
     bool isEmpty = values.empty();
     bool isLastReference = !isEmpty && values.back().isRef;
     // this needs serious refactoring
-    auto currentAccessMode = memoryPolicy.getAccessMode(currentAddress);
+    auto currentAccessMode = memoryPolicy.getAccessMode(policyCurrentAddress);
     printvalue2(magic_enum::enum_name(currentAccessMode));
     printvalue2(magic_enum::enum_name(lastAccessMode));
     printvalue2(currentAddress);
@@ -600,13 +647,20 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::retrieveCombinedValueImpl(
       }
     } else {
       uint64_t mem_value;
-      auto read_mem = file.readMemory(v.memoryAddress, bytesize, mem_value);
+      const uint64_t policyMemoryAddress =
+          memoryPolicyAddress(v.memoryAddress);
+      uint64_t readAddr = policyMemoryAddress;
+      auto read_mem = file.readMemory(readAddr, bytesize, mem_value);
+      if (!read_mem && readAddr != v.memoryAddress) {
+        readAddr = v.memoryAddress;
+        read_mem = file.readMemory(readAddr, bytesize, mem_value);
+      }
       printvalue2(read_mem);
       printvalue2(mem_value);
-      if (memoryPolicy.isSymbolic(v.memoryAddress)) {
+      if (memoryPolicy.isSymbolic(policyMemoryAddress)) {
         byteValue = extractBytes(orgLoad.get(), m, m + bytesize);
       } else if (read_mem) {
-        if (!file.shouldPromoteFileValue(v.memoryAddress, bytesize, mem_value)) {
+        if (!file.shouldPromoteFileValue(readAddr, bytesize, mem_value)) {
           return cxTag("stale-zero", makeStaleFileValue());
         }
         byteValue = builder->getIntN(bytesize * 8, mem_value);
@@ -631,7 +685,7 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::retrieveCombinedValueImpl(
     // zero at this point is file bytes or empty buffer slots — the Themida
     // range-policy failure mode (promote a slot rewritten before the lift).
     if (byteCount >= 8 && ci->isZero() &&
-        !file.isImmutableImageAddress(startAddress)) {
+        !file.isImmutableImageAddress(policyStartAddress)) {
       return cxTag("stale-zero", makeStaleFileValue());
     }
   }

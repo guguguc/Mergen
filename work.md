@@ -1983,6 +1983,329 @@ findstr /C:"clobber=1" /C:"[vippick]" /C:"confirm=1" vip_diag.out
 
 `0x403f48ee` 现为 `skip=1`，cursor 留在 `0x14022184c` 并继续推进。诊断日志保留。下一步仍是无 seed 的 VIP 槽取回（RCX 保持 SYM）。
 
+§7.12.19.E 全套后 `--reg RCX` 诊断停点从 405604（假 VIP confirm）前移到 **405644**（`jne` 路径分叉）。槽实验见 **§7.12.20**；后续从 `0xe64`/`rdtsc` 追回后，**对拍层** 405644 可由 TSC 不同解释，**出口层** `ret@0x33ce78` 另论 —— 见 **§7.12.21**。与无 seed 的二次 `ret @0x3ec79e`（≈301739）仍是另一条线。
+
+### 7.12.20 405644：`0x14fcd8` 槽实验与修正后的根因链
+
+> **后续改写（§7.12.21）：** 对「与某一份冻住的 DR insn 对拍」而言，405644/`0x450` 分叉可由 **`rdtsc` TSC 采样不同**充分解释（钉同 TSC 即消）；DR 多跑圈数本身也不固定。真正「出不了客户码」是 **`ret@0x33ce78` 表 load 折不动**。本节 slot 实验仍保留作历史因果记录，勿再当出口主线。
+
+`--reg RCX=0x12345678`，dump `entry_7450.dmp`，`MERGEN_MAX_BLOCK_BUDGET=131072`。对照 DR `vmptest/mix_dr_insn.csv`；LF insn `mix_rcx_insn_wr.csv` / `mix_verify_*_insn.csv`；写流 `mix_rcx_wr.csv` / `mix_verify_*_wr.csv`。一键 relift：`build_msvc_dbg/_relift_verify.cmd`（tag=`baseline|slot|lea|load`）。
+
+#### A. 表观停点（RVA 对齐到 405643）
+
+| seq | RVA | DR | LF（baseline） |
+|---|---|---|---|
+| 405643 | `0x3fccd1` | `rcx=0`，下一跳 `0x3fccd7` | 同 |
+| **405644** | **`0x3fccd7` vs `0x3f48de`** | fallthrough 出圈 | **`jne` 继续转**（`rcx≈0x411`） |
+
+计数来自更早 `0x326e3b` `mov rcx,[r9+8]` 等链；表观是循环计数偏大，lasting 写入在更前。
+
+#### B. Slot 实验证了什么（充分条件，未证错）
+
+**`MERGEN_VERIFY_SLOT_FCD8=1`**（`GEPTracker.ipp` `addValueReference`）：在 rva **`0x2eeeae`**、槽 **`0x14fcd8`** 这一次 store，把 LF 会写的值强行换成 DR 的 **`0x14042b24f`**。
+
+| tag | wr **mem seq** 28489 写入 `0x14fcd8` | seq 405644 |
+|---|---|---|
+| baseline | `0x14042d0af`（本跑；其它跑次亦见 `0x14042a7db` 等） | **分叉**（LF `0x3f48de`） |
+| **slot** | **`0x14042b24f`**（强制） | **对齐**（LF `0x3fccd7`，与 DR 同） |
+
+由此可成立（至少在本 trace 上）：
+
+- **`0x14fcd8` 里的错模块指针，是传到 405644 的 lasting 瓶颈之一**（write stream **mem seq 28489**，insn rva `0x2eeeae`；**≠** insn seq 188789）。
+- **修这一下就够消掉 405644 这个分叉**（充分条件）。
+- **12407 的 `adc` 不是 lasting 根**：`12407` `mov [r10],rbp` 写 rbp、`movzx` 清 rdx；slot 实验也**不需要**动 adc。
+- **这不是说「28489 是唯一毒源」**，而是说：在这条 trace 上，**下游这一槽写错 → 405644 分叉**。
+
+#### C. 之前分析里不严谨 / 说错的地方
+
+1. **「28489 写进去的一定是 +0x120 模块指针」——本 trace 不成立**
+
+   | 跑次 | baseline 写入 `0x14fcd8` | DR @400919 读回 module rva | 差 |
+   |---|---|---|---|
+   | 早前 relift | `0x14042a7db` | `0x42b24f` | **`0x474`** |
+   | verify baseline | `0x14042d0af` | `0x42b24f` | **`0x1e60`** |
+
+   **`0x120` 是 cx / 栈几何层的偏**（12287、12406 仍成立），**不等于**每个模块 store 的 module rva 差都恰好 `0x120`。
+
+2. **「28489 = 毒从 12407 adc 直接传下来」——链断了**
+
+   - `12407`：`mov [r10],rbp` 写 **rbp**；`movzx rdx,r13w` 清 rdx → **adc 的 rdx 毒没从 12407 进内存**。
+   - `28489` 的值来自 **另一条 fold 链**（write stream 有具体值；insn 行里 `rdx` 常与 store 值对不上）。
+   - **28489 之前具体哪条 fold 算错，尚未钉死**（`MERGEN_DIAG_FCD8_STORE` visit=1：store 已是裸 `ConstantInt`，IR/`output_no_opts.ll` 同形，semantic fold 在 emit 前完成）。
+
+3. **「修 lea cx 就能验证同一根因」——本次 hook 没打上**
+
+   **`MERGEN_VERIFY_LEA_CX=1`**（`Semantics_Arithmetic.ipp` `lift_lea`）：只在 **`Rvalue` 已是 `ConstantInt`** 时把 cx 强制为 `0xfc80`（rva `0x406f2d`）。若 lea 已是 SSA → **hook 不触发**。
+
+   | tag | 405644 |
+   |---|---|
+   | lea | **仍分叉**（`rcx=0xa`） |
+
+   **lea 实验不能说明「12287 不是根」**，只说明 **当前 patch 没覆盖到**。
+
+4. **「slot 实验 = 根因就是栈几何」——推过头**
+
+   Slot 只证明：**下游这个槽写错 → 405644 分叉**。  
+   **为什么** 28489 会 fold 成 `0x14042d0af` 而不是 `0x14042b24f`，仍要往上追（很可能和 cx/伪栈有关，**但 slot 实验本身没证这一点**）。
+
+**`MERGEN_VERIFY_LOAD_FCD8=1`**（`retrieveCombinedValueImpl`，rva `0x3c048f` 读 `0x14fcd8`）：trace **未到 405644**（停点更早），**不能**替代 slot 实验对瓶颈的因果结论。
+
+#### D. 更准确的根因链（两层，勿混为一谈）
+
+**[机制层，仍较可信，未用 slot 闭合因果]**
+
+```
+12287  lea rcx,[rsp+0x140]     → cx 差 0x120（DR 0xfc80 vs LF 0xfda0，伪栈 vs 真机）
+12406  adc dx,cx               → 演示「栈低16 × 模块指针」会混（寄存器瞬时）
+12407  mov [r10],rbp; movzx    → 不写 rdx 毒进槽；lasting 链在此断
+```
+
+**[瓶颈层，slot 实验证实]**
+
+```
+28489  WR  0x14fcd8 ← 错模块指针（具体 module rva 随 fold 跑次变，非固定 +0x120）
+       insn 0x2eeeae  mov [rsp+rbp], rdx
+400919 LD  mov rdx,[rsp+r8]    r8=0x78 → 0x14fc60+0x78 = 0x14fcd8
+…      → 0x14fe60 / NOR / 计数 …
+405644     jne @0x3fccd1        DR rcx=0 出圈，LF 继续
+```
+
+**[slot 实验证实的]**
+
+```
+在 0x2eeeae 强制写 DR 值 0x14042b24f → 405644 对齐
+```
+
+#### E. 一句话
+
+Slot 实验**没证错**「28489 → `0x14fcd8` 是 lasting 瓶颈」。
+
+说错的是：把「瓶颈」说成「**+0x120 写进去**」、把「**12407 adc**」说成「lasting 根」、以及用 slot 结果直接等同「**栈几何根因已因果闭合**」——中间 **28489 的 fold 链**和 **lea 上游**还没用实验钉死。
+
+#### F.2 28489 store 机制：rdx fold 错，不是 slot 地址错
+
+**insn** `mov qword ptr [rsp+rbp], rdx`（rva `0x2eeeae`，LF 模块 VA 前缀 `0x14000000`）：
+
+| | 值 | 模块 rva |
+|---|---|---|
+| LF（baseline） | `0x14042d0af` | `0x42d0af` |
+| DR（slot patch 用） | `0x14042b24f` | `0x42b24f` |
+| 差 | **`0x1e60`** | — |
+
+- **slot 地址 `0x14fcd8` 本身没错**（`rsp+rbp` → 伪栈 0x14fcd8 对）；错的 RDX fold 结果被写进去。
+- `400919` 读回 `0x14fcd8` → LF `rbx/rdx` 带 `0x14042d0af`，DR 带 `0x7ff7a378b24f` → 传到 `405644`。
+- **insn 行里 rdx 列对不上 store 用的值**：写槽用的是 folder 折叠出的 ConstantInt，和 insn 行采样不是同一路径/同一时刻。
+
+**rdx 被算错的机制**（同 handler 前面有典型 VMP 垃圾 ALU）：
+
+```
+or r10w, r9w
+xor r10d, edx
+...
+mov [rsp+rbp], rdx    ← 28489，rdx 在这里 first lasting 进槽
+```
+
+更早同 handler 内，LF 的 rdx 模块 rva 已比 DR 偏 `0x37`（rva `0x2e6539` 一带）→ **进这个 handler 之前/之中，模块指针已在 ALU 里被污染**。
+
+**lifter 的根因 class**：模块指针 load 和栈几何/伪栈常量走同一套 `createAddFolder` / constant fold，没有「栈几何域 ≠ 模块指针域」的隔离。多步 junk 后，folder 把**错的整数**收成 `rdx = 0x14042d0af`，`store` 第一次把这个 concrete lasting 写进 `0x14fcd8`。
+
+**和 12287/12407 的关系**：
+
+| | 作用 |
+|---|---|
+| `12287` lea，cx 差 `0x120` | 更早的栈几何污染源之一，会参与后面很多 handler 的 fold |
+| `12407` adc | 演示「栈低16 × 模块指针」会混；这次 lasting 写不经过它 |
+| `28489` store | 这条 trace 上 lasting 进 `0x14fcd8` 的瓶颈；此时 cx 已同，毒是**累积 fold 结果** |
+
+`0x1e60` ≠ `0x120`：`0x120` 是 cx / 栈几何层的典型偏；`0x1e60` 是这次具体写槽的差，同属「把不该一起 fold 的域揉成一个常数」，不是「这里又 +0x120」。
+
+#### F.3 追 rdx fold 链：下一步
+
+在 `0x2eeeae` store 上对 rdx operand 开 SSA 追溯（`MERGEN_DIAG_SLOTDAG` / `MERGEN_DIAG_FCD8_STORE visit=1`）：insn 行里的 rdx 列对不上 store 值，需在 **fold DAG** 上追 rdx 从哪条指令开始偏成 `0x42d0af`（锚点 wr seq 28489，而非 405644）。`output_no_opts.ll` 在 store 处已是裸 `ConstantInt`，需 semantic 侧或 insn trace，不是 O2 后 IR。
+
+#### F.4 一句话
+
+Slot 实验没证错「28489 → `0x14fcd8` 是 lasting 瓶颈」。
+
+说错的是：把「瓶颈」说成「**+0x120 写进去**」、把「**12407 adc**」说成「lasting 根」、以及用 slot 结果直接等同「**栈几何根因已因果闭合**」——中间 **28489 的 fold 链**和 **lea 上游**还没用实验钉死。
+
+#### G. 若要闭合机制层（下一步；已被 §7.12.21 改写）
+
+1. **对拍 405644：** 后续从 `0xe64`/`0x450` 追到 `rdtsc`（§7.12.21）；与某一份 DR 对齐时钉同 TSC 可消该分叉，属预期，**不是**产品修法。slot/`0x14fcd8` 实验仍有效作「充分补丁」演示，但主因口径已转为 TSC。
+2. **出口：** 主线改追 `ret@0x33ce78` / `0x403c47d8` 表 load 具体化（§7.12.21.H）。
+3. **禁止当修法**：`MERGEN_VERIFY_SLOT_FCD8` 作产品解、写死 DR TSC、`STACKP±0x120`、handler 特判 `adc@0x414464`、把 module 差硬减 `0x120`、把「对拍分叉」和「出口解不出」绑成同一修。
+
+### 7.12.21 TSC / `rdtsc` / 出口 `ret@0x33ce78`：对拍分叉 vs 真出不了客户码（两件事）
+
+入口仍 `0x140007450`，`--reg RCX=0x12345678`，dump `entry_7450.dmp`，`MERGEN_MAX_BLOCK_BUDGET=131072`。  
+LF：`scripts/dev/run_mix_chase.cmd`（`MERGEN_INSN_STREAM_FILE` / `MERGEN_WRITE_STREAM_FILE`）。  
+DR：`vmpdrtrace7` `-entry 0x140007450 -insn <csv>`（见下）。  
+一键 chase：`python scripts/dev/chase_mix_diverge.py`。
+
+#### A. 从 405644 往回追到的症状链（与 §7.12.20 并行口径）
+
+对某一趟 DR（`mix_dr_insn.csv`）与某一趟 LF 对拍时：
+
+| 锚点 | 现象 |
+|---|---|
+| 405644 | 首个 RVA 分叉：`0x3fccd7` vs `0x3f48de`；LF 侧像 `xor …,0x450` 计数偏 |
+| 401476 一带 | 最早稳定出现可接到 `0x450` 的 **module Δ=`0xe64`**（`mov r10d,[rbp]` 等） |
+| 399914 | `add rcx, rdi`：`rcx` 两边齐，`rdi` 已是 `0x2934` vs `0x3798`（差 `0xe64`） |
+| 398562 | `rax` 首次同现 `0x36f`/`0x4a2`；`mul` 把差放大成 `0xe64` |
+| 396367 | **`rdtsc` @ `0x37b499`**：两边 `rax/rdx` 低 32 **首次**分叉；仅这两寄存器变 |
+
+**否证：** seq~16348 的 module Δ=`0x120` **不是** 405644 的因（寿命短、量级不是 `0xe64` 的整数倍、当时 CF 仍齐）。  
+**否证：** 把「最早任意偏差」当成因果；应对准能造出 `0x450`/`0xe64` 的那条链。
+
+`lift_rdtsc`（`Semantics_Misc.ipp`）：Win32 上 **`__rdtsc()` 真机拍一次**，再冻成 `ConstantInt` 写 EAX/EDX——不是假 stub；和非 Win 的 `tsc=0` 不同。
+
+#### B. 因果实验：钉成「那趟 DR 的 TSC」
+
+临时把 `lift_rdtsc` 写成该趟 DR 的 `EDX:EAX=0x11b2:0xfffc50d7`，重编 + `run_mix_chase.cmd lift-only`：
+
+| 检查 | 活 `__rdtsc` LF vs 该 DR | 钉死同 TSC |
+|---|---|---|
+| 396367 `rax/rdx` | 不一致 | **一致** |
+| 首个 RVA 分叉 | 405644 | **重叠前缀内无** |
+| module Δ=`0xe64` / `rcx` 差 `0x450` | 有 | **无** |
+| 旧点 405644 | 分叉 | **同 PC，`rcx` 对齐** |
+
+→ **对「和这份 DR insn 金标对拍」而言，TSC 采样不同是 405644/`0x450` 分叉的充分条件。**  
+**禁止产品化：** 把某趟 DR 的 TSC 写死进 `lift_rdtsc`（§7.11.14 同禁令）。
+
+#### C. DR 多跑：并非每次都在 seq 407501 回 `0x750c`
+
+```bat
+D:\DynamoRIO\bin64\drrun.exe -c D:\sogen\dr\vmpdrtrace7.dll ^
+  -entry 0x140007450 -imagebase 0x140000000 ^
+  -insn D:\sogen\dr\vmfix\mix_dr_a.csv ^
+  -- D:\sogen\dr\vmfix\test_fixed4.exe
+```
+
+（再跑一次换 `mix_dr_b.csv`。）五份 mix DR insn（含已有 `mix_dr_insn*.csv` + 新 A/B）：
+
+| trace | 总条数 | 首次 `0x750c` seq | TSC (`eax`,`edx`) | `@0x750c` rax/rcx |
+|---|---|---|---|---|
+| mix_dr_insn.csv | 425181 | **407501** | `fffc50d7`,`11b2` | `89ca4f1d` / `c029ef1d` |
+| mix_dr_a | 425618 | **407938** | `f5ef30e5`,`7f56` | 同上 |
+| mix_dr_insn_pre_r12 | 444770 | **427090** | `8be60097`,`359a` | 同上 |
+| mix_dr_b | 446157 | **428477** | `bc892c17`,`7f82` | 同上 |
+| mix_dr_insn_rerun | 500402 | **482722** | `2a5824fc`,`68b1` | 同上 |
+
+共同点：
+
+- **都会**回到客户码 `0x750c`，再收到 `0x6cd57`
+- 回到时 **rax/rcx 固定**；进程打印 `mix(0x12345678) = c5186e29` 固定
+- **seq / 圈数随 TSC 变**（与 §7.11.14 `add_only` 的 `dec/jne` 倒计时同一类）
+
+→ **407501 只是某一趟的序号。**  
+「DR 每次 TSC 不同但计数器/`mix` 结果仍对」≠「insn 金标圈数不变」；对拍时 TSC 不同导致中途 RVA 分叉是**预期现象**。
+
+#### D. 说错的因果：出口解不出 ret ≠「TSC 导致走错 handler」
+
+| 现象 | 和 TSC 的关系 |
+|---|---|
+| 与**某一份** DR 在 405644 RVA 对不齐 | **正常**：两边 TSC 不同 → 圈数/路径长度不同 |
+| LF 在 `0x33ce78` **解不出 ret、AV、落不到 `0x750c`** | **另一件事**：不是「相对 DR 走错 handler」就能概括 |
+
+**关键证据：** TSC **钉成与 DR 一致**后，405644 分叉消失、RVA 长前缀对齐，但末尾仍出现  
+`[rdag] unresolved ret target at 0x4033ce78`（或进 `solvePath` 后 AV）。  
+路径已对齐，出口仍折不出来 → **出口具体化失败**，不是对拍分叉本身。
+
+DR 不「解 IR」：任意完整 TSC 自洽跑完，栈上/算完就是 `0x750c`。  
+Mergen 必须把同一条 VMP 出口公式在 IR 里折成常数。
+
+#### E. 出口 `ret@0x33ce78`：目标 DAG 与折不动的点
+
+顶层（`[vipret] add-shape`）：
+
+```
+ret_target = add i64 %sym, 0x14000750c    ; 0x14000750c == 客户返回 VA
+```
+
+要落到 `0x750c`，`%sym` **须为 0**（或等价可折成 0）。  
+`%sym` 往下是 `zext/trunc` + `xor/not/add`，最终卡在多次：
+
+```
+load i32, gep(%memory, %index*4 + 0x403c47d8)
+```
+
+（另有常数址 `0x403c4924` 的 load。）  
+`retrieveCombinedValue` 对这些址返回的是 **SSA=`load` 自身**，不是 `ConstantInt`（PE 文件在对应 RVA 上有 dword 表数据）。
+
+`solvePath` 要 `ConstantInt` 目的地 → `PATH_unsolved` / 诊断 `Unresolved ROP chain`；本机还观察到 **AV 发生在 `solvePath` 内部**，事后 `[rdag]` 打不出来。
+
+#### F. 已加诊断（默认开、有上限；定位用）
+
+| 标签 | 位置 | 作用 |
+|---|---|---|
+| `[vipret]` | `Semantics_ControlFlow.ipp` `lift_ret` | 尤其 `rva=0x33ce78`：是否 CI、buffer、`add-shape` |
+| `[rdag] pre-solve` | 同上，**在 `solvePath` 之前** | 防 AV 吞掉事后 dump；LOAD / GEP-idx / `RETRV-*` / `first-blocker` |
+| `[ret-tbl]` | `GEPTracker.ipp` `retrieveCombinedValue` | `rva∈[0x3c47d0,0x3c4a00)`：`fileOk`/`promote`/`symRange`/`bufCover`/`mode`/`isCI`（改完后需重跑确认） |
+
+脚本：`scripts/dev/run_mix_chase.cmd`（须保留 `MERGEN_INSN_STREAM_FILE` / `WRITE`）；无这两行则只出 `.out/.err`、无 insn CSV。  
+临时分析脚本（勿当产品）：`tmp_compare_fixed_tsc.py`、`tmp_dr_multi_750c.py`、`tmp_run_mix_dr_twice.cmd`、`tmp_chase_*.py`。
+
+#### G. 两层结论（勿混）
+
+1. **对拍层：** LF 活 `__rdtsc` vs 冻住的某趟 DR ⇒ 405644/`0x450` 分叉可由 TSC 不同解释；钉同 TSC 可消该分叉。DR 多跑本身圈数就不固定。  
+2. **出口层（已闭合，§7.12.22）：** 根因是 rebased GEP 常数 `0x403c47d8` 查 policy 落在 default SYMBOLIC，不是 PE/overlay 无字节。
+
+#### H. `[ret-tbl]` 钉死的机制（2026-10-08，`mix_ret_tbl_rerun.log` / `mix_policy_fix.log`）
+
+对 `va=0x403c47d8`（`rva=0x3c47d8`）16 次 load，修复前每次：
+
+```
+fileOk=1  promote=1  symRange=0  bufCover=0  mode=SYMBOLIC  isCI=0  ir=%… = load i32 …
+```
+
+| 字段 | 含义 |
+|---|---|
+| `fileOk=1` / `promote=1` | 文件/overlay 能读到、`shouldPromoteFileValue` 也会放行 |
+| `mode=SYMBOLIC` | **`memoryPolicy.getAccessMode(0x403c47d8)`** 落在 default，不是 `.HjF0` CONCRETE |
+| `isCI=0` | `retrieveCombinedValueImpl` 在 `isSymbolic` 分支直接 `extractBytes(Load)`，**从未走进 promote** |
+
+policy 节范围按 **`imageBase + sectionVA` → `0x140…`** 注册；lift 里 GEP 常数在 **rebased `0x40…` 车道**（`LifterDiagHelpers.hpp`）。同一 RVA：
+
+| VA | policy |
+|---|---|
+| `0x403c47d8` | SYMBOLIC (default) |
+| `0x1403c47d8` | CONCRETE (`.HjF0`) |
+
+`normalizeRuntimeTargetAddress(0x403c47d8)` **修不到** `0x1403c47d8`（无 paged 命中则原样返回），所以旧代码在 policy 阶段用错地址。
+
+#### I. 根修（§7.12.22，不是样本 patch）
+
+**`LifterClass.hpp`：`memoryPolicyAddress(addr)`** — rebased `0x40…` → `imageBase + (addr & 0xFFFFFF)`；已在 `imageBase` 上的 VA 不变；栈/堆等其它地址不变。
+
+**`GEPTracker.ipp`：`retrieveCombinedValueImpl` / `createMemcpy`** — 所有 `getAccessMode` / `isSymbolic` / `isRangeFullyCovered` / promote / `isImmutableImageAddress` 均经 `memoryPolicyAddress()`；`readMemory` 先试 policy VA，再 fallback 原地址。`[ret-tbl]` 诊断增加 `policyVa=…`。
+
+**禁止当修法：** 给 `0x3c47d0..0x3c4a00` 特判 CONCRETE、在 `ret@0x33ce78` hook 读表、写死 DR TSC。
+
+#### J. 修复后验证（`vmptest`，`--reg rcx=0x12345678`，`MERGEN_MAX_BLOCK_BUDGET=131072`）
+
+| 检查 | 修复前 | 修复后 |
+|---|---|---|
+| `[ret-tbl]` | `mode=SYMBOLIC isCI=0` | **`mode=CONCRETE isCI=1`**（表 dword 为 `ConstantInt`） |
+| `[vipret] @0x33ce78` | `isCI=0`，`[rdag] first-blocker=load` | **`isCI=1`**，`realval=0x14000750c` |
+| 客户出口 | 落不到 `0x750c` / AV | **`[ret] at 0x140007518 rop=1`** |
+| `output.ll`（O2） | `bb1: br bb1` 死循环（§7.12.17） | **`ret i64 3306712617`**（`0xc5186e29` = `mix(0x12345678)`） |
+| lift 规模 | — | **46044 blocks / 432814 insns**，0 diagnostic error |
+
+日志：`build_msvc_dbg/mix_policy_fix.log`。产物：`output.ll` / `output_no_opts.ll` / `output_diagnostics.json`（2026-10-08 14:08）。
+
+**IR「没还原」的口径：** `output_no_opts.ll` 仍是完整 VM 图（~31MB），这是设计；**语义还原看 `output.ll`**。`--reg rcx=…` 把入口参数钉死 → O2 整路径 constant-fold 成单个 `ret i64` 常数（与 `add_only` 保留 `%RCX+%RDX` 公式不同，因 mix 这次 RCX 是具体值）。要看带 RCX 的公式形 IR，需无 `--reg` 再 lift（产品路径，块数更少）。
+
+进程 exit code 仍可能为 `0xC0000005`（客户 `ret` 之后的尾巴），与 IR 已写出、诊断 0 error 不矛盾。
+
+### 7.12.22 `memoryPolicyAddress`：rebased 映像 VA 与 MemoryPolicy 对齐（根修）
+
+**问题：** lift 重基到 `0x40000000` 车道（§7.12.8 / `LifterDiagHelpers.hpp`），但 `configureDefaultMemoryPolicy` 把节注册在 `imageBase+RVA`（`0x140…`）。`retrieveCombinedValueImpl` 用 **原始 GEP 地址** 查 `isSymbolic` → rebased `0x403c47d8` 命中 default SYMBOLIC，即使 `file.readMemory`/`promote=1` 仍只回 `LoadInst`（§7.12.21.H–I）。
+
+**修法：** `LifterClass.hpp` 新增 `memoryPolicyAddress()`；`GEPTracker.ipp` 的 policy/promote 路径统一经它。与 `PathSolver.ipp` 里 `file.imageBase + fetchRva(addr)` 多候选读文件同一地址模型，不是 mix 表特判。
+
+**验收：** §7.12.21.J。mix `--reg rcx=0x12345678` 时 `output.ll` = `ret i64 0xc5186e29`。
+
 ### 7.12.4 早期 `movabs` / overlay（已否证为「把 PC 拓宽就能修 mix」）
 
 seq 43 `0x3e28a1` `movabs rbx, imm64`：dump 已是 `0x7ff5e0460000`，文件是 0。lift rbx=0。拓宽 PC / 拒 FileReader underflow 后 mix 的 movabs 对了，但 add 从 ~26069 块客户 `ret` 塌成 11 块 Unresolved ROP。已 `git checkout HEAD -- FileReader.hpp LifterClass.hpp LifterStages.hpp`。mix 前 221160 条 PC 仍对齐，停在 7.12.5→7.12.3，不是取指 RVA 分叉。
@@ -2002,6 +2325,10 @@ seq 43 `0x3e28a1` `movabs rbx, imm64`：dump 已是 `0x7ff5e0460000`，文件是
 | `MERGEN_DIAG_SLOTSTORE` | store 操作数的真实 IR 类型 | 只听 `0x14fe68` / `0x14fe70` 两个 qword 槽（§7.12.10、§7.12.12） |
 | `MERGEN_DIAG_PEEL` | cast 折叠生效处 | 打印 `peelToConstantInt` 折成的值（§7.12.13；实测在 mix 上触发 0 次） |
 | `MERGEN_DIAG_VIP` | VIP cursor / transfer pick | `=1`：`[vipcur]`/`[vippick]` + 可疑 `[vipload]`；`=2`：全量 module 读。见 §7.12.19 |
+| `MERGEN_VERIFY_SLOT_FCD8=1` | stderr `[verify-slot-fcd8]` | **因果实验**：rva `0x2eeeae` 写 `0x14fcd8` 强制 `0x14042b24f`；405644 对齐。见 §7.12.20.B |
+| `MERGEN_VERIFY_LOAD_FCD8=1` | stderr `[verify-load-fcd8]` | rva `0x3c048f` 读 `0x14fcd8` 强制 DR 值；本 trace 未到 405644。§7.12.20.C |
+| `MERGEN_VERIFY_LEA_CX=1` | stderr `[verify-lea-cx]` | rva `0x406f2d` 仅当 lea 已是 `ConstantInt` 时强制 cx=`0xfc80`；SSA 不触发。§7.12.20.C |
+| `MERGEN_DIAG_FCD8_STORE=1` | stdout `[fcd8-store]`（≤3 visit） | rva `0x2eeeae` store 的 IR/reg + use-def；visit=1 多为裸常数。§7.12.20.C |
 
 **两条流共用 `nextMemEventSeq()`（`mergen_events::memEventSeq`）**，
 序号在同一执行轴上，可按 seq 合并成一条时间线 —— 这是定位
@@ -2020,7 +2347,7 @@ lifter 侧默认会打 `[tramp]` / `[vip] pre`（定位用，未关）。不要�
 **所有按指令卡点的探针都必须比 `maskedRVA(va)`，不能比裸地址。** lift 把映像重基到
 `0x40000000`，写死 `0x140000000` 的探针在重基 lane 上静默不触发——0 命中看起来像
 「那段代码没执行」，实际是基址不匹配（§7.12.8 踩过）。`OperandUtils.ipp` 提供了
-「怎么修」的当前状态见 §7.12.13（cast 折叠实测无效）、§7.12.15（167342 的 `0x206` 是 shld 在已符号 dword 上的 FLAGS）、§7.12.16（`0x98fb1a05` 是嵌套 32-bit NAND）、§7.12.17（`--reg rcx` 诊断）与 **§7.12.19（两层停点：二次 ret SYM vs 假 VIP confirm=1）**。§7.12.14 的 SSA `%134186`/`%138038` 不是当前主线。
+「怎么修」的当前状态见 §7.12.13（cast 折叠实测无效）、§7.12.15（167342 的 `0x206` 是 shld 在已符号 dword 上的 FLAGS）、§7.12.16（`0x98fb1a05` 是嵌套 32-bit NAND）、§7.12.17（`--reg rcx` 诊断）、§7.12.19（两层停点：二次 ret SYM vs 假 VIP confirm=1）、§7.12.20（`0x14fcd8` slot 实验）、§7.12.21（TSC 对拍 vs 出口层）、**§7.12.22（`memoryPolicyAddress` 根修：rebased VA 查 policy）**。§7.12.14 的 SSA `%134186`/`%138038` 不是当前主线。
 
 **别拿 DR 的寄存器值当基准**：DR 是真机进程状态（入口 `rbx=0x1fc45d23d40`、`rsp=0x11eb8ffe08`），lifter 是空寄存器 + 伪栈 `rsp=0x14fea0`。两条流 RVA 100% 对齐，但寄存器从第 0 条就不同，这是设计如此。「DR 有 X / lift 无」不是缺陷证据（§7.12.11 实测否证）。
 

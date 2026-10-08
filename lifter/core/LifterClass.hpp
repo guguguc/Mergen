@@ -1147,6 +1147,21 @@ public:
     }
     return addr;
   }
+  // Memory policy ranges are registered at imageBase+RVA. Lifted GEP/load
+  // addresses may still be in the rebased 0x40000000 lane; map those back
+  // before consulting MemoryPolicy or isImmutableImageAddress.
+  uint64_t memoryPolicyAddress(uint64_t addr) const {
+    if (file.imageBase == 0) {
+      return addr;
+    }
+    if (addr >= file.imageBase) {
+      return addr;
+    }
+    if ((addr & 0xFF000000ULL) == 0x40000000ULL) {
+      return file.imageBase + (addr & 0x00FFFFFFULL);
+    }
+    return addr;
+  }
   bool isRecentModuleFetch(uint64_t addr) {
     if (addr == 0) {
       return false;

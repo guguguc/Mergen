@@ -563,24 +563,143 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_ret() { // fix
     currentVipOffset = 0;
   }
   logTransferVipPick("ret", realval, vipFromMod, vipFromChain, vipFromCur);
+  const uint64_t retRVA = maskedRVA(current_address - instruction.length);
+  auto dumpRetTargetDag = [&](const char* tag) {
+    std::cout << "[rdag] " << tag << " ret target at 0x" << std::hex
+              << (current_address - instruction.length) << " rva=0x" << retRVA
+              << std::dec << " :\n"
+              << std::flush;
+    std::set<llvm::Value*> seen;
+    std::vector<std::pair<llvm::Value*, int>> work{{realval, 0}};
+    unsigned visited = 0;
+    unsigned loadN = 0;
+    llvm::Value* firstBlocker = nullptr;
+    while (!work.empty() && visited < 300) {
+      auto entry = work.back();
+      work.pop_back();
+      llvm::Value* v = entry.first;
+      if (!v || !seen.insert(v).second)
+        continue;
+      ++visited;
+      std::cout << "  [" << entry.second << "] " << irText(v, 110);
+      if (auto* li = llvm::dyn_cast<llvm::LoadInst>(v)) {
+        ++loadN;
+        std::cout << "  <LOAD#" << loadN
+                  << " ptr=" << irText(li->getPointerOperand(), 90) << ">";
+        llvm::Value* idxV = nullptr;
+        if (auto* g = llvm::dyn_cast<llvm::GetElementPtrInst>(
+                li->getPointerOperand())) {
+          if (g->getNumOperands() >= 2)
+            idxV = g->getOperand(1);
+        }
+        auto tryRetrv = [&](uint64_t off, const char* rtag) {
+          LazyValue nl([li]() -> llvm::Value* { return li; });
+          auto* rc = retrieveCombinedValue(
+              off, li->getType()->getIntegerBitWidth() / 8, nl);
+          std::cout << "  <RETRV-" << rtag << " off=0x" << std::hex << off
+                    << std::dec << " -> ";
+          if (!rc) {
+            std::cout << "NULL buf=" << (buffer.count(off) ? 1 : 0);
+          } else if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(rc)) {
+            std::cout << "CI=0x" << std::hex << ci->getZExtValue() << std::dec;
+          } else {
+            std::cout << "SSA=" << irText(rc, 80);
+          }
+          std::cout << ">";
+        };
+        if (auto* oc = llvm::dyn_cast_or_null<llvm::ConstantInt>(idxV)) {
+          tryRetrv(oc->getZExtValue(), "ci");
+        } else if (auto* bo =
+                       llvm::dyn_cast_or_null<llvm::BinaryOperator>(idxV)) {
+          if (bo->getOpcode() == llvm::Instruction::Add) {
+            auto* a0 = llvm::dyn_cast<llvm::ConstantInt>(bo->getOperand(0));
+            auto* a1 = llvm::dyn_cast<llvm::ConstantInt>(bo->getOperand(1));
+            if (a0 && !a1) {
+              std::cout << "  <GEP-idx=add CI=0x" << std::hex
+                        << a0->getZExtValue() << std::dec
+                        << " + SSA=" << irText(bo->getOperand(1), 60) << ">";
+              tryRetrv(a0->getZExtValue(), "base");
+            } else if (a1 && !a0) {
+              std::cout << "  <GEP-idx=add SSA="
+                        << irText(bo->getOperand(0), 60) << " + CI=0x"
+                        << std::hex << a1->getZExtValue() << std::dec << ">";
+              tryRetrv(a1->getZExtValue(), "base");
+            } else {
+              std::cout << "  <GEP-idx=add nonCI>";
+            }
+          } else {
+            std::cout << "  <GEP-idx=binop " << bo->getOpcodeName() << ">";
+          }
+        } else if (idxV) {
+          std::cout << "  <GEP-idx=SSA " << irText(idxV, 70) << ">";
+        } else {
+          std::cout << "  <GEP-idx=?>";
+        }
+        if (!firstBlocker)
+          firstBlocker = li;
+      }
+      if (llvm::isa<llvm::Argument>(v)) {
+        std::cout << "  <ARG>";
+        if (!firstBlocker)
+          firstBlocker = v;
+      }
+      std::cout << "\n";
+      if (auto* u = llvm::dyn_cast<llvm::User>(v))
+        for (auto& op : u->operands())
+          work.push_back({op.get(), entry.second + 1});
+    }
+    if (firstBlocker)
+      std::cout << "[rdag] first-blocker: " << irText(firstBlocker, 160)
+                << "\n";
+    std::cout << "[rdag] loads_seen=" << loadN << " nodes=" << visited << "\n"
+              << std::flush;
+  };
   {
-    static bool dumped = false;
-    if (!dumped) {
-      dumped = true;
-      std::string s;
-      llvm::raw_string_ostream os(s);
-      realval->print(os);
+    static bool dumpedAny = false;
+    // Always dump the known mix exit ret (0x33ce78); otherwise first ret only.
+    const bool dumpThis = (retRVA == 0x33ce78ull) || !dumpedAny;
+    if (dumpThis) {
+      dumpedAny = true;
       std::cout << "[vipret] at 0x" << std::hex
-                << (current_address - instruction.length)
+                << (current_address - instruction.length) << " rva=0x" << retRVA
                 << " isLoad=" << llvm::isa<llvm::LoadInst>(realval)
+                << " isCI=" << llvm::isa<llvm::ConstantInt>(realval)
                 << " valueID=" << realval->getValueID()
                 << " bufHas14fc58=" << buffer.count(0x14fc58)
+                << " bufHas14fe70=" << buffer.count(0x14fe70)
                 << " bufSize=" << buffer.size()
                 << " provSize=" << loadProvenance.size()
-                << " lastModLoad=0x" << std::hex << vmp.vipOffset()
-                << std::dec
-                << " realval=" << os.str().substr(0, 200) << "\n"
+                << " lastModLoad=0x" << vmp.vipOffset() << std::dec
+                << " realval=" << irText(realval, 220) << "\n"
                 << std::flush;
+      // Top shape: add i64 %x, 0x14000750c  (customer ret VA)
+      if (auto* bo = llvm::dyn_cast<llvm::BinaryOperator>(realval)) {
+        if (bo->getOpcode() == llvm::Instruction::Add) {
+          auto* c0 = llvm::dyn_cast<llvm::ConstantInt>(bo->getOperand(0));
+          auto* c1 = llvm::dyn_cast<llvm::ConstantInt>(bo->getOperand(1));
+          llvm::Value* other = nullptr;
+          uint64_t imm = 0;
+          if (c1 && !c0) {
+            other = bo->getOperand(0);
+            imm = c1->getZExtValue();
+          } else if (c0 && !c1) {
+            other = bo->getOperand(1);
+            imm = c0->getZExtValue();
+          }
+          if (other) {
+            std::cout << "[vipret] add-shape imm=0x" << std::hex << imm
+                      << " (==750c? " << (imm == 0x14000750cull) << ")"
+                      << " other_isCI=" << llvm::isa<llvm::ConstantInt>(other)
+                      << std::dec << " other=" << irText(other, 160) << "\n"
+                      << std::flush;
+          }
+        }
+      }
+      // Dump DAG BEFORE solvePath: AV has been observed inside solvePath on
+      // this site, which previously skipped the post-unsolved rdag dump.
+      if (retRVA == 0x33ce78ull && !llvm::isa<llvm::ConstantInt>(realval)) {
+        dumpRetTargetDag("pre-solve");
+      }
     }
   }
   auto pathResult = solvePath(function, destination, realval);
@@ -592,51 +711,11 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_ret() { // fix
       ++liftStats.blocks_unreachable;
       diagnostics.warning(DiagCode::UnresolvedRetChain, diagAddr,
                           "Unresolved ROP chain (ret to symbolic address)");
-      static bool dumpedRd = false;
-      if (!dumpedRd) {
-        dumpedRd = true;
-        std::cout << "[rdag] unresolved ret target at 0x" << std::hex
-                  << diagAddr << std::dec << " :\n";
-        std::cout << std::flush;
-        std::set<llvm::Value*> seen;
-        std::vector<std::pair<llvm::Value*, int>> work{{realval, 0}};
-        unsigned visited = 0;
-        while (!work.empty() && visited < 300) {
-          auto entry = work.back();
-          work.pop_back();
-          llvm::Value* v = entry.first;
-          if (!v || !seen.insert(v).second) continue;
-          ++visited;
-          std::string s;
-          llvm::raw_string_ostream os(s);
-          v->print(os);
-          std::cout << "  [" << entry.second << "] " << os.str().substr(0, 110);
-          if (auto* li = llvm::dyn_cast<llvm::LoadInst>(v)) {
-            std::string ps;
-            llvm::raw_string_ostream pos(ps);
-            li->getPointerOperand()->print(pos);
-            std::cout << "  <LOAD ptr=" << ps.substr(0, 90) << ">";
-            if (auto* g = llvm::dyn_cast<llvm::GetElementPtrInst>(
-                    li->getPointerOperand())) {
-              if (auto* oc =
-                      llvm::dyn_cast<llvm::ConstantInt>(g->getOperand(1))) {
-                LazyValue nl([li]() -> llvm::Value* { return li; });
-                auto* rc = retrieveCombinedValue(
-                    oc->getZExtValue(),
-                    li->getType()->getIntegerBitWidth() / 8, nl);
-                std::cout << "  <RETRV off=0x" << std::hex << oc->getZExtValue()
-                          << std::dec << " -> " << (rc ? "nonnull" : "NULL")
-                          << ">";
-              }
-            }
-          }
-          if (llvm::isa<llvm::Argument>(v)) std::cout << "  <ARG>";
-          std::cout << "\n";
-          if (auto* u = llvm::dyn_cast<llvm::User>(v))
-            for (auto& op : u->operands())
-              work.push_back({op.get(), entry.second + 1});
-        }
-        std::cout << std::flush;
+      static unsigned dumpedRdCount = 0;
+      // 0x33ce78 already dumped pre-solve; dump other first unresolved (≤2).
+      if (retRVA != 0x33ce78ull && dumpedRdCount < 2) {
+        ++dumpedRdCount;
+        dumpRetTargetDag("unsolved");
       }
     }
     // Block is currently unterminated: solvePath did not resolve the popped
