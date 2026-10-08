@@ -78,9 +78,9 @@ static llvm::ConstantInt* peelToConstantInt(llvm::Value* v, unsigned depth = 0) 
   // Aftermath / BLARE2: store-forward is byte-level. A VM store of
   // `zext i32 C to i64` is still a concrete qword; returning the narrow
   // ConstantInt made addValueReference reject the peel (width mismatch) and
-  // left unaligned cross-slot loads unable to compose (work.md 7.12.9–10).
+  // left unaligned cross-slot loads unable to compose (work.md 7.12.9鈥?0).
   // Re-apply the cast to the peeled constant so the result matches `v`'s
-  // width. Do not walk or/shl FLAGS chains — that is the 7.12.7 regression.
+  // width. Do not walk or/shl FLAGS chains 鈥?that is the 7.12.7 regression.
   if (auto* cast = llvm::dyn_cast<llvm::CastInst>(v)) {
     if (!cast->getType()->isIntegerTy()) {
       return nullptr;
@@ -150,6 +150,26 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::addValueReference(Value* value,
     }
   }
 
+  // Log every store whose value is an image/cursor address. The dispatcher
+  // consumes a cursor that must be pushed onto the pseudo-stack by one of these;
+  // if none of them lands in the slot the dispatcher pops, the lift lost the
+  // cursor even though the arithmetic produced it (work.md, mix stop 301739).
+  if (std::getenv("MERGEN_DIAG_CURSOR")) {
+    static unsigned cursorWrites = 0;
+    if (auto* ci = llvm::dyn_cast_or_null<llvm::ConstantInt>(value)) {
+      const uint64_t v = ci->getZExtValue();
+      const bool imageLane = (v >= 0x40000000ULL && v < 0x50000000ULL) ||
+                             (v >= 0x140000000ULL && v < 0x150000000ULL);
+      if (imageLane && cursorWrites < 40000) {
+        ++cursorWrites;
+        std::cout << "[cursor-w] rva=0x" << std::hex
+                  << maskedRVA(current_address - instruction.length) << " slot=0x"
+                  << address << " value=0x" << v << std::dec << "\n"
+                  << std::flush;
+      }
+    }
+  }
+
   // Report the value as actually stored, after peeling.
   if (std::getenv("MERGEN_DIAG_SLOTSTORE") &&
       (address == 0x14FE68ULL || address == 0x14FE70ULL)) {
@@ -159,6 +179,141 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::addValueReference(Value* value,
               << (llvm::isa<llvm::ConstantInt>(value) ? 1 : 0) << " ir="
               << irText(value, 100) << std::endl;
   }
+
+  // mix 0x140007450: the VM dispatcher pops its pcode cursor out of pseudo-stack
+  // slot 0x14fd08 (mov r10,[rsp+rsi] @0x3ead9b), so a symbolic value in that slot
+  // makes the whole dispatch decode symbolic and the following
+  // `add r8,rcx; push r8; ret` (@0x3b046a / @0x3ec79e) unresolvable. On the real
+  // machine the producing store at rva 0x2e7bb2 writes a concrete FLAGS-family
+  // qword, and the lifter's register stream shows the same concrete RBP on both
+  // sides at that point - yet the buffer recorded SSA. Probe why the operand is
+  // not a ConstantInt: post-peel shape, whether peelToConstantInt could fold it,
+  // and a select's condition/arms individually.
+  if (std::getenv("MERGEN_DIAG_SLOTSTORE2")) {
+    const uint64_t rva2 = maskedRVA(current_address - instruction.length);
+    if (rva2 == 0x2E7BB2ULL && address == 0x14FD08ULL) {
+      const unsigned vbits =
+          value && value->getType()->isIntegerTy()
+              ? value->getType()->getIntegerBitWidth()
+              : 0;
+      auto* ci = llvm::dyn_cast_or_null<llvm::ConstantInt>(value);
+      auto* peeled = peelToConstantInt(value);
+      std::cout << "[slotstore2] rva=0x" << std::hex << rva2 << " slot=0x"
+                << address << std::dec << " bits=" << vbits
+                << " isCI=" << (ci ? 1 : 0) << " peeled="
+                << (peeled ? 1 : 0);
+      if (ci) {
+        std::cout << " value=0x" << std::hex << ci->getZExtValue() << std::dec;
+      }
+      if (peeled) {
+        std::cout << " peel_val=0x" << std::hex << peeled->getZExtValue()
+                  << " peel_bits=" << peeled->getBitWidth() << std::dec;
+      }
+      std::cout << "\n[slotstore2]   value_ir=" << irText(value, 220) << "\n"
+                << std::flush;
+      if (auto* sel = llvm::dyn_cast_or_null<llvm::SelectInst>(value)) {
+        auto* pc = peelToConstantInt(sel->getCondition());
+        auto* pt = peelToConstantInt(sel->getTrueValue());
+        auto* pf = peelToConstantInt(sel->getFalseValue());
+        std::cout << "[slotstore2]   select cond_ir=" << irText(sel->getCondition(), 140)
+                  << " cond_peel=" << (pc ? 1 : 0)
+                  << " true_peel=" << (pt ? 1 : 0) << " false_peel=" << (pf ? 1 : 0)
+                  << "\n[slotstore2]   select true_ir=" << irText(sel->getTrueValue(), 120)
+                  << "\n[slotstore2]   select false_ir=" << irText(sel->getFalseValue(), 120)
+                  << "\n"
+                  << std::flush;
+      }
+      auto* rbpVal = GetRegisterValue(Register::RBP);
+      auto* rbpCI = llvm::dyn_cast_or_null<llvm::ConstantInt>(rbpVal);
+      auto* rbpPeel = peelToConstantInt(rbpVal);
+      std::cout << "[slotstore2]   rbp_isCI=" << (rbpCI ? 1 : 0)
+                << " rbp_peel=" << (rbpPeel ? 1 : 0);
+      if (rbpCI) {
+        std::cout << " rbp=0x" << std::hex << rbpCI->getZExtValue() << std::dec;
+      }
+      if (rbpPeel) {
+        std::cout << " rbp_peel_val=0x" << std::hex << rbpPeel->getZExtValue()
+                  << std::dec;
+      }
+      std::cout << "\n[slotstore2]   rbp_ir=" << irText(rbpVal, 220) << "\n"
+                << std::flush;
+    }
+  }
+
+  // Causal probe for the mix no-seed stop at insn 301739. The VM stages its pcode
+  // cursor with `mov [rsp+rsi], rbp` @rva 0x2e7bb2 and the dispatcher takes it
+  // back with `mov r10, [rsp+rsi]` @0x3ead9b (same rsp+0xa8 slot). When rbp is a
+  // two-armed select the store is recorded symbolic, the pop returns symbolic,
+  // and the whole decode chain (mov ecx,[rbx] -> xor/dec/rol/dec/ror/movsxd ->
+  // add r8,rcx -> push r8; ret) dies as Unresolved ROP chain.
+  //
+  // MERGEN_VERIFY_SLOT_FD08=<qword> substitutes one concrete value there so the
+  // claim can be tested both ways: pass the value DR held (0x14021ac17) to show
+  // sufficiency, pass one of the select's own arms (0x14021ab17) to show the
+  // specific value matters rather than mere concreteness. Only fires when the
+  // stored value really is a select, so the other 35 visits stay untouched.
+  if (const char* forcedEnv = std::getenv("MERGEN_VERIFY_SLOT_FD08")) {
+    const uint64_t rvaVerify = maskedRVA(current_address - instruction.length);
+    if (rvaVerify == 0x2E7BB2ULL && address == 0x14FD08ULL &&
+        llvm::isa<llvm::SelectInst>(value)) {
+      char* end = nullptr;
+      const unsigned long long forced = std::strtoull(forcedEnv, &end, 0);
+      if (end != forcedEnv && value->getType()->isIntegerTy()) {
+        value = llvm::ConstantInt::get(value->getType(), forced);
+        std::cout << "[verify-slot-fd08] rva=0x2e7bb2 slot=0x14fd08 forced=0x"
+                  << std::hex << forced << std::dec << "\n"
+                  << std::flush;
+      }
+    }
+  }
+
+  // Why is rbp a two-armed select here instead of the concrete cursor DR held
+  // (rva 0x21ac17)? Dump the real use-def chain of that register value. The
+  // names the folders mint embed `current_address`, so every node maps back to
+  // the instruction that produced it and can be checked against the insn stream.
+  // That is how the first wrong step gets located without guessing.
+  if (std::getenv("MERGEN_DIAG_RBPDAG")) {
+    const uint64_t rvaDag = maskedRVA(current_address - instruction.length);
+    if (rvaDag == 0x2E7BB2ULL && address == 0x14FD08ULL && value &&
+        !llvm::isa<llvm::ConstantInt>(value)) {
+      std::cout << "[rbpdag] rva=0x" << std::hex << rvaDag
+                << " root=" << irText(value, 120) << "\n"
+                << std::flush;
+      std::set<llvm::Value*> seen;
+      std::vector<std::pair<llvm::Value*, int>> work{{value, 0}};
+      unsigned printed = 0;
+      while (!work.empty() && printed < 60000) {
+        const auto entry = work.back();
+        work.pop_back();
+        llvm::Value* v = entry.first;
+        const int d = entry.second;
+        if (!v || !seen.insert(v).second) {
+          continue;
+        }
+        std::string owner;
+        if (auto* inst = llvm::dyn_cast<llvm::Instruction>(v)) {
+          if (inst->getParent()) {
+            owner = inst->getParent()->getName().str();
+          }
+        }
+        std::cout << "[rbpdag] " << std::string(static_cast<size_t>(d) * 2, ' ')
+                  << irText(v, 150)
+                  << (owner.empty() ? "" : "   {" + owner + "}") << "\n"
+                  << std::flush;
+        ++printed;
+        if (d >= 3000) {
+          continue;
+        }
+        if (auto* u = llvm::dyn_cast<llvm::User>(v)) {
+          for (auto& op : u->operands()) {
+            work.push_back({op.get(), d + 1});
+          }
+        }
+      }
+      std::cout << "[rbpdag] end printed=" << printed << "\n" << std::flush;
+    }
+  }
+
   if (std::getenv("MERGEN_DIAG_SLOTDAG")) {
     const uint64_t rva = maskedRVA(current_address - instruction.length);
     if ((rva == 0x3932B5ULL || rva == 0x367EAAULL) &&
@@ -467,6 +622,19 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::retrieveCombinedValueImpl(
     uint64_t startAddress, uint8_t byteCount, LazyValue orgLoad) {
   printvalue2(startAddress);
 
+  // mix 0x140007450: the dispatcher pops its pcode cursor out of pseudo-stack slot
+  // 0x14fd08 (mov r10,[rsp+rsi] @0x3ead9b) but that slot's last write is a
+  // symbolic two-armed select. Log every read of that one slot so the request
+  // history can be lined up against the write stream (which already records the
+  // stored value) and checked for a cursor ever passing through.
+  if (std::getenv("MERGEN_DIAG_CURSOR") && startAddress == 0x14FD08ULL) {
+    std::cout << "[cursor-r] rva=0x" << std::hex
+              << maskedRVA(current_address - instruction.length) << " slot=0x"
+              << startAddress << " bytes=" << std::dec
+              << static_cast<unsigned>(byteCount) << "\n"
+              << std::flush;
+  }
+
   auto bufferFullyCoversRange = [&](uint64_t rangeStart, uint8_t rangeSize) {
     for (uint8_t i = 0; i < rangeSize; ++i) {
       auto it = buffer.find(rangeStart + i);
@@ -682,7 +850,7 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::retrieveCombinedValueImpl(
   printvalue(result);
   if (auto* ci = dyn_cast<ConstantInt>(result)) {
     // trackedBufferConstant already returned real stored zeros. A composed
-    // zero at this point is file bytes or empty buffer slots — the Themida
+    // zero at this point is file bytes or empty buffer slots 鈥?the Themida
     // range-policy failure mode (promote a slot rewritten before the lift).
     if (byteCount >= 8 && ci->isZero() &&
         !file.isImmutableImageAddress(policyStartAddress)) {
