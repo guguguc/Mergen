@@ -1890,6 +1890,8 @@ NaC-L / `DEVIRT_STRATEGY.md` 同一条：concolic buffer 按字节跟踪先前 s
 
 #### A. 无 `--reg`（产品路径）
 
+> **⚠️ 本小节的归因已被 §7.12.23 否证**（"依赖 ABI 第一参 `%RCX`" 不成立）。仍然有效的只有：无 seed 停点 ≈301739、第一次 `0x3ec79e` 能过第二次不能、以及 "`--reg R12=0` 之类不推进停点"。
+
 停在第二次 `ret @0x3ec79e`（insn ≈ **301739**；更早口径曾写 221160 / `0x35a716`，同一类 unresolved ROP）。栈顶目标不是常数：`r8` 经 `add r8,rcx` 仍依赖 **ABI 第一参 `%RCX`（必须保持 SYM）**。第一次 `0x3ec79e`（≈224254）能过（目标具体）；第二次不能。
 
 **不是** entry 非 ABI 种子问题：无 seed 已是 301739；`--reg R12=0` 等不推进停点。
@@ -2129,10 +2131,10 @@ Slot 实验没证错「28489 → `0x14fcd8` 是 lasting 瓶颈」。
 
 说错的是：把「瓶颈」说成「**+0x120 写进去**」、把「**12407 adc**」说成「lasting 根」、以及用 slot 结果直接等同「**栈几何根因已因果闭合**」——中间 **28489 的 fold 链**和 **lea 上游**还没用实验钉死。
 
-#### G. 若要闭合机制层（下一步；已被 §7.12.21 改写）
+#### G. 若要闭合机制层（下一步；已被 §7.12.21 / §7.12.22 改写）
 
 1. **对拍 405644：** 后续从 `0xe64`/`0x450` 追到 `rdtsc`（§7.12.21）；与某一份 DR 对齐时钉同 TSC 可消该分叉，属预期，**不是**产品修法。slot/`0x14fcd8` 实验仍有效作「充分补丁」演示，但主因口径已转为 TSC。
-2. **出口：** 主线改追 `ret@0x33ce78` / `0x403c47d8` 表 load 具体化（§7.12.21.H）。
+2. **出口：** 已由 **`memoryPolicyAddress`（§7.12.22）** 闭合；勿再单独 patch `0x3c47d8` 表。
 3. **禁止当修法**：`MERGEN_VERIFY_SLOT_FCD8` 作产品解、写死 DR TSC、`STACKP±0x120`、handler 特判 `adc@0x414464`、把 module 差硬减 `0x120`、把「对拍分叉」和「出口解不出」绑成同一修。
 
 ### 7.12.21 TSC / `rdtsc` / 出口 `ret@0x33ce78`：对拍分叉 vs 真出不了客户码（两件事）
@@ -2178,8 +2180,8 @@ DR：`vmpdrtrace7` `-entry 0x140007450 -insn <csv>`（见下）。
 ```bat
 D:\DynamoRIO\bin64\drrun.exe -c D:\sogen\dr\vmpdrtrace7.dll ^
   -entry 0x140007450 -imagebase 0x140000000 ^
-  -insn D:\sogen\dr\vmfix\mix_dr_a.csv ^
-  -- D:\sogen\dr\vmfix\test_fixed4.exe
+  -insn D:\sogen\dr\vmptest\mix_dr_a.csv ^
+  -- D:\sogen\dr\vmptest\test_fixed4.exe
 ```
 
 （再跑一次换 `mix_dr_b.csv`。）五份 mix DR insn（含已有 `mix_dr_insn*.csv` + 新 A/B）：
@@ -2294,7 +2296,27 @@ policy 节范围按 **`imageBase + sectionVA` → `0x140…`** 注册；lift 里
 
 日志：`build_msvc_dbg/mix_policy_fix.log`。产物：`output.ll` / `output_no_opts.ll` / `output_diagnostics.json`（2026-10-08 14:08）。
 
-**IR「没还原」的口径：** `output_no_opts.ll` 仍是完整 VM 图（~31MB），这是设计；**语义还原看 `output.ll`**。`--reg rcx=…` 把入口参数钉死 → O2 整路径 constant-fold 成单个 `ret i64` 常数（与 `add_only` 保留 `%RCX+%RDX` 公式不同，因 mix 这次 RCX 是具体值）。要看带 RCX 的公式形 IR，需无 `--reg` 再 lift（产品路径，块数更少）。
+**IR「没还原」的口径：**
+
+| 文件 | 期望 |
+|---|---|
+| `output_no_opts.ll` | **不会**收成可读 C/ mix 源码；~31MB / 4 万+ block 的 VM handler 图是设计（debug 用） |
+| `output.ll`（O2） | **语义还原**看这里；本跑 = `ret i64 3306712617`（`0xc5186e29`） |
+| vs §7.12.17 | 修复前 O2 是 `bb1: br bb1` 死循环；修复后是正确常数 ret |
+
+`--reg rcx=0x12345678` 把入口钉死 → O2 **整路径 constant-fold** 成单个 `ret i64`（对比 `add_only` 仍保留 `add %RCX,%RDX; and` 是因为 RCX/RDX 保持符号）。要看带 `%RCX` 的公式形 IR，需**无 `--reg`** 再 lift。
+
+Lift 命令（PowerShell，日志重定向）：
+
+```powershell
+$env:MERGEN_MAX_BLOCK_BUDGET='131072'
+cd D:\sogen\dr\refs\Mergen\build_msvc_dbg
+.\lifter.exe D:\sogen\dr\vmptest\test_fixed4.exe 0x140007450 `
+  --mem-dump D:\sogen\dr\vmptest\entry_7450.dmp --reg rcx=0x12345678 `
+  *> mix_policy_fix.log
+```
+
+或 `scripts\dev\run_mix_chase.cmd lift-only`（会写 insn/wr 流）。
 
 进程 exit code 仍可能为 `0xC0000005`（客户 `ret` 之后的尾巴），与 IR 已写出、诊断 0 error 不矛盾。
 
@@ -2305,6 +2327,251 @@ policy 节范围按 **`imageBase + sectionVA` → `0x140…`** 注册；lift 里
 **修法：** `LifterClass.hpp` 新增 `memoryPolicyAddress()`；`GEPTracker.ipp` 的 policy/promote 路径统一经它。与 `PathSolver.ipp` 里 `file.imageBase + fetchRva(addr)` 多候选读文件同一地址模型，不是 mix 表特判。
 
 **验收：** §7.12.21.J。mix `--reg rcx=0x12345678` 时 `output.ll` = `ret i64 0xc5186e29`。
+
+#### K. §7.12.22 后无 `--reg` 重跑（2026-10-08，验证 §7.12.19 停点是否仍在）
+
+**命令：**
+
+```powershell
+$env:MERGEN_MAX_BLOCK_BUDGET='131072'
+$env:MERGEN_INSN_STREAM_FILE='D:\sogen\dr\refs\Mergen\build_msvc_dbg\mix_noreg_insn.csv'
+cd D:\sogen\dr\refs\Mergen\build_msvc_dbg
+.\lifter.exe D:\sogen\dr\vmptest\test_fixed4.exe 0x140007450 `
+  --mem-dump D:\sogen\dr\vmptest\entry_7450.dmp *> mix_noreg_lift.log
+```
+
+（**不要** `--reg`。DR 金标：`vmptest\mix_dr_insn.csv`。）
+
+| 指标 | LF（无 `--reg`） | DR |
+|---|---|---|
+| insn 条数 | **301739**（末条 `0x3ec79e`） | 425181 |
+| 块 / 指令（diagnostics） | **31336 / 301740** | — |
+| 前 301739 RVA | **与 DR 100% 对齐**（`chase_mix_diverge`：`first_rva_diverge: none`） | 同 seq 同 RVA |
+| exit | 0 | — |
+
+**两次 `ret @0x3ec79e`（与 §7.12.19 同）：**
+
+| 次序 | insn seq | LF | DR 下一跳 |
+|---|---|---|---|
+| 第一次 | **224254** | `[dest-dag] const dest=0x402e8e10` **过** | 继续 |
+| 第二次 | **301739** | `[rdag] unsolved ret target` / 诊断 **201** `Unresolved ROP chain` | seq 301740 → **`0x2feda7`** |
+
+第二次卡住的 **不是** `0x33ce78` 出口表（那是 `--reg` 路径末段；`memoryPolicyAddress` 已修）。`first-blocker` 是 **栈上 symbolic load**（`select` 控 FLAGS 选槽址），DAG 经 `%RCX` 相关 xorshift/flags 链，与 §7.12.19「第二次 ret 依赖符号 `%RCX`」同线。
+
+**O2 `output.ll`（无 `--reg`）：** 入口 `%RCX` 上折出一段 xorshift/NAND，但 **`ret i64 undef`**——路径在第二次 `0x3ec79e` 未闭合，语义未还原到 `mix(RCX)`。
+
+**结论：** §7.12.22 **不**改变无 `--reg` 的 **≈301739** 停点；出口层 fix 与「产品路径二次 ret + 符号 RCX」是两条线。下一步仍是无 seed 的 VIP/栈槽取回（§7.12.19.D），不是再 patch 表地址。
+
+> **⚠️ 本节结论已被 §7.12.23 取代。** 「二次 `ret@0x3ec79e` 依赖符号 `%RCX`」不成立：派发链内没有 `%RCX`。真实根因是游标 push（rva `0x2e7bb2`）的源操作数 `rbp` 算成两臂 `select`。本节仍然有效的只有：insn/块数基线（301740±1 / 31336±1）、RVA 前缀与 DR 100% 对齐、以及「表读折不动 ≠ 出口层」这个分层的必要性。
+
+日志/产物：`mix_noreg_lift.log`、`mix_noreg_insn.csv`、`output_diagnostics.json`（warning 201 @ `0x403ec79e`）。
+
+### 7.12.23 根因：无 seed 停点是**游标 push 的源操作数 `rbp` 是两臂 `select`**（干预实验已验证）
+
+入口 `0x140007450`，dump `entry_7450.dmp`，`MERGEN_MAX_BLOCK_BUDGET=131072`，**无 `--reg`**。
+
+> **本节推翻 §7.12.19.A / §7.12.22.K 的口径**：那两节把停点归到「二次 `ret@0x3ec79e` 依赖符号 `%RCX`」。
+> **实测 `%RCX` 与本停点无关**，详见下面「已否证」表。`%RCX` 是 ABI 第一参，必须保持符号。
+
+#### A. 出口目标的真实公式（纯控制域，两次 visit 逐位验证）
+
+`ret @0x3ec79e`（`push r8 ; ret`）的目标 = `0x39ab25 + sext32(decode(...))`：
+
+```
+0x39ab09  mov r9, rbx
+0x39ab0f  movabs rbp, 0
+0x39ab19  sub r9, rbp
+0x39ab25  lea r8, [rip-7]          ; r8 = 0x39ab25（自地址常量，两侧恒等）
+0x39ab2c  mov ecx, [rbx]           ; ★ 明文 pcode dword（rbx = 游标，rbx+4 是下一条）
+0x39ab2e  add rbx, 4
+0x39ab35  xor ecx, r9d             ; r9d = 低32(rbx - rbp)
+0x39ab38  dec ecx
+0x39ab3a  rol ecx, 0x13
+0x3d87c8  dec ecx
+0x3d87ca  ror ecx, 0x12
+0x395b6e  movsxd rcx, ecx
+0x3b046a  add r8, rcx              ; ★ 目标
+0x3ec79c  push r8 / 0x3ec79e ret
+```
+
+验证：按此式**反向回代** visit1 得 `d = 0xbfdb1c8f`，与 DR 在 `0x39ab2c` 之后实测的 `ecx` **逐位一致**（`r9d = 0x40218df9`）。两次 visit 目标分别 `0x2e8e10` / `0x2feda7`，验算 `0x39ab25-0xB1D15` / `0x39ab25-0x9BD7E` 全中。
+
+**`r8` 不是控制域量**（只是 `lea r8,[rip-7]` 的自地址，两侧全程相等）；控制域量是 `rcx`（解码出的派发偏移）。
+
+#### B. 断链：游标从 native 栈 pop 回来时是符号
+
+游标由 **push** 存、由 dispatcher **pop** 取，是同一槽 `[rsp+rsi]`（`rsp=STACKP-0x240`, `rsi=0xa8`）：
+
+| rva | 指令 | DR | lifter |
+|---|---|---|---|
+| `0x2e7bb2` | `mov qword ptr [rsp+rsi], rbp` | `rbp` = **游标** rva `0x21ac17` | `rbp` = **`select`** |
+| `0x3ead9b` | `mov r10, qword ptr [rsp+rsi]` | `0x7ff7a357ac17` | 符号 |
+
+DR 侧用 `-trackmem` 直接钉死（`vmpdrtrace7 -trackmem`，同一趟还出 `-insn`）：
+
+```
+W,26632,300372,0x7ff63d067bb2,0xa80f7bf928,8     映像基址 0x7ff63cd80000 → 写者 rva 0x2e7bb2
+R,26632,301660,0x7ff63d1829fd,…                  → pop @ rva 0x3ead9b
+```
+
+同趟 `-insn` 流 seq 300372 处 **DR `rbp = 0x7ff63cf9ac17`（rva `0x21ac17`）= 游标**；seq 301661 起 `r10` 取回同一值。
+
+lifter 侧 `MERGEN_DIAG_SLOTSTORE2`（只听 rva `0x2e7bb2` / 槽 `0x14fd08`）实测，该次被存值：
+
+```
+isCI=0  peeled=0
+value_ir= %lol-274501 = select i1 %188393, i64 5370915863, i64 5370915584   (= 0x14021AC17 / 0x14021AB00)
+select cond_ir= %188393 = icmp eq i64 %shr-lshr-1076950142-, 0   cond_peel=0 true_peel=1 false_peel=1
+```
+
+`%188393` 同时就是 `[rdag] first-blocker` 里那条 GEP 索引的 select 条件 —— **槽里存的和出口读的是同一个值**，不是两件事。
+
+**因此失效链**：`rbp`（装游标，控制域量）算成两臂 `select` → store 记 SSA → pop 读回符号 → `mov ecx,[rbx]` 地址非常数（**读都没发生**）→ 解码链全符号 → `add r8,rcx` 符号 → `push r8;ret` 交不出目标 → warning 201。
+
+#### C. 干预实验（`MERGEN_VERIFY_SLOT_FD08=<qword>`）
+
+在 rva `0x2e7bb2` / 槽 `0x14fd08`，**当且仅当**被存值是 `SelectInst` 时替换为一个具体 qword。全程只触发 1 次，其余 37 次 visit 不动。
+
+| | 无干预 | 强制 DR 真值 `0x14021ac17` | **负对照**：强制 select 臂 `0x14021ab17` |
+|---|---|---|---|
+| insns | 301740 | **440111** | 301740 |
+| blocks | 31336 | **47197** | 31337 |
+| `201 @0x403ec79e` | 有 | **消失** | 无（但走不下去） |
+| seq 301736 的 `rcx` | `-` | **`0xfffffffffff64282`** = DR | `0x7d02941b`（具体但错） |
+| 派发目标 | 符号 | **`0x402feda7`** = DR | `0xbd3c3f40`（模块外垃圾） |
+| 与 DR 的 RVA 前缀 | 301739 | **405643** | 301739 |
+
+- **充分性成立**：只改这一个值 ⇒ +138k insns、warning 201 消失、与 DR 对齐到 405643。
+- **唯一分叉在 seq 405644**，即 §7.12.20.A / §7.12.21.B 已钉死的 `rdtsc` 采样差异（钉同 TSC 即消），**不是 lifter 缺陷**。
+- **负对照**：塞 select 的臂会让解码器忠实算出**错误但具体**的目标，lift 原地不动 ⇒ 起作用的是**值的正确性**，不是「具体性」。
+- **跨趟复现**：6 趟 DR（ASLR/TSC 各不同，`mix_dr_insn{,_a,_b,_rerun,_pre_r12}` + `mix_tm_insn`）中，rva `0x2e7bb2` 各被访问 **38 次**，其中**恰好一次**（都是 seq 300372）`rbp` 是模块内游标、低 32 位全为 `0x21ac17`；其余 37 次都是 FLAGS 族（`0x202/0x206/0x213/0x246/0x257/0x282/0x286/0x292`），与 lifter 写该槽的值谱完全吻合。⇒ 不是 TSC 抖动、不是 ASLR 假象。
+- **默认回归**：不带 env 探针输出 0 行，停点不变。
+
+#### D. 附带成果：**无 `--reg` 还原出 `mix(RCX)` 公式**
+
+强制正确值那一趟的 O2 `output.ll`（`%RCX` 保持符号）：
+
+```llvm
+%0 = trunc i64 %RCX to i32
+  ... 8 轮 xorshift (shl 13 / lshr 17 / shl 5) ...
+%realxor = xor i32 %shl-shift380734, %24
+%25 = zext i32 %realxor to i64
+ret i64 %25
+```
+
+`[ret] at 0x4033ce78 disp=-48`（§7.12.21.E 的出口表那一次，现在解析开了）→ `[ret] at 0x140007518 rsp=0x14fea0 disp=0 rop=1`（**客户函数返回**）。
+
+回代验证 IR 公式 = `test.cpp` 的 C 实现 = DR 实跑打印值：`mix(0x12345678) = 0xc5186e29`（另 3 个种子也对上）。
+
+**⇒ §7.12.17 记为「从未达成」的「无 `--reg` 拿到带 `%RCX` 的公式形 IR」已达成。**
+
+#### E. 已否证 / 已撤回（勿重复排查）
+
+| 说法 | 否证方式 |
+|---|---|
+| 停点根因是 `%RCX` 符号 | **已否证。** 种子化后 lifter 算出的游标与真机逐位一致（`0x14021AC17` = rva `0x21ac17`），且**多个种子给出同一游标** ⇒ 游标是常量。**把符号 DAG 离线求值，5 个种子全部得到 `0x14021AC17`** ⇒ IR 是对的，只是折不出条件。见 §7.12.23.F.1b |
+| 明文 pcode 不在 dump / 数据不可得 | 读地址是进入 handler 时的 `rbx`（**不是 `rbx+4`**）：visit1 rva `0x218df9`（明文 `0xbfdb1c8f`）、visit2 rva `0x21ac17`（明文 `0x3fdaed55`），**两处在 `entry_7450.dmp` 里都精确命中**。lifter 对这两个地址 **0 次 store**（不是自己解出来的） |
+| `r8` 是控制域量 | 只是 `lea r8,[rip-7]` 的自地址常量，两侧全程相等 |
+| `[rdag] first-blocker` 的 `select` 是「可 fork 的虚拟化 dispatch 谓词」，与槽无关 | 它就是槽里存的那个值（同一 `%188393`）；两臂是候选游标，差 `0x17` |
+| 「lifter 把游标写进错槽、slot 身份漂移 `0x160`」 | `0x2e7bb2` 用 `[r11+8]`、`0x3ead9b` 用 `[rsp+rsi]`，**在 DR 上也差 `0x160`**（rsp+0x190 vs rsp+0xa8），本就是不同槽、发生在不同时刻。`r11-rsp` 全程恒比 DR **少 `0x8`**（§7.12.5 已否证的那 8 字节伪栈偏移），与本停点无关 |
+| 是 `peel`/cast 丢常数（§7.12.9(2)/§7.12.10/§7.12.13 那条路） | 被存值是 `select`，`peelToConstantInt` 拒绝是正确的（条件不唯一）；两臂都已是 `ConstantInt` |
+| 是 `MERGEN_DIAG_SLOTSTORE2` 探针本身扰动 | 默认回归：0 行输出、停点不变（301740±1，`rdtsc` 活采样导致 ±1 抖动） |
+
+#### F. 为什么 lifter 的 `rbp` 是 `select`：缺的是**代数化简**（`%RCX` 只是可被消去的叶子）
+
+`MERGEN_DIAG_RBPDAG=1` 打出 `rbp` 在 `0x2e7bb2` 处的完整 use-def（深度放到 3000）：
+
+- **922 个节点，0 个 `load`，外部叶子只有一个：`%RCX`。**
+- 链的内部是 `shl/lshr` + `xor -1`（`realnot`）+ `and`（`realand`）+ 一整套 **RFLAGS 重建**（`%creatingrflag*` = `or/shl/zext` 逐位拼 CF/PF/AF/ZF/SF/OF；`%pf*` 用 `mul 72340172838076673` + `urem 511`；`%sub_af*` 来自 `shld`）→ 末端一个 flag 测试 → 两臂 `select`。
+
+**判定（`--reg rcx=0x12345678`，`build_msvc_dbg/rcxseed.log`）：**
+
+| 检查 | 结果 |
+|---|---|
+| seq 300372 `rbp` | LF `0x14021ac17` = DR rva `0x21ac17`，**逐位一致** |
+| seq 301736 `rcx` / `r8` | `0xfffffffffff64282` / rva `0x39ab25`，与 DR 一致 |
+| 规模 / 告警 | 53763 blocks / 481701 insns，**0 个 `201`** |
+
+⇒ **那条链（含 RFLAGS 重建）算术完全忠实，没有语义 bug。**
+
+#### F.1 但「符号 `%RCX` 下游标不是常数」是错的 —— 游标是**常量**
+
+用 lifter 自己测（链已证明忠实，所以它算出的就是机器会算的）：
+
+| seed | 游标 `rbp` @`0x2e7bb2` | 派发偏移 `rcx` @`0x3b046a` |
+|---|---|---|
+| `0x12345678` | `0x14021ac17` | `0xfffffffffff64282` |
+| `0xdeadbeef` | `0x14021ac17` | `0xfffffffffff64282` |
+
+（序号不同：300372 vs 300250；**值完全相同**。`0x00000000` 那趟路径不同、36 次 visit，没走到该点。）
+
+⇒ **游标与参数无关。** 那 922 节点链虽然唯一叶子是 `%RCX`，但它的**参数依赖是可代数消去的**（VMP 拿参数做了能抵消的混淆）。所以：
+
+- **不是**数据依赖的控制流，**不是**方法边界，**不需要**控制域枚举，**不需要** seed。
+- **是**一个可修的缺陷：**lifter 折不出条件 `%164868`**（F.1b 证明 IR 本身正确、值恒定）。修法见 F.3：**① 自底向上化简后重试**（首选，单路径）或 **② 对「条件符号 + 两臂具体」的 `select` 做 2 路 fork**（通用兜底，§5.5 本来就有这个机制）。
+
+#### F.1b 离线求值证明：**IR 是对的，缺的是折出条件**
+
+把 `MERGEN_DIAG_RBPDAG` 打出的 922 节点锥用 `tmp_eval_dag.py` 离线求值（只代入 `%RCX`，其余按 IR 语义算）：
+
+| seed | 求值出的 `rbp` |
+|---|---|
+| `0x12345678` / `0xdeadbeef` / `0x00000000` / `0xffffffff` / `0x00000001` | **全部 `0x14021AC17`**（= DR rva `0x21ac17`） |
+
+根节点是
+
+```
+%lol-… = select i1 %164868, i64 5370915863, i64 5370915584
+                        = 0x14021AC17      = 0x14021AB00
+%164868 = icmp eq i64 %shr-lshr-1076950142-, 0        → 5 个种子下恒为 1
+```
+
+⇒ **真值就是臂 1。** 两臂都是合法 pcode 游标（`0x21AC17` / `0x21AB00`，后者在 seq 301696 处正是 `rbx`）。
+
+⇒ **这是「折不动」，不是「算错」**：IR 是正确的编码（一个看似依赖 `%RCX`、实则恒定的函数），lifter 只是折不出条件 `%164868`。
+
+⇒ 由此**两条修法都成立**：
+- **折叠**（更优）：条件折成常数 ⇒ 直接取臂 1，单路径。离线求值证明了只要做自底向上化简就一定折得出来（对种子不敏感）。
+- **fork**（通用兜底）：条件符号、两臂都是具体控制值 ⇒ 按 §1/§5.5 的 `ltJmpWithFlag` 机制分两路。代价是每臂深拷 `buffer`（§7.10 的 OOM 风险），但 2 路是有界的。
+
+**⚠️ 进制错误教训（勿重复）**：`5370915863` 是 **`0x14021AC17`**，不是 `0x14021AB17`。本节此前据手算得出「真值不在两臂里 ⇒ fork 不行 ⇒ 需控制域枚举」，**该结论已作废**。十六进制换算一律用工具，不要手算。
+
+#### F.2 为什么折不动
+
+| 环节 | 行为 |
+|---|---|
+| `IRBuilder` 用 `ConstantFolder`（§4.6 从 `InstSimplifyFolder` 换掉） | **局部**折叠：只有操作数**已经**是 `ConstantInt` 才折 |
+| 这条链 | 中间**没有任何一步是常数**（全是 SSA），从根往下折不动 |
+| `PathSolver.cpp` `getConstraintVal` | 已经试了 `ConstantFoldInstruction` + `simplifyInstruction`，但只作用在**根节点**；根是条件为符号的 `select`，操作数还是 SSA ⇒ 产不出常数。**没有自底向上的传播** |
+
+#### F.3 修法（两条，都待实现 / 接通）
+
+**① 折叠（首选，单路径）** —— 在 `lift_ret` 第一次 `PATH_unsolved` 时，对弹出值的**操作数锥**做**自底向上**的 `simplifyInstruction` + `RAUW`（子节点先于父节点，迭代到不动点），把中间节点塌成 `ConstantInt`，重取槽值后重试 `solvePath`。
+F.1b 证明**数学上**一定折得出来（离线求值对 5 个种子都给出臂 1）；**但 LLVM 层面的实现尚未打通，见下方尝试记录**。
+
+> **⚠️ 实现尝试记录（2026-10-08，均已回退，`PathSolver.cpp` 回到 HEAD）**
+>
+> | 尝试 | 结果 |
+> |---|---|
+> | 自底向上 `simplifyInstruction` + `RAUW`（含自写 `trunc(zext(x))→x` / `zext(trunc(x))→x` 恒等折叠） | 折了 **241 个节点后停滞**在 `%RCX` 处。锥的 80.9%（729/901）是 `zext`/`trunc`，真实算术只有 ~90 个节点，且它们**只能靠重结合消去** —— 逐指令局部折叠做不到。**诊断成立，实现路线不通。** |
+> | 直接对活函数跑 `InstCombinePass` | **不安全**：InstCombine 会折掉并 `erase` 根 `select`，而 `solvePath` 仍持有 `simplifyValue` ⇒ use-after-free（§4.6 同类坑）。已放弃。 |
+> | 把锥克隆进临时函数做沙箱 `InstCombine` | 能跑，但**结果不可信**：停点反而提前到 221161（比 301740 更差），并产出地址为 `0x140000000` 的伪告警 —— 回读逻辑取到了无关常数。已放弃。 |
+>
+> **诊断（缺代数化简）成立，但「用 LLVM 做重结合」这条实现路线尚未打通。** 若继续，正确的形态是**在 lift 期间维持常量性**（§4.6 换 `ConstantFolder` 正是因为 `InstSimplifyFolder` 会删指令），而不是在 transfer 失败时补救 —— 后者已被证明既不够又容易踩生命周期问题。
+
+**② fork（通用兜底，2 路）** —— 转移目标是「条件符号 + 两臂都是具体控制地址」的 `select` 时，按 §1/§5.5 的 `ltJmpWithFlag` 机制分两路，而不是要求单值。**这条本来就在设计意图里**（§5.5 虚拟化条件 fork），只是当前没有覆盖「`select` 经栈槽往返后才被 pop」这种形态。**尚未实现**；F.1b 已确认臂 1 就是真值，所以 fork 出的两条路里有一条是真机走的那条。
+
+- 两条都只加在失败路径、可用 env 门控 ⇒ 默认行为不变。
+- 与 §7.12.18 的教训一致：`peel` 只修"宽度不够"，缺的是**真正的化简**（①）。
+- **验收**：无 `--reg` 的 mix 从 301740 前进（预期到 §7.12.23.D 那一档：`output.ll` = `mix(RCX)` 公式 + `[ret] rop=1`），且 add `0x140007210` 不回归。
+
+**禁令（补）**：不要给 RFLAGS / `shld` 结果做分字节 overlay（§7.12.7 已证明会让 jcc 走错 handler）；不要把 `%RCX` 具体化当修法；**不要**做控制域枚举（游标是常量，枚举无意义且会 OOM，§7.10）；**不要**因为"两臂"就断定 fork 不行——臂 1 就是真值（见 F.1b 的进制教训）。
+
+**禁令（新增）**：写死 `0x14021ac17` 当修法、给 `0x14fd08` / rva `0x2e7bb2` 特判 CONCRETE、在 `ret@0x3ec79e` hook 读槽、把 `%RCX` 具体化、unique-fold、`STACKP±8`、`GetRFLAGSValue |= 0x202`、写死 DR 的 TSC。
+
+日志/产物：`build_msvc_dbg/vfd08_ok.log` + `vfd08_ok_insn.csv`（正确值）、`vfd08_bad.log` + `vfd08_bad_insn.csv`（负对照）、`default_regress.log`、`slotstore2.log`、`cursor.log` + `cursor_wr.csv`、`rcxseed.log`、`rbpdag4.log` + `dag_nodes.txt`；DR 侧 `vmptest/mix_tm_{insn,mem}.csv`。
+
+分析脚本（**勿当产品**）：`tmp_dr_cursor_writer.py`（DR 侧定位 `0x3ead9b` 那个槽的写者）、`tmp_eval_dag.py`（离线求值 `MERGEN_DIAG_RBPDAG` 输出的 DAG；用法 `python tmp_eval_dag.py <dag_nodes.txt>`）。
 
 ### 7.12.4 早期 `movabs` / overlay（已否证为「把 PC 拓宽就能修 mix」）
 
@@ -2329,6 +2596,10 @@ seq 43 `0x3e28a1` `movabs rbx, imm64`：dump 已是 `0x7ff5e0460000`，文件是
 | `MERGEN_VERIFY_LOAD_FCD8=1` | stderr `[verify-load-fcd8]` | rva `0x3c048f` 读 `0x14fcd8` 强制 DR 值；本 trace 未到 405644。§7.12.20.C |
 | `MERGEN_VERIFY_LEA_CX=1` | stderr `[verify-lea-cx]` | rva `0x406f2d` 仅当 lea 已是 `ConstantInt` 时强制 cx=`0xfc80`；SSA 不触发。§7.12.20.C |
 | `MERGEN_DIAG_FCD8_STORE=1` | stdout `[fcd8-store]`（≤3 visit） | rva `0x2eeeae` store 的 IR/reg + use-def；visit=1 多为裸常数。§7.12.20.C |
+| `MERGEN_DIAG_SLOTSTORE2=1` | stdout `[slotstore2]` | **mix 根因探针**：rva `0x2e7bb2` / 槽 `0x14fd08` 的 store 操作数形态 + `rbp` 形态 + select 三段 peel。§7.12.23.B |
+| `MERGEN_DIAG_CURSOR=1` | stdout `[cursor-w]` / `[cursor-r]` | 全部「游标形状」（`0x140…`/`0x40…`）的写 + 槽 `0x14fd08` 的全部读。用来证明「游标从未进过该槽」。§7.12.23.B |
+| `MERGEN_VERIFY_SLOT_FD08=<qword>` | stdout `[verify-slot-fd08]` | **因果实验**：rva `0x2e7bb2` / 槽 `0x14fd08` 且被存值是 `select` 时强制写该 qword。传 DR 真值 `0x14021ac17` 验充分性；传 select 臂 `0x14021ab17` 做负对照。**不是修法**。§7.12.23.C |
+| `MERGEN_DIAG_RBPDAG=1` | stdout `[rbpdag]` | rva `0x2e7bb2` / 槽 `0x14fd08` 处 `rbp` 的**完整 use-def**（深度 3000 / 60000 节点上限）。用来证明「该 select 的唯一外部叶子是 `%RCX`，链内 0 个 load」。§7.12.23.F |
 
 **两条流共用 `nextMemEventSeq()`（`mergen_events::memEventSeq`）**，
 序号在同一执行轴上，可按 seq 合并成一条时间线 —— 这是定位
@@ -2347,7 +2618,9 @@ lifter 侧默认会打 `[tramp]` / `[vip] pre`（定位用，未关）。不要�
 **所有按指令卡点的探针都必须比 `maskedRVA(va)`，不能比裸地址。** lift 把映像重基到
 `0x40000000`，写死 `0x140000000` 的探针在重基 lane 上静默不触发——0 命中看起来像
 「那段代码没执行」，实际是基址不匹配（§7.12.8 踩过）。`OperandUtils.ipp` 提供了
-「怎么修」的当前状态见 §7.12.13（cast 折叠实测无效）、§7.12.15（167342 的 `0x206` 是 shld 在已符号 dword 上的 FLAGS）、§7.12.16（`0x98fb1a05` 是嵌套 32-bit NAND）、§7.12.17（`--reg rcx` 诊断）、§7.12.19（两层停点：二次 ret SYM vs 假 VIP confirm=1）、§7.12.20（`0x14fcd8` slot 实验）、§7.12.21（TSC 对拍 vs 出口层）、**§7.12.22（`memoryPolicyAddress` 根修：rebased VA 查 policy）**。§7.12.14 的 SSA `%134186`/`%138038` 不是当前主线。
+「怎么修」的当前状态见 §7.12.13（cast 折叠实测无效）、§7.12.15（167342 的 `0x206` 是 shld 在已符号 dword 上的 FLAGS）、§7.12.16（`0x98fb1a05` 是嵌套 32-bit NAND）、§7.12.17（`--reg rcx` 诊断）、§7.12.19（无 `--reg` 卡 ≈301739 二次 `ret@0x3ec79e`）、§7.12.20（`0x14fcd8` slot 实验）、§7.12.21（TSC 对拍 vs 出口层）、§7.12.22（`memoryPolicyAddress` 根修）、**§7.12.23（根因：无 seed 停点是游标 push `0x2e7bb2` 的源操作数 `rbp` 算成两臂 `select`；干预实验已验证充分性 + 负对照 + 6 趟 DR 复现；且已还原出 `mix(RCX)` 公式 —— 与 `%RCX` 无关）**。§7.12.14 的 SSA `%134186`/`%138038` 不是当前主线。
+
+**⚠️ 读 §7.12.19.A / §7.12.22.K 前先读 §7.12.23**：那两节把停点归到「依赖符号 `%RCX`」，已被 §7.12.23.E 实测否证（派发链内没有 `%RCX`）。
 
 **别拿 DR 的寄存器值当基准**：DR 是真机进程状态（入口 `rbx=0x1fc45d23d40`、`rsp=0x11eb8ffe08`），lifter 是空寄存器 + 伪栈 `rsp=0x14fea0`。两条流 RVA 100% 对齐，但寄存器从第 0 条就不同，这是设计如此。「DR 有 X / lift 无」不是缺陷证据（§7.12.11 实测否证）。
 
