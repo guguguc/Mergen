@@ -2344,8 +2344,9 @@ cd D:\sogen\dr\refs\Mergen\build_msvc_dbg
 
 | 指标 | LF（无 `--reg`） | DR |
 |---|---|---|
-| insn 条数 | **301739**（末条 `0x3ec79e`） | 425181 |
-| 块 / 指令（diagnostics） | **31336 / 301740** | — |
+| insn 条数 | **427881**（越过二次 `0x3ec79e`，客户 `ret`） | 425181 |
+| 块 / 指令（diagnostics） | **45269 / 427881** | — |
+| 旧卡点（§7.12.25 前） | 31336 / 301739 @ 二次 `0x3ec79e` unresolved | — |
 | 前 301739 RVA | **与 DR 100% 对齐**（`chase_mix_diverge`：`first_rva_diverge: none`） | 同 seq 同 RVA |
 | exit | 0 | — |
 
@@ -2544,9 +2545,9 @@ ret i64 %25
 | 这条链 | 中间**没有任何一步是常数**（全是 SSA），从根往下折不动 |
 | `PathSolver.cpp` `getConstraintVal` | 已经试了 `ConstantFoldInstruction` + `simplifyInstruction`，但只作用在**根节点**；根是条件为符号的 `select`，操作数还是 SSA ⇒ 产不出常数。**没有自底向上的传播** |
 
-#### F.3 修法（两条，都待实现 / 接通）
+#### F.3 修法
 
-**① 折叠（首选，单路径）** —— 在 `lift_ret` 第一次 `PATH_unsolved` 时，对弹出值的**操作数锥**做**自底向上**的 `simplifyInstruction` + `RAUW`（子节点先于父节点，迭代到不动点），把中间节点塌成 `ConstantInt`，重取槽值后重试 `solvePath`。
+**① 折叠（单路径，未接通）** —— 在 `lift_ret` 第一次 `PATH_unsolved` 时，对弹出值的**操作数锥**做**自底向上**的 `simplifyInstruction` + `RAUW`（子节点先于父节点，迭代到不动点），把中间节点塌成 `ConstantInt`，重取槽值后重试 `solvePath`。
 F.1b 证明**数学上**一定折得出来（离线求值对 5 个种子都给出臂 1）；**但 LLVM 层面的实现尚未打通，见下方尝试记录**。
 
 > **⚠️ 实现尝试记录（2026-10-08，均已回退，`PathSolver.cpp` 回到 HEAD）**
@@ -2559,11 +2560,10 @@ F.1b 证明**数学上**一定折得出来（离线求值对 5 个种子都给�
 >
 > **诊断（缺代数化简）成立，但「用 LLVM 做重结合」这条实现路线尚未打通。** 若继续，正确的形态是**在 lift 期间维持常量性**（§4.6 换 `ConstantFolder` 正是因为 `InstSimplifyFolder` 会删指令），而不是在 transfer 失败时补救 —— 后者已被证明既不够又容易踩生命周期问题。
 
-**② fork（通用兜底，2 路）** —— 转移目标是「条件符号 + 两臂都是具体控制地址」的 `select` 时，按 §1/§5.5 的 `ltJmpWithFlag` 机制分两路，而不是要求单值。**这条本来就在设计意图里**（§5.5 虚拟化条件 fork），只是当前没有覆盖「`select` 经栈槽往返后才被 pop」这种形态。**尚未实现**；F.1b 已确认臂 1 就是真值，所以 fork 出的两条路里有一条是真机走的那条。
+**② pop 边界有界 fork（产品修法，§7.12.25）** —— 在 pcode 游标 **pop**（`resolveFetch` + `freshPop`）读到 `select(i1, pcode, pcode)` 时，按 §1/§5.5 的路径假设机制做**有界 2 路**展开：`assumptions[cond]` + `branch_backup` + `addUnvisitedAddr`。store 仍写 opaque select（IR 保真）；pop 时各路径 buffer commit 一臂具体游标。**已在产品代码接通**；ret 侧 PathSolver 全局 muxfork 已否证（131k blocks）。
 
-- 两条都只加在失败路径、可用 env 门控 ⇒ 默认行为不变。
-- 与 §7.12.18 的教训一致：`peel` 只修"宽度不够"，缺的是**真正的化简**（①）。
-- **验收**：无 `--reg` 的 mix 从 301740 前进（预期到 §7.12.23.D 那一档：`output.ll` = `mix(RCX)` 公式 + `[ret] rop=1`），且 add `0x140007210` 不回归。
+- 与 §7.12.18 的教训一致：`peel` 只修"宽度不够"，缺的是 pop 边界的路径语义（②）。
+- **验收（mix 无 `--reg`，2026-10-09）**：45269 blocks / 427881 insns；二次 `ret@0x3ec79e` → `0x402feda7`；客户 `ret@0x140007518 rop=1`；与 §7.12.23.C 干预实验 ~47k blocks 同量级。
 
 **禁令（补）**：不要给 RFLAGS / `shld` 结果做分字节 overlay（§7.12.7 已证明会让 jcc 走错 handler）；不要把 `%RCX` 具体化当修法；**不要**做控制域枚举（游标是常量，枚举无意义且会 OOM，§7.10）；**不要**因为"两臂"就断定 fork 不行——臂 1 就是真值（见 F.1b 的进制教训）。
 
@@ -2618,7 +2618,7 @@ lifter 侧默认会打 `[tramp]` / `[vip] pre`（定位用，未关）。不要�
 **所有按指令卡点的探针都必须比 `maskedRVA(va)`，不能比裸地址。** lift 把映像重基到
 `0x40000000`，写死 `0x140000000` 的探针在重基 lane 上静默不触发——0 命中看起来像
 「那段代码没执行」，实际是基址不匹配（§7.12.8 踩过）。`OperandUtils.ipp` 提供了
-「怎么修」的当前状态见 §7.12.13（cast 折叠实测无效）、§7.12.15（167342 的 `0x206` 是 shld 在已符号 dword 上的 FLAGS）、§7.12.16（`0x98fb1a05` 是嵌套 32-bit NAND）、§7.12.17（`--reg rcx` 诊断）、§7.12.19（无 `--reg` 卡 ≈301739 二次 `ret@0x3ec79e`）、§7.12.20（`0x14fcd8` slot 实验）、§7.12.21（TSC 对拍 vs 出口层）、§7.12.22（`memoryPolicyAddress` 根修）、**§7.12.23（根因：无 seed 停点是游标 push `0x2e7bb2` 的源操作数 `rbp` 算成两臂 `select`；干预实验已验证充分性 + 负对照 + 6 趟 DR 复现；且已还原出 `mix(RCX)` 公式 —— 与 `%RCX` 无关）**、**§7.12.24（更正：两臂都是字面量，游标是二值常量集；InstCombine 折叠路线已否证；应通过「逐个尝试有限地址集 + 存活者筛选」而不是分叉或猜测）**。§7.12.14 的 SSA `%134186`/`%138038` 不是当前主线。
+「怎么修」的当前状态见 §7.12.13（cast 折叠实测无效）、§7.12.15（167342 的 `0x206` 是 shld 在已符号 dword 上的 FLAGS）、§7.12.16（`0x98fb1a05` 是嵌套 32-bit NAND）、§7.12.17（`--reg rcx` 诊断）、§7.12.19（无 `--reg` 卡 ≈301739 二次 `ret@0x3ec79e`）、§7.12.20（`0x14fcd8` slot 实验）、§7.12.21（TSC 对拍 vs 出口层）、§7.12.22（`memoryPolicyAddress` 根修）、**§7.12.23（根因：无 seed 停点是游标 push `0x2e7bb2` 的源操作数 `rbp` 算成两臂 `select`；干预实验已验证充分性 + 负对照 + 6 趟 DR 复现；且已还原出 `mix(RCX)` 公式 —— 与 `%RCX` 无关）**、**§7.12.24（更正：两臂都是字面量，游标是二值常量集；InstCombine 折叠路线已否证）**、**§7.12.25（产品修法：pcode 游标 pop 边界有界 2 路 fork；mix 无 seed 45269 blocks / 427881 insns，客户 ret 可达）**。§7.12.14 的 SSA `%134186`/`%138038` 不是当前主线。
 
 **⚠️ 读 §7.12.19.A / §7.12.22.K / §7.12.23.F.1b 前先读 §7.12.24**：前先读 §7.12.23**：那两节把停点归到「依赖符号 `%RCX`」，已被 §7.12.23.E 实测否证（派发链内没有 `%RCX`）。
 
@@ -2748,6 +2748,45 @@ handler 机器码里本来就有数据相关分支，lifter 在汇合处用 `sel
 `dag_deps.py`（位依赖，保守）、`dag_slice.py`（反向位切片，**未跑完**）、
 `dag_sign_check.py`（拓扑序求值 + 种子扫描）。
 `tmp_eval_dag.py` 的 docstring 推断已过时，见 A。
+
+### 7.12.25 产品修法：pcode 游标 **pop 边界**有界 2 路 fork
+
+#### A. 问题（§7.12.23 根因，IR 正确）
+
+游标 `select(i1 cond, i64 pcode_A, i64 pcode_B)` 在 store 时**正确**写入 concolic buffer 与 LLVM IR。
+`resolveFetch` 的 retrieve 只接受 `ConstantInt` → pop 读到符号 select 时 `unbind()` → decode 链全符号 → 二次 `ret@0x3ec79e` unresolved（31336 blocks / 301739 insns）。
+
+#### B. 修法（通用，无 mix 特判）
+
+| 层 | 行为 |
+|---|---|
+| **store** | 不变：buffer 仍记 opaque `select`；LLVM store 仍保真 |
+| **pop** | `tryResolvePcodeCursorPop`（`OperandUtils.ipp` → `resolveFetch` retrieve lambda） |
+| **门控** | 仅 `vmp.isFetch` + `plan.freshPop`；值 = `select` 且两臂 `vmp.isBytecodeAddress()` |
+| **fork** | `tryForkCursorSelectMux_impl`：`assumptions[cond]`、`branch_backup`、`CondBr`、`addUnvisitedAddr` |
+| **去重** | `cursorMuxForked[(condInst, slot)]` — 每颗 cond 每槽最多 fork 一次 |
+| **有界** | 固定 2 路；**不是** ret 侧 PathSolver 扫全 DAG 的 muxfork |
+
+代码：`lifter/core/LifterClass_Concolic.hpp`（`tryResolvePcodeCursorPop_impl`）、`lifter/semantics/OperandUtils.ipp`。
+
+#### C. 已否证路线（勿复用）
+
+| 尝试 | 结果 |
+|---|---|
+| store 侧 `isVmStackAddress` + pcode 两臂 fork | 误触 handler 槽 `0x14fe70` → **95601 blocks**，崩溃 |
+| ret 侧 PathSolver 2 路 muxfork | **131059 blocks**，budget 503 |
+| 证 `cond` 恒定再写一臂 | Z3：非恒定（`tmp_prove_cond_z3.py`） |
+| VIP pin / `MERGEN_VERIFY_SLOT_FD08` | 诊断/因果实验，非产品 |
+
+#### D. mix 验收（`0x140007450`，无 `--reg`，`entry_7450.dmp`，2026-10-09）
+
+| 指标 | §7.12.25 前 | 后 |
+|---|---|---|
+| blocks | 31336 | **45269** |
+| insns | 301739 | **427881** |
+| 二次 `ret@0x3ec79e` | unresolved | **`dest=0x402feda7`** |
+| 客户 `ret@0x140007518` | 无 | **`rop=1`** |
+| 对比 §7.12.23.C 干预 | — | 同量级（47197 / 440111） |
 
 ## 8. 待清理
 

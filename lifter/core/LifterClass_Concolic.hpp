@@ -764,6 +764,110 @@ public:
     BBbackup[bb] = std::move(snapshot);
   }
 
+  static llvm::SelectInst* peelPcodeCursorSelect(llvm::Value* v) {
+    return llvm::dyn_cast<llvm::SelectInst>(
+        VmpPcodeCursor<Register>::peelCasts(v));
+  }
+
+  static bool isPcodeCursorSelectArms(llvm::SelectInst* sel,
+                                      llvm::ConstantInt*& tArm,
+                                      llvm::ConstantInt*& fArm) {
+    tArm = llvm::dyn_cast<llvm::ConstantInt>(sel->getTrueValue());
+    fArm = llvm::dyn_cast<llvm::ConstantInt>(sel->getFalseValue());
+    return tArm && fArm;
+  }
+
+  bool tryForkCursorSelectMux_impl(llvm::SelectInst* sel, uint64_t slot,
+                                   llvm::ConstantInt* tArm,
+                                   llvm::ConstantInt* fArm) {
+    auto* condInst = llvm::dyn_cast<llvm::Instruction>(sel->getCondition());
+    if (condInst == nullptr) {
+      return false;
+    }
+
+    const CursorMuxForkKey key{condInst, slot};
+    if (this->cursorMuxForked.contains(key)) {
+      auto it = this->assumptions.find(condInst);
+      if (it == this->assumptions.end()) {
+        return false;
+      }
+      this->writeBufferQwordFromConstant(
+          slot, it->second.isOne() ? tArm : fArm);
+      return true;
+    }
+    this->cursorMuxForked.insert(key);
+
+    const uint64_t contPC = this->current_address;
+    llvm::BasicBlock* bbFalse =
+        this->createBudgetedBasicBlock("cursor_mux_f", contPC);
+    llvm::BasicBlock* bbTrue =
+        this->createBudgetedBasicBlock("cursor_mux_t", contPC);
+    if (bbFalse == this->liftAbortBlock || bbTrue == this->liftAbortBlock) {
+      return false;
+    }
+
+    this->branch_backup(bbFalse);
+    auto& falseSnap = BBbackup[bbFalse];
+    falseSnap.assumptions[condInst] = llvm::APInt(1, 0);
+    const unsigned armBytes = fArm->getBitWidth() / 8;
+    for (unsigned i = 0; i < armBytes; ++i) {
+      falseSnap.buffer[slot + i] = ValueByteReference(fArm, i);
+    }
+
+    this->assumptions[condInst] = llvm::APInt(1, 1);
+    this->writeBufferQwordFromConstant(slot, tArm);
+
+    llvm::Value* cond = sel->getCondition();
+    auto* br = this->builder->CreateCondBr(cond, bbTrue, bbFalse);
+    this->RegisterBranch(br);
+    this->addUnvisitedAddr(BBInfo(contPC, bbFalse));
+
+    this->builder->SetInsertPoint(bbTrue);
+    this->blockInfo = BBInfo(contPC, bbTrue);
+    return true;
+  }
+
+  std::optional<uint64_t> tryResolvePcodeCursorPop_impl(uint64_t slot,
+                                                        LazyValue orgLoad) {
+    LazyValue nested(orgLoad);
+    llvm::Value* popped = this->retrieveCombinedValue(slot, 8, nested);
+    if (popped == nullptr) {
+      return std::nullopt;
+    }
+    if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(popped)) {
+      const uint64_t addr = ci->getZExtValue();
+      if (this->vmp.isBytecodeAddress(addr)) {
+        return addr;
+      }
+      return std::nullopt;
+    }
+
+    llvm::SelectInst* sel = peelPcodeCursorSelect(popped);
+    if (sel == nullptr) {
+      return std::nullopt;
+    }
+    llvm::ConstantInt *tArm = nullptr, *fArm = nullptr;
+    if (!isPcodeCursorSelectArms(sel, tArm, fArm) ||
+        !this->vmp.isBytecodeAddress(tArm->getZExtValue()) ||
+        !this->vmp.isBytecodeAddress(fArm->getZExtValue())) {
+      return std::nullopt;
+    }
+
+    if (!tryForkCursorSelectMux_impl(sel, slot, tArm, fArm)) {
+      return std::nullopt;
+    }
+
+    auto* condInst = llvm::dyn_cast<llvm::Instruction>(sel->getCondition());
+    if (condInst == nullptr) {
+      return std::nullopt;
+    }
+    auto it = this->assumptions.find(condInst);
+    if (it == this->assumptions.end()) {
+      return tArm->getZExtValue();
+    }
+    return (it->second.isOne() ? tArm : fArm)->getZExtValue();
+  }
+
   void load_backup_impl(BasicBlock* bb) {
     activeGeneralizedLoopLocalBuffer.clear();
     if (BBbackup.contains(bb)) {

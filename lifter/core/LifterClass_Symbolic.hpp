@@ -132,6 +132,13 @@ public:
 
   constexpr ControlFlow getControlFlow_impl() { return ControlFlow::Basic; }
 
+  std::optional<uint64_t> tryResolvePcodeCursorPop_impl(uint64_t slot,
+                                                        LazyValue orgLoad) {
+    (void)slot;
+    (void)orgLoad;
+    return std::nullopt;
+  }
+
   void branch_backup_impl(BasicBlock* bb, bool generalized) {
     //
     return;

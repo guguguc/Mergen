@@ -23,6 +23,7 @@
 
 #include <concepts>
 #include <deque>
+#include <optional>
 #include <fstream>
 #include <sstream>
 #include <llvm/ADT/DenseMap.h>
@@ -232,6 +233,31 @@ public:
   }
 };
 
+
+struct CursorMuxForkKey {
+  llvm::Instruction* cond = nullptr;
+  uint64_t slot = 0;
+
+  bool operator==(const CursorMuxForkKey& other) const {
+    return cond == other.cond && slot == other.slot;
+  }
+};
+
+template <>
+struct llvm::DenseMapInfo<CursorMuxForkKey> {
+  static inline CursorMuxForkKey getEmptyKey() {
+    return {llvm::DenseMapInfo<llvm::Instruction*>::getEmptyKey(), 0};
+  }
+  static inline CursorMuxForkKey getTombstoneKey() {
+    return {llvm::DenseMapInfo<llvm::Instruction*>::getTombstoneKey(), 1};
+  }
+  static unsigned getHashValue(const CursorMuxForkKey& key) {
+    return llvm::hash_combine(key.cond, key.slot);
+  }
+  static bool isEqual(const CursorMuxForkKey& lhs, const CursorMuxForkKey& rhs) {
+    return lhs == rhs;
+  }
+};
 
 struct BBInfo {
   uint64_t block_address = 0;
@@ -901,6 +927,22 @@ public:
   // useless in symbolic?
   void branch_backup(BasicBlock* bb, bool generalized = false) {
     static_cast<Derived*>(this)->branch_backup_impl(bb, generalized);
+  }
+
+  void writeBufferQwordFromConstant(uint64_t address, llvm::ConstantInt* ci) {
+    if (ci == nullptr) {
+      return;
+    }
+    const unsigned nbytes = ci->getBitWidth() / 8;
+    for (unsigned i = 0; i < nbytes; ++i) {
+      buffer[address + i] = ValueByteReference(ci, i);
+    }
+  }
+
+  std::optional<uint64_t> tryResolvePcodeCursorPop(uint64_t slot,
+                                                   LazyValue orgLoad) {
+    return static_cast<Derived*>(this)->tryResolvePcodeCursorPop_impl(
+        slot, orgLoad);
   }
   void migrate_generalized_loop_block(BasicBlock* oldBlock, BasicBlock* newBlock) {
     static_cast<Derived*>(this)->migrate_generalized_loop_block_impl(oldBlock, newBlock);
@@ -1784,6 +1826,7 @@ public:
 
   // ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
   llvm::DenseMap<llvm::Instruction*, llvm::APInt> assumptions;
+  llvm::DenseSet<CursorMuxForkKey> cursorMuxForked;
   // Memoization cache for computePossibleValues, cleared per solvePath call.
   llvm::DenseMap<llvm::Value*, std::set<llvm::APInt, APIntComparator>> pv_cache;
   llvm::DenseMap<uint64_t, ValueByteReference> buffer;

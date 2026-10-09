@@ -1742,10 +1742,8 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::GetMemoryValue(Value* address,
         GetRegisterValue(vmp.pcodeRegister()),
         [&](uint64_t slot, llvm::Value* org) -> uint64_t {
           LazyValue nested(org);
-          if (auto* popped = retrieveCombinedValue(slot, 8, nested)) {
-            if (auto* pci = llvm::dyn_cast<llvm::ConstantInt>(popped)) {
-              return pci->getZExtValue();
-            }
+          if (auto resolved = tryResolvePcodeCursorPop(slot, nested)) {
+            return *resolved;
           }
           return 0;
         },
