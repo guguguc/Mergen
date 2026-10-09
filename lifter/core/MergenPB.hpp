@@ -198,6 +198,11 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::run_opts() {
   postPassManager.addPass(SignedCompareFromFlagsPass());
   postPassManager.addPass(
       llvm::createModuleToFunctionPassAdaptor(llvm::InstCombinePass()));
+  // After O2 + cleanup InstCombine: fold repeated straight-line iterative
+  // reductions (identical pure seed→out rounds) back into a counted loop.
+  postPassManager.addPass(StraightLineRerollPass());
+  postPassManager.addPass(
+      llvm::createModuleToFunctionPassAdaptor(llvm::InstCombinePass()));
   postPassManager.addPass(llvm::DeadArgumentEliminationPass());
   postPassManager.addPass(CanonicalNamingPass());
   postPassManager.run(*module, finalModuleAnalysisManager);

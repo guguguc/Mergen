@@ -214,4 +214,4 @@ This gate is currently **red** on `example2-virt.bin`: the lifter unrolls the VM
 |---|---|
 | `REP`/`REPE`/`REPNE`-prefixed `SCAS` | Rejected as `not_implemented`; needs a model for repeated-scan termination. |
 | `INT 2` continuation under VMP 3.6 | Naive architectural fallthrough is wrong; recovery requires modeling the dispatcher / exception-mediated control flow. See `VMP_TESTING_NOTES.md`. |
-| Loop unrolling / loop-invariant code motion | Not implemented. The lifter relies on LLVM's downstream optimization passes for this once the IR is in shape. |
+| Loop unrolling / loop-invariant code motion | Not implemented during lift. Post-O2 `StraightLineRerollPass` can fold ≥2 isomorphic pure seed→out rounds back into a counted loop (`lifter/analysis/StraightLineRerollPass.hpp`). |

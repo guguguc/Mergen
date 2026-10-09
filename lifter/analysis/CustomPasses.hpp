@@ -4,6 +4,7 @@
 #include "MemoryPolicy.hpp"
 #include "FileReader.hpp"
 #include "Includes.h"
+#include "StraightLineRerollPass.hpp"
 #include "Utils.h"
 #include "llvm/IR/PassManager.h"
 #include <algorithm>

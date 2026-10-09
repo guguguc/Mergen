@@ -32,6 +32,8 @@ loop {
 } until instruction count stabilizes (delta == 0)
 
 Final O2 pipeline (runs once after fixpoint)
+
+Post-O2 passes (order matters): `StripTrailingScratchStores` → `SelectChainToSwitch` → `SwitchNormalization` → `SignedCompareFromFlags` → InstCombine → **`StraightLineReroll`** → InstCombine → `DeadArgumentElimination` → `CanonicalNaming`
 ```
 
 Termination: the loop compares instruction count before and after each iteration. When the count stops changing, the fixpoint is reached.
@@ -44,6 +46,7 @@ Termination: the loop compares instruction count before and after each iteration
 | `ReplaceTruncWithLoadPass` | `trunc(load wide, ptr)` patterns | `load narrow, ptr` | Rewrites wide-load-then-truncate into narrow load; valid on little-endian |
 | `PromotePseudoStackPass` | `memory`-base GEPs in `[STACKP_VALUE - reserve, STACKP_VALUE + reserve]` via `isStackAddress()` | `stackmemory` alloca GEPs | Replaces pseudo-stack memory accesses with real stack alloca operations |
 | `PromotePseudoMemory` | Remaining `memory`-base GEPs (not handled by above passes) | `inttoptr` | Converts leftover pseudo-memory GEPs to raw pointer operations |
+| `StraightLineRerollPass` | Post-O2: ≥2 back-to-back pure isomorphic seed→out rounds (same structural fingerprint, single-BB) | Counted loop `for i in 0..N-1: acc = F(acc)` | Rerolls fully unrolled iterative reductions; pattern-agnostic (no opcode special cases) |
 
 Pass order matters: GEPLoadPass must run before PromotePseudoMemory, otherwise concrete PE loads get converted to `inttoptr` and are lost.
 

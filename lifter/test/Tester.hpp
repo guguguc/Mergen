@@ -1,11 +1,17 @@
 #pragma once
 
 #include "LifterClass_Concolic.hpp"
+#include "StraightLineRerollPass.hpp"
 #include <llvm/ADT/APInt.h>
 #include <llvm/ADT/SmallString.h>
 #include <llvm/IR/Constants.h>
+#include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Instructions.h>
+#include <llvm/IR/Module.h>
+#include <llvm/IR/PassManager.h>
+#include <llvm/IR/Verifier.h>
 #include <llvm/Support/Casting.h>
+#include <llvm/Support/raw_ostream.h>
 
 #include <cstdint>
 #include <iostream>
@@ -10808,7 +10814,55 @@ bool runComputePossibleValuesOnRolledArithmeticChain(std::string& details) {
     return true;
   }
 
+  bool runStraightLineRerollRepeatedAddChain(std::string& details) {
+    llvm::LLVMContext Ctx;
+    llvm::Module M("reroll_test", Ctx);
+    auto* i32 = llvm::Type::getInt32Ty(Ctx);
+    auto* F = llvm::Function::Create(llvm::FunctionType::get(i32, {i32}, false),
+                                     llvm::Function::ExternalLinkage, "f", &M);
+    auto* entry = llvm::BasicBlock::Create(Ctx, "entry", F);
+    llvm::IRBuilder<> B(entry);
+    llvm::Value* v = F->getArg(0);
+    for (int i = 0; i < 4; ++i)
+      v = B.CreateAdd(v, llvm::ConstantInt::get(i32, 7), "add");
+    B.CreateRet(v);
 
+    llvm::ModuleAnalysisManager MAM;
+    StraightLineRerollPass().run(M, MAM);
+
+    std::string err;
+    llvm::raw_string_ostream eos(err);
+    if (llvm::verifyModule(M, &eos)) {
+      details = "  verifyModule failed after reroll:\n" + eos.str();
+      return false;
+    }
+
+    bool sawAcc = false;
+    bool sawBackedge = false;
+    for (llvm::BasicBlock& BB : *F) {
+      for (llvm::Instruction& I : BB) {
+        if (auto* Phi = llvm::dyn_cast<llvm::PHINode>(&I)) {
+          if (Phi->getName().starts_with("reroll.acc"))
+            sawAcc = true;
+        }
+      }
+      if (auto* Br = llvm::dyn_cast<llvm::BranchInst>(BB.getTerminator())) {
+        if (Br->isConditional()) {
+          for (unsigned si = 0; si < Br->getNumSuccessors(); ++si) {
+            if (Br->getSuccessor(si) == &BB)
+              sawBackedge = true;
+          }
+        }
+      }
+    }
+    if (!sawAcc || !sawBackedge) {
+      details =
+          "  expected counted loop (reroll.acc phi + self backedge) after "
+          "StraightLineRerollPass on 4x (x+=7)\n";
+      return false;
+    }
+    return true;
+  }
 
   int runCustomKnownBitsTests(const std::string& suiteFilter) {
     int failures = 0;
@@ -11253,6 +11307,8 @@ bool runComputePossibleValuesOnRolledArithmeticChain(std::string& details) {
              &InstructionTester::runNormalizeRuntimeTargetWidensMappedRvaTarget);
     runCustom("pushfq_pseudostack_unaligned_qword_reload_resolves_as_ssa",
              &InstructionTester::runPushFflagsPseudoStackQwordReloadResolvesAsSSA);
+    runCustom("straight_line_reroll_repeated_add_chain",
+             &InstructionTester::runStraightLineRerollRepeatedAddChain);
 
     return failures;
   }
