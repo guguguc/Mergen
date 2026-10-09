@@ -45,10 +45,20 @@ struct LiftPerfDiag {
   Acc icmpKnownBits;
   Acc truncKnownBits;
 
+  Acc createLookup;
+  Acc createSelectDist;
+  Acc createBinOp;
+  Acc createCast;
+  Acc createCacheInsert;
+  Acc createComplexity;
+  Acc createFoldOrigin;
+
   Acc regGet;
   Acc regSet;
   Acc flagGet;
   Acc flagSet;
+  Acc flagSetLazyCalc;
+  Acc flagSetStore;
   Acc decode;
 
   uint64_t constBackupSkipped = 0;
@@ -73,6 +83,17 @@ struct LiftPerfDiag {
   uint64_t flagGetCalls = 0;
   uint64_t flagSetCalls = 0;
   uint64_t flagSetLazyCalls = 0;
+  uint64_t flagSetEagerCalls = 0;
+  std::array<uint64_t, 32> flagSetById{};
+
+  uint64_t createCalls = 0;
+  uint64_t createCacheHits = 0;
+  uint64_t createCacheMisses = 0;
+  uint64_t createSelectDistEntered = 0;
+  uint64_t createSelectDistHit = 0;
+  uint64_t createPlainBinOp = 0;
+  uint64_t createCastPath = 0;
+  std::array<uint64_t, 256> createOpcode{};
 
   uint64_t cpvCacheHits = 0;
   uint64_t cpvDepthCut = 0;
@@ -263,6 +284,51 @@ struct LiftPerfDiag {
        << " total_ms=" << truncKnownBits.totalMs
        << " avg_ms=" << truncKnownBits.avgMs() << "\n";
 
+    os << "[perf] create calls=" << createCalls
+       << " cache_hit=" << createCacheHits
+       << " cache_miss=" << createCacheMisses
+       << " select_enter=" << createSelectDistEntered
+       << " select_hit=" << createSelectDistHit
+       << " plain_binop=" << createPlainBinOp
+       << " cast=" << createCastPath << "\n";
+    os << "[perf]   create_lookup calls=" << createLookup.count
+       << " total_ms=" << createLookup.totalMs
+       << " avg_ms=" << createLookup.avgMs() << "\n";
+    os << "[perf]   create_select_dist calls=" << createSelectDist.count
+       << " total_ms=" << createSelectDist.totalMs
+       << " avg_ms=" << createSelectDist.avgMs() << "\n";
+    os << "[perf]   create_binop calls=" << createBinOp.count
+       << " total_ms=" << createBinOp.totalMs
+       << " avg_ms=" << createBinOp.avgMs() << "\n";
+    os << "[perf]   create_cast calls=" << createCast.count
+       << " total_ms=" << createCast.totalMs
+       << " avg_ms=" << createCast.avgMs() << "\n";
+    os << "[perf]   create_cache_insert calls=" << createCacheInsert.count
+       << " total_ms=" << createCacheInsert.totalMs
+       << " avg_ms=" << createCacheInsert.avgMs() << "\n";
+    os << "[perf]   create_complexity calls=" << createComplexity.count
+       << " total_ms=" << createComplexity.totalMs
+       << " avg_ms=" << createComplexity.avgMs() << "\n";
+    os << "[perf]   create_fold_origin calls=" << createFoldOrigin.count
+       << " total_ms=" << createFoldOrigin.totalMs
+       << " avg_ms=" << createFoldOrigin.avgMs() << "\n";
+    os << "[perf]   create_opcode top:";
+    {
+      std::vector<std::pair<unsigned, uint64_t>> createRank;
+      for (unsigned op = 0; op < createOpcode.size(); ++op) {
+        if (createOpcode[op] != 0) {
+          createRank.emplace_back(op, createOpcode[op]);
+        }
+      }
+      std::sort(createRank.begin(), createRank.end(),
+                [](const auto& a, const auto& b) { return a.second > b.second; });
+      const size_t topN = std::min<size_t>(createRank.size(), 10);
+      for (size_t i = 0; i < topN; ++i) {
+        os << " op" << createRank[i].first << "=" << createRank[i].second;
+      }
+      os << "\n";
+    }
+
     os << "[perf] reg_get calls=" << regGetCalls
        << " total_ms=" << regGet.totalMs << " highbyte=" << regGetHighByte
        << " rflags=" << regGetRflags << "\n";
@@ -273,8 +339,21 @@ struct LiftPerfDiag {
     os << "[perf] flag_get calls=" << flagGetCalls
        << " total_ms=" << flagGet.totalMs << "\n";
     os << "[perf] flag_set calls=" << flagSetCalls
-       << " lazy=" << flagSetLazyCalls << " total_ms=" << flagSet.totalMs
-       << "\n";
+       << " eager=" << flagSetEagerCalls << " lazy=" << flagSetLazyCalls
+       << " total_ms=" << flagSet.totalMs << "\n";
+    os << "[perf]   flag_set_lazy_calc calls=" << flagSetLazyCalc.count
+       << " total_ms=" << flagSetLazyCalc.totalMs
+       << " avg_ms=" << flagSetLazyCalc.avgMs() << "\n";
+    os << "[perf]   flag_set_store calls=" << flagSetStore.count
+       << " total_ms=" << flagSetStore.totalMs
+       << " avg_ms=" << flagSetStore.avgMs() << "\n";
+    os << "[perf]   flag_set_by_id:";
+    for (unsigned i = 0; i < flagSetById.size(); ++i) {
+      if (flagSetById[i] != 0) {
+        os << " f" << i << "=" << flagSetById[i];
+      }
+    }
+    os << "\n";
     os << "[perf] decode calls=" << decode.count
        << " total_ms=" << decode.totalMs << " avg_ms=" << decode.avgMs()
        << "\n";

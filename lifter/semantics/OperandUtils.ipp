@@ -368,92 +368,172 @@ inline bool isCast(uint8_t opcode) {
 
 MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::getOrCreate(
     const InstructionKey& key, uint8_t opcode, const Twine& Name) {
+  const bool perf = perfDiag.enabled;
+  if (perf) {
+    ++perfDiag.createCalls;
+    if (opcode < perfDiag.createOpcode.size()) {
+      ++perfDiag.createOpcode[opcode];
+    }
+  }
 
-  auto it = cache.lookup(opcode, key);
+  Value* it = nullptr;
+  {
+    LiftPerfDiag::ScopedTimer lookupTimer(&perfDiag, &perfDiag.createLookup);
+    it = cache.lookup(opcode, key);
+  }
   if (it) {
+    if (perf) {
+      ++perfDiag.createCacheHits;
+    }
     return it;
   }
+  if (perf) {
+    ++perfDiag.createCacheMisses;
+  }
+
   Value* newInstruction = nullptr;
   if (isCast(opcode) == 0) {
     // Binary instruction. Distribute over select through folderBinOps so
     // identities (-1/0/~~) and constant folding run on each arm; CreateBinOp
     // alone skips Mergen's folder and leaves VIP masks symbolic.
     const auto binOp = static_cast<Instruction::BinaryOps>(opcode);
-    if (auto select_inst = dyn_cast<llvm::SelectInst>(key.operand1)) {
-      printvalue2(
-          analyzeValueKnownBits(select_inst->getCondition(), select_inst));
-      if (isa<ConstantInt>(key.operand2))
-        return createSelectFolder(
-            select_inst->getCondition(),
-            folderBinOps(select_inst->getTrueValue(), key.operand2, Name,
-                         binOp),
-            folderBinOps(select_inst->getFalseValue(), key.operand2, Name,
-                         binOp),
-            "lola-");
-    }
-    if (auto select_inst = dyn_cast<llvm::SelectInst>(key.operand2)) {
-      printvalue2(
-          analyzeValueKnownBits(select_inst->getCondition(), select_inst));
-      if (isa<ConstantInt>(key.operand1))
-        return createSelectFolder(
-            select_inst->getCondition(),
-            folderBinOps(key.operand1, select_inst->getTrueValue(), Name,
-                         binOp),
-            folderBinOps(key.operand1, select_inst->getFalseValue(), Name,
-                         binOp),
-            "lolb-");
-    }
-
-    Value *cnd1, *lhs1, *rhs1;
-    if (match(key.operand1, m_TruncOrSelf(m_Select(m_Value(cnd1), m_Value(lhs1),
-                                                   m_Value(rhs1))))) {
-      if (auto select_inst = dyn_cast<llvm::SelectInst>(key.operand2))
-        if (select_inst && cnd1 == select_inst->getCondition()) // also check
-                                                                // if inversed
+    // The select/cast(select) patterns below only fire when an operand is a
+    // Select or a cast of one. Skip PatternMatch on the common non-select path.
+    const bool maybeSelectBinop =
+        isa<SelectInst>(key.operand1) || isa<SelectInst>(key.operand2) ||
+        isa<CastInst>(key.operand1) || isa<CastInst>(key.operand2);
+    if (maybeSelectBinop) {
+      if (perf) {
+        ++perfDiag.createSelectDistEntered;
+      }
+      // Time only the PatternMatch / isa checks here. The distributed
+      // folderBinOps work is already counted under folder_* buckets.
+      enum class SelectArm { None, Lola, Lolb, Lol2a, Lol2b, Lol2c, Lol2d };
+      SelectArm hit = SelectArm::None;
+      SelectInst* sel = nullptr;
+      Value *armL = nullptr, *armR = nullptr, *cnd = nullptr;
+      {
+        LiftPerfDiag::ScopedTimer selectTimer(&perfDiag,
+                                              &perfDiag.createSelectDist);
+        if (auto select_inst = dyn_cast<llvm::SelectInst>(key.operand1)) {
+          printvalue2(
+              analyzeValueKnownBits(select_inst->getCondition(), select_inst));
+          if (isa<ConstantInt>(key.operand2)) {
+            hit = SelectArm::Lola;
+            sel = select_inst;
+          }
+        }
+        if (hit == SelectArm::None) {
+          if (auto select_inst = dyn_cast<llvm::SelectInst>(key.operand2)) {
+            printvalue2(analyzeValueKnownBits(select_inst->getCondition(),
+                                              select_inst));
+            if (isa<ConstantInt>(key.operand1)) {
+              hit = SelectArm::Lolb;
+              sel = select_inst;
+            }
+          }
+        }
+        if (hit == SelectArm::None) {
+          Value *cnd1 = nullptr, *lhs1 = nullptr, *rhs1 = nullptr;
+          if (match(key.operand1,
+                    m_TruncOrSelf(m_Select(m_Value(cnd1), m_Value(lhs1),
+                                           m_Value(rhs1))))) {
+            if (auto select_inst = dyn_cast<llvm::SelectInst>(key.operand2)) {
+              if (select_inst && cnd1 == select_inst->getCondition()) {
+                hit = SelectArm::Lol2a;
+                sel = select_inst;
+                armL = lhs1;
+                armR = rhs1;
+              }
+            }
+          } else if (match(key.operand1, m_ZExtOrSExtOrSelf(m_Select(
+                                             m_Value(cnd1), m_Value(lhs1),
+                                             m_Value(rhs1))))) {
+            if (auto select_inst = dyn_cast<llvm::SelectInst>(key.operand2)) {
+              if (select_inst && cnd1 == select_inst->getCondition()) {
+                hit = SelectArm::Lol2b;
+                sel = select_inst;
+                armL = lhs1;
+                armR = rhs1;
+              }
+            }
+          }
+        }
+        if (hit == SelectArm::None) {
+          Value *lhs = nullptr, *rhs = nullptr;
+          if (match(key.operand2,
+                    m_TruncOrSelf(m_Select(m_Value(cnd), m_Value(lhs),
+                                           m_Value(rhs))))) {
+            if (auto select_inst = dyn_cast<llvm::SelectInst>(key.operand1)) {
+              if (select_inst && cnd == select_inst->getCondition()) {
+                hit = SelectArm::Lol2c;
+                sel = select_inst;
+                armL = lhs;
+                armR = rhs;
+              }
+            }
+          } else if (match(key.operand2, m_ZExtOrSExtOrSelf(
+                                             m_Select(m_Value(cnd), m_Value(lhs),
+                                                      m_Value(rhs))))) {
+            if (auto select_inst = dyn_cast<llvm::SelectInst>(key.operand1)) {
+              if (select_inst && cnd == select_inst->getCondition()) {
+                hit = SelectArm::Lol2d;
+                sel = select_inst;
+                armL = lhs;
+                armR = rhs;
+              }
+            }
+          }
+        }
+      }
+      if (hit != SelectArm::None && sel != nullptr) {
+        if (perf) {
+          ++perfDiag.createSelectDistHit;
+        }
+        switch (hit) {
+        case SelectArm::Lola:
           return createSelectFolder(
-              select_inst->getCondition(),
-              folderBinOps(lhs1, select_inst->getTrueValue(), Name, binOp),
-              folderBinOps(rhs1, select_inst->getFalseValue(), Name, binOp),
-              "lol2-");
-    } else if (match(key.operand1,
-                     m_ZExtOrSExtOrSelf(m_Select(m_Value(cnd1), m_Value(lhs1),
-                                                 m_Value(rhs1))))) {
-      if (auto select_inst = dyn_cast<llvm::SelectInst>(key.operand2))
-        if (select_inst && cnd1 == select_inst->getCondition()) // also check
-                                                                // if inversed
+              sel->getCondition(),
+              folderBinOps(sel->getTrueValue(), key.operand2, Name, binOp),
+              folderBinOps(sel->getFalseValue(), key.operand2, Name, binOp),
+              "lola-");
+        case SelectArm::Lolb:
           return createSelectFolder(
-              select_inst->getCondition(),
-              folderBinOps(lhs1, select_inst->getTrueValue(), Name, binOp),
-              folderBinOps(rhs1, select_inst->getFalseValue(), Name, binOp),
-              "lol2-");
+              sel->getCondition(),
+              folderBinOps(key.operand1, sel->getTrueValue(), Name, binOp),
+              folderBinOps(key.operand1, sel->getFalseValue(), Name, binOp),
+              "lolb-");
+        case SelectArm::Lol2a:
+        case SelectArm::Lol2b:
+          return createSelectFolder(
+              sel->getCondition(),
+              folderBinOps(armL, sel->getTrueValue(), Name, binOp),
+              folderBinOps(armR, sel->getFalseValue(), Name, binOp), "lol2-");
+        case SelectArm::Lol2c:
+        case SelectArm::Lol2d:
+          return createSelectFolder(
+              sel->getCondition(),
+              folderBinOps(sel->getTrueValue(), armL, Name, binOp),
+              folderBinOps(sel->getFalseValue(), armR, Name, binOp), "lol2-");
+        case SelectArm::None:
+          break;
+        }
+      }
     }
-    Value *cnd, *lhs, *rhs;
-    if (match(key.operand2, m_TruncOrSelf(m_Select(m_Value(cnd), m_Value(lhs),
-                                                   m_Value(rhs))))) {
-      if (auto select_inst = dyn_cast<llvm::SelectInst>(key.operand1))
-        if (select_inst && cnd == select_inst->getCondition()) // also check
-                                                               // if inversed
-          return createSelectFolder(
-              select_inst->getCondition(),
-              folderBinOps(select_inst->getTrueValue(), lhs, Name, binOp),
-              folderBinOps(select_inst->getFalseValue(), rhs, Name, binOp),
-              "lol2-");
-    } else if (match(key.operand2,
-                     m_ZExtOrSExtOrSelf(
-                         m_Select(m_Value(cnd), m_Value(lhs), m_Value(rhs))))) {
-      if (auto select_inst = dyn_cast<llvm::SelectInst>(key.operand1))
-        if (select_inst && cnd == select_inst->getCondition()) // also check
-                                                               // if inversed
-          return createSelectFolder(
-              select_inst->getCondition(),
-              folderBinOps(select_inst->getTrueValue(), lhs, Name, binOp),
-              folderBinOps(select_inst->getFalseValue(), rhs, Name, binOp),
-              "lol2-");
+    {
+      LiftPerfDiag::ScopedTimer binOpTimer(&perfDiag, &perfDiag.createBinOp);
+      newInstruction =
+          builder->CreateBinOp(binOp, key.operand1, key.operand2, Name);
     }
-    newInstruction =
-        builder->CreateBinOp(binOp, key.operand1, key.operand2, Name);
+    if (perf) {
+      ++perfDiag.createPlainBinOp;
+    }
   } else if (isCast(opcode)) {
     // Cast instruction
+    if (perf) {
+      ++perfDiag.createCastPath;
+    }
+    LiftPerfDiag::ScopedTimer castTimer(&perfDiag, &perfDiag.createCast);
     switch (opcode) {
 
     case Instruction::Trunc:
@@ -478,7 +558,11 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::getOrCreate(
       UNREACHABLE("Unsupported cast opcode");
     }
   }
-  cache.insert(opcode, key, newInstruction);
+  {
+    LiftPerfDiag::ScopedTimer insertTimer(&perfDiag,
+                                          &perfDiag.createCacheInsert);
+    cache.insert(opcode, key, newInstruction);
+  }
   return newInstruction;
 }
 
@@ -513,10 +597,14 @@ static bool isCommutative(const unsigned Opcode) {
 MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::createInstruction(
     unsigned opcode, Value* operand1, Value* operand2, Type* destType,
     const Twine& Name) {
-  if (isCommutative(opcode)) {
-    if (getComplexity(operand1) < getComplexity(operand2)) {
-      // if operand1 is less complex, move it to RHS
-      std::swap(operand2, operand1);
+  {
+    LiftPerfDiag::ScopedTimer complexityTimer(&perfDiag,
+                                              &perfDiag.createComplexity);
+    if (isCommutative(opcode)) {
+      if (getComplexity(operand1) < getComplexity(operand2)) {
+        // if operand1 is less complex, move it to RHS
+        std::swap(operand2, operand1);
+      }
     }
   }
 
@@ -528,7 +616,11 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::createInstruction(
 
   Value* newValue = getOrCreate(key, opcode, Name);
 
-  recordFoldOrigin(newValue, opcode, operand1, operand2);
+  {
+    LiftPerfDiag::ScopedTimer originTimer(&perfDiag,
+                                          &perfDiag.createFoldOrigin);
+    recordFoldOrigin(newValue, opcode, operand1, operand2);
+  }
 
   return newValue; //
 }
@@ -1306,7 +1398,13 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::setFlag(const Flag flag,
   LiftPerfDiag::ScopedTimer flagTimer(&perfDiag, &perfDiag.flagSet);
   if (perfDiag.enabled) {
     ++perfDiag.flagSetCalls;
+    ++perfDiag.flagSetEagerCalls;
+    const unsigned id = static_cast<unsigned>(flag);
+    if (id < perfDiag.flagSetById.size()) {
+      ++perfDiag.flagSetById[id];
+    }
   }
+  LiftPerfDiag::ScopedTimer storeTimer(&perfDiag, &perfDiag.flagSetStore);
   return setFlagValue(flag, newValue);
 }
 
@@ -1317,8 +1415,18 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::setFlag(
   if (perfDiag.enabled) {
     ++perfDiag.flagSetCalls;
     ++perfDiag.flagSetLazyCalls;
+    const unsigned id = static_cast<unsigned>(flag);
+    if (id < perfDiag.flagSetById.size()) {
+      ++perfDiag.flagSetById[id];
+    }
   }
-  return setFlagValue(flag, calculation());
+  Value* computed = nullptr;
+  {
+    LiftPerfDiag::ScopedTimer calcTimer(&perfDiag, &perfDiag.flagSetLazyCalc);
+    computed = calculation();
+  }
+  LiftPerfDiag::ScopedTimer storeTimer(&perfDiag, &perfDiag.flagSetStore);
+  return setFlagValue(flag, computed);
 }
 
 MERGEN_LIFTER_DEFINITION_TEMPLATES(LazyValue)::getLazyFlag(const Flag flag) {

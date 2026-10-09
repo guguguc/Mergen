@@ -22,15 +22,20 @@
 #endif
 
 #ifndef _NODEV
+// Guard the argument: printValue/printLLVMValue used to run after evaluating
+// `x`, so printvalue2(analyzeValueKnownBits(...)) paid knownbits on every call
+// even when debugging was off.
 #define printvalue(x)                                                          \
   do {                                                                         \
-    debugging::printLLVMValue(x, #x);                                          \
+    if (debugging::shouldDebug && debugging::debugStream) {                    \
+      debugging::printLLVMValue(x, #x);                                        \
+    }                                                                          \
   } while (0);
-// outs() << " " #x " : "; x->print(outs());
-// outs() << "\n";  outs().flush();
 #define printvalue2(x)                                                         \
   do {                                                                         \
-    debugging::printValue(x, #x);                                              \
+    if (debugging::shouldDebug && debugging::debugStream) {                    \
+      debugging::printValue(x, #x);                                            \
+    }                                                                          \
   } while (0);
 #else
 #define printvalue(x) ((void)0);
