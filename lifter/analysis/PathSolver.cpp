@@ -1,5 +1,6 @@
 
 #include "PathSolver.h"
+#include "LiftPerfDiag.hpp"
 #include "CustomPasses.hpp"
 #include "Utils.h"
 #include <llvm/ADT/DenseMap.h>
@@ -22,18 +23,29 @@ using namespace llvm;
 // PATH_unsolved otherwise. This is intentionally conservative — it only
 // succeeds when LLVM can prove the value is a single constant.
 PATH_info getConstraintVal(llvm::Function* function, Value* constraint,
-                           uint64_t& dest) {
+                           uint64_t& dest, LiftPerfDiag* perf) {
   printvalue(constraint);
+
+  if (perf != nullptr && perf->enabled) {
+    ++perf->gcvCalls;
+  }
 
   // Already a constant — should have been caught by caller, but handle anyway.
   if (auto* CI = dyn_cast<ConstantInt>(constraint)) {
     dest = CI->getZExtValue();
+    if (perf != nullptr && perf->enabled) {
+      ++perf->gcvSolvedConst;
+    }
     return PATH_solved;
   }
 
   auto* inst = dyn_cast<Instruction>(constraint);
-  if (!inst)
+  if (!inst) {
+    if (perf != nullptr && perf->enabled) {
+      ++perf->gcvUnsolved;
+    }
     return PATH_unsolved;
+  }
 
   const DataLayout& DL = function->getParent()->getDataLayout();
 
@@ -42,6 +54,9 @@ PATH_info getConstraintVal(llvm::Function* function, Value* constraint,
     if (auto* CI = dyn_cast<ConstantInt>(folded)) {
       dest = CI->getZExtValue();
       printvalue(CI);
+      if (perf != nullptr && perf->enabled) {
+        ++perf->gcvSolvedFold;
+      }
       return PATH_solved;
     }
   }
@@ -52,9 +67,15 @@ PATH_info getConstraintVal(llvm::Function* function, Value* constraint,
     if (auto* CI = dyn_cast<ConstantInt>(simplified)) {
       dest = CI->getZExtValue();
       printvalue(CI);
+      if (perf != nullptr && perf->enabled) {
+        ++perf->gcvSolvedSimplify;
+      }
       return PATH_solved;
     }
   }
 
+  if (perf != nullptr && perf->enabled) {
+    ++perf->gcvUnsolved;
+  }
   return PATH_unsolved;
 }

@@ -6,6 +6,7 @@
 #include "GEPTracker.h"
 #include "InlinePolicy.hpp"
 #include "LiftDiagnostics.hpp"
+#include "LiftPerfDiag.hpp"
 #include "PathSolver.h"
 #include "RegisterManager.hpp"
 #include "ZydisDisassembler.hpp"
@@ -27,6 +28,7 @@
 #include <fstream>
 #include <sstream>
 #include <llvm/ADT/DenseMap.h>
+#include <llvm/ADT/DenseSet.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/Analysis/AliasAnalysis.h>
 #include <llvm/Analysis/DomConditionCache.h>
@@ -541,6 +543,10 @@ public:
   uint32_t maxCallInlineBudget      = 0;   // 0 = disabled (no speculative limit)
   bool liftBudgetExceeded          = false;
   uint32_t maxBasicBlockBudget     = 4096;  // 0 = disabled
+  // Cached BB count: Function::size() walks the BB list (O(n)). Calling it on
+  // every createBudgetedBasicBlock made mix PathSolver ~O(n²) (~5s of
+  // const_resolve). Keep this in sync with every BB we create on fnc.
+  uint32_t basicBlockCount         = 0;
   llvm::BasicBlock* liftAbortBlock = nullptr;
   bool bypassStackConcolicTracking = false;
   BlockRestoreMode currentBlockRestoreMode = BlockRestoreMode::Normal;
@@ -925,8 +931,9 @@ public:
   }
 
   // useless in symbolic?
-  void branch_backup(BasicBlock* bb, bool generalized = false) {
-    static_cast<Derived*>(this)->branch_backup_impl(bb, generalized);
+  void branch_backup(BasicBlock* bb, bool generalized = false,
+                     bool moveState = false) {
+    static_cast<Derived*>(this)->branch_backup_impl(bb, generalized, moveState);
   }
 
   void writeBufferQwordFromConstant(uint64_t address, llvm::ConstantInt* ci) {
@@ -1335,7 +1342,7 @@ public:
   }
   uint64_t currentVipOffset = 0;
   bool currentVipIsExact = false;
-  std::set<uint64_t> seenVipOffsets;
+  llvm::DenseSet<uint64_t> seenVipOffsets;
   // Loop backedges are recognised by edge revisit, not by node revisit. The VM
   // dispatch trampoline is shared: many different handlers jump to the same
   // native target, which is what made a target-only criterion over-generalize.
@@ -1478,7 +1485,7 @@ public:
     {
       const bool budgetCritical =
           maxBasicBlockBudget > 0 &&
-          fnc->size() > (maxBasicBlockBudget * 3u / 4u);
+          basicBlockCount > (maxBasicBlockBudget * 3u / 4u);
       if (budgetCritical &&
           currentPathSolveContext != PathSolveContext::Ret &&
           visitedAddresses.contains(addr) &&
@@ -1750,6 +1757,8 @@ public:
     os << "\n" << std::flush;
   }
 
+  void dumpPerfDiagReport(std::ostream& os) const { perfDiag.dump(os); }
+
   bool addUnvisitedAddr(BBInfo bb) {
     printvalue2(bb.block_address);
     printvalue2("added");
@@ -1944,6 +1953,8 @@ public:
   // is genuinely advancing through distinct VM handlers or churning on a few.
   llvm::DenseMap<uint64_t, uint32_t> liftAttemptCounts;
   bool liftProgressDiagEnabled = false;
+  bool vipDiagEnabled = false;
+  LiftPerfDiag perfDiag;
   LiftDiagnostics diagnostics;
   PipelineProfiler profiler;
   llvm::SimplifyQuery* cachedquery;
@@ -2024,7 +2035,7 @@ public:
   // creates an edge to created bb
   // TODO: wrapper for createbr, condbr, switch and update it there.
   BasicBlock* createBudgetedBasicBlock(const std::string& name, uint64_t diagAddr) {
-    if (maxBasicBlockBudget > 0 && fnc->size() >= maxBasicBlockBudget) {
+    if (maxBasicBlockBudget > 0 && basicBlockCount >= maxBasicBlockBudget) {
       if (!liftBudgetExceeded) {
         diagnostics.error(
             DiagCode::LiftBlockBudgetExceeded, diagAddr,
@@ -2034,12 +2045,14 @@ public:
       if (!liftAbortBlock) {
         liftAbortBlock =
             BasicBlock::Create(context, "bb_lift_budget_exceeded", fnc);
+        ++basicBlockCount;
         llvm::IRBuilder<> abortBuilder(liftAbortBlock);
         abortBuilder.CreateRet(llvm::UndefValue::get(fnc->getReturnType()));
       }
       return liftAbortBlock;
     }
 
+    ++basicBlockCount;
     return BasicBlock::Create(context, name, fnc);
   }
 
@@ -2084,7 +2097,7 @@ public:
   }
 
 
-  BasicBlock* getOrCreateBB(uint64_t addr, std::string name) {
+  BasicBlock* getOrCreateBB(uint64_t addr, const std::string& name) {
     addr = normalizeFileBackedRuntimeTargetAddress(addr);
     auto it = addrToBB.find(addr);
     if (getControlFlow() == ControlFlow::Basic) {
@@ -2154,6 +2167,7 @@ public:
 
     createFunction();
     this->bb = llvm::BasicBlock::Create(this->context, "entry", this->fnc);
+    this->basicBlockCount = 1;
 
     this->builder = std::make_unique<llvm::IRBuilder<>>(this->bb);
     // InitRegisters() is deliberately NOT called here: it writes the derived

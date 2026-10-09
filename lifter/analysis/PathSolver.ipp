@@ -25,61 +25,21 @@
 MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
     llvm::Function* function, uint64_t& dest, Value* simplifyValue) {
   auto pathSolveSample = profiler.sample("lift_path_solve");
-
-  // Clear memoization cache for value enumeration.
-  // Each solvePath invocation may have different assumptions
-  // (from different branch paths), so cached results don't carry over.
-  pv_cache.clear();
-  const uint64_t pathSolveSite = current_address - instruction.length;
-  if (currentPathSolveContext != PathSolveContext::Ret) {
-    if (auto* loadInst = dyn_cast<LoadInst>(simplifyValue)) {
-      if (loadInst->getType()->isIntegerTy()) {
-        auto* gep = dyn_cast<GetElementPtrInst>(loadInst->getPointerOperand());
-        if (gep && gep->getPointerOperand() == memoryAlloc) {
-          unsigned loadBits = loadInst->getType()->getIntegerBitWidth();
-          if (loadBits % 8 == 0) {
-            LazyValue nestedLoad([loadInst]() -> Value* { return loadInst; });
-            if (auto* resolved = solveLoad(
-                    nestedLoad, gep, static_cast<uint8_t>(loadBits))) {
-              if (liftProgressDiagEnabled && pathSolveSite == 0x1400237F9ULL) {
-                std::string resolvedText;
-                llvm::raw_string_ostream os(resolvedText);
-                resolved->print(os);
-                std::cout << "[diag] solvePath eager load current=0x1400237f9 resolved="
-                          << os.str() << "\n";
-              }
-              if (currentPathSolveContext == PathSolveContext::IndirectJump) {
-                if (auto* resolvedCI = dyn_cast<ConstantInt>(resolved)) {
-                  uint64_t normalizedResolved =
-                      normalizeRuntimeTargetAddress(resolvedCI->getZExtValue());
-                  if (!isMemPaged(normalizedResolved)) {
-                    if (liftProgressDiagEnabled && pathSolveSite == 0x1400237F9ULL) {
-                      std::cout << "[diag] solvePath eager load skipping unmapped constant=0x"
-                                << std::hex << resolvedCI->getZExtValue()
-                                << " normalized=0x" << normalizedResolved << std::dec
-                                << "\n";
-                    }
-                  } else {
-                    simplifyValue = resolved;
-                  }
-                } else {
-                  simplifyValue = resolved;
-                }
-              } else {
-                simplifyValue = resolved;
-              }
-            } else if (liftProgressDiagEnabled && pathSolveSite == 0x1400237F9ULL) {
-              std::string offsetText;
-              llvm::raw_string_ostream os(offsetText);
-              gep->getOperand(1)->print(os);
-              std::cout << "[diag] solvePath eager load current=0x1400237f9 returned-null offset="
-                        << os.str() << "\n";
-            }
-          }
-        }
-      }
-    }
+  const bool perf = perfDiag.enabled;
+  LiftPerfDiag::ScopedTimer solveTimer(perf ? &perfDiag : nullptr,
+                                       perf ? &perfDiag.solvePath : nullptr);
+  if (perf) {
+    perfDiag.noteSolvePathContext(
+        static_cast<unsigned>(currentPathSolveContext));
   }
+  auto finishSolvePath = [&](const char* outcome, PATH_info rv) -> PATH_info {
+    if (perf) {
+      perfDiag.noteSolvePathOutcome(outcome);
+    }
+    return rv;
+  };
+
+  const uint64_t pathSolveSite = current_address - instruction.length;
   auto normalizeTargetAddress = [&](uint64_t target) -> uint64_t {
     return normalizeRuntimeTargetAddress(target);
   };
@@ -90,12 +50,14 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
     bool generalizedBackup;
   };
 
-  auto importBlocks = std::make_shared<std::unordered_map<uint64_t, BasicBlock*>>();
-  auto resolveImportTarget = [&, this, importBlocks](uint64_t target) -> BasicBlock* {
+  // Local cache is enough: all import-resolution lambdas live in this call.
+  // Avoid make_shared on the 42k-call const fast path.
+  std::unordered_map<uint64_t, BasicBlock*> importBlocks;
+  auto resolveImportTarget = [&](uint64_t target) -> BasicBlock* {
     auto importIt = importMap.find(target);
     if (importIt == importMap.end()) return nullptr;
-    auto cached = importBlocks->find(target);
-    if (cached != importBlocks->end()) return cached->second;
+    auto cached = importBlocks.find(target);
+    if (cached != importBlocks.end()) return cached->second;
     const std::string& importName = importIt->second;
     BasicBlock* importBB = BasicBlock::Create(
         builder->getContext(), "bb_import_" + importName, fnc);
@@ -109,7 +71,7 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
         DiagCode::CallOutlinedImportThunk,
         current_address - instruction.length,
         "Resolved indirect-transfer import: " + importName);
-    (*importBlocks)[target] = importBB;
+    importBlocks[target] = importBB;
     return importBB;
   };
 
@@ -156,7 +118,8 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
       seenVipOffsets.insert(backedgeKey);
       vipConfirmsBackedge = vipRepeat && currentVipIsExact;
     }
-    if (backwardVisitedTarget) {
+    if (backwardVisitedTarget && vipDiagEnabled) {
+      // Unconditional cout+flush here previously dominated PathSolver time.
       std::cout << "[vip] backward target=0x" << std::hex << target
                 << " cur=0x" << blockInfo.block_address << " vip=0x"
                 << currentVipOffset << std::dec
@@ -208,12 +171,107 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
     return {getOrCreateBB(target, name), false, false};
   };
 
-  auto backupQueuedTarget = [&](BasicBlock* targetBlock, bool generalizedBackup) {
+  auto backupQueuedTarget = [&](BasicBlock* targetBlock, bool generalizedBackup,
+                                bool moveState = false) {
     if (targetBlock == liftAbortBlock) {
       return;
     }
-    branch_backup(targetBlock, generalizedBackup);
+    branch_backup(targetBlock, generalizedBackup, moveState);
   };
+
+  // Const fast path: 99.99% of mix solvePath calls. Skip pv_cache clear,
+  // eager-load, and dest-dag dump — they only matter for symbolic targets.
+  if (auto* constInt = dyn_cast<ConstantInt>(simplifyValue)) {
+    dest = normalizeTargetAddress(constInt->getZExtValue());
+    run = 0;
+    ResolvedTargetBlock resolved;
+    {
+      LiftPerfDiag::ScopedTimer t(perf ? &perfDiag : nullptr,
+                                  perf ? &perfDiag.solvePathConstResolve
+                                       : nullptr);
+      resolved = resolveTargetBlock(dest, "bb_solved_const");
+    }
+    {
+      LiftPerfDiag::ScopedTimer t(perf ? &perfDiag : nullptr,
+                                  perf ? &perfDiag.solvePathConstBr : nullptr);
+      builder->CreateBr(resolved.block);
+    }
+    if (!resolved.reusedBackedge) {
+      blockInfo = BBInfo(dest, resolved.block);
+      printvalue2("pushing block");
+      {
+        LiftPerfDiag::ScopedTimer t(perf ? &perfDiag : nullptr,
+                                    perf ? &perfDiag.solvePathConstBackup
+                                         : nullptr);
+        // Single successor + run=0: current path state is abandoned after
+        // return, so move into the queued backup instead of deep-copy.
+        backupQueuedTarget(blockInfo.block, resolved.generalizedBackup,
+                           /*moveState=*/true);
+      }
+      if (perf) {
+        ++perfDiag.constBackupTaken;
+      }
+      unvisitedBlocks.push_back(blockInfo);
+    } else if (perf) {
+      ++perfDiag.constBackupSkipped;
+    }
+    return finishSolvePath("const", PATH_solved);
+  }
+
+  // Symbolic / load path below.
+  // Clear memoization cache for value enumeration.
+  // Each solvePath invocation may have different assumptions
+  // (from different branch paths), so cached results don't carry over.
+  pv_cache.clear();
+  if (currentPathSolveContext != PathSolveContext::Ret) {
+    if (auto* loadInst = dyn_cast<LoadInst>(simplifyValue)) {
+      if (loadInst->getType()->isIntegerTy()) {
+        auto* gep = dyn_cast<GetElementPtrInst>(loadInst->getPointerOperand());
+        if (gep && gep->getPointerOperand() == memoryAlloc) {
+          unsigned loadBits = loadInst->getType()->getIntegerBitWidth();
+          if (loadBits % 8 == 0) {
+            LazyValue nestedLoad([loadInst]() -> Value* { return loadInst; });
+            if (auto* resolved = solveLoad(
+                    nestedLoad, gep, static_cast<uint8_t>(loadBits))) {
+              if (liftProgressDiagEnabled && pathSolveSite == 0x1400237F9ULL) {
+                std::string resolvedText;
+                llvm::raw_string_ostream os(resolvedText);
+                resolved->print(os);
+                std::cout << "[diag] solvePath eager load current=0x1400237f9 resolved="
+                          << os.str() << "\n";
+              }
+              if (currentPathSolveContext == PathSolveContext::IndirectJump) {
+                if (auto* resolvedCI = dyn_cast<ConstantInt>(resolved)) {
+                  uint64_t normalizedResolved =
+                      normalizeRuntimeTargetAddress(resolvedCI->getZExtValue());
+                  if (!isMemPaged(normalizedResolved)) {
+                    if (liftProgressDiagEnabled && pathSolveSite == 0x1400237F9ULL) {
+                      std::cout << "[diag] solvePath eager load skipping unmapped constant=0x"
+                                << std::hex << resolvedCI->getZExtValue()
+                                << " normalized=0x" << normalizedResolved << std::dec
+                                << "\n";
+                    }
+                  } else {
+                    simplifyValue = resolved;
+                  }
+                } else {
+                  simplifyValue = resolved;
+                }
+              } else {
+                simplifyValue = resolved;
+              }
+            } else if (liftProgressDiagEnabled && pathSolveSite == 0x1400237F9ULL) {
+              std::string offsetText;
+              llvm::raw_string_ostream os(offsetText);
+              gep->getOperand(1)->print(os);
+              std::cout << "[diag] solvePath eager load current=0x1400237f9 returned-null offset="
+                        << os.str() << "\n";
+            }
+          }
+        }
+      }
+    }
+  }
 
   // do static polymorphism here
 
@@ -277,8 +335,8 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
               << std::dec << " value=" << formatPathValue(simplifyValue) << "\n";
   }
 
-  if (llvm::ConstantInt* constInt =
-          dyn_cast<llvm::ConstantInt>(simplifyValue)) {
+  // Eager-load may have folded to a constant after the early check.
+  if (auto* constInt = dyn_cast<ConstantInt>(simplifyValue)) {
     dest = normalizeTargetAddress(constInt->getZExtValue());
     result = PATH_solved;
     run = 0;
@@ -294,10 +352,17 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
       unvisitedBlocks.push_back(blockInfo);
     }
 
-    return result;
+    return finishSolvePath("const", result);
   }
 
-  if (PATH_info solved = getConstraintVal(function, simplifyValue, dest)) {
+  PATH_info gcvResult = PATH_unsolved;
+  {
+    LiftPerfDiag::ScopedTimer gcvTimer(perf ? &perfDiag : nullptr,
+                                       perf ? &perfDiag.solvePathGcv : nullptr);
+    gcvResult = getConstraintVal(function, simplifyValue, dest,
+                                 perf ? &perfDiag : nullptr);
+  }
+  if (PATH_info solved = gcvResult) {
       dest = normalizeTargetAddress(dest);
     if (solved == PATH_solved) {
       run = 0;
@@ -315,7 +380,7 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
         unvisitedBlocks.push_back(blockInfo);
       }
 
-      return solved;
+      return finishSolvePath("gcv", solved);
     }
   }
 
@@ -493,7 +558,7 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
         unvisitedBlocks.push_back(blockInfo);
       }
       run = 0;
-      return PATH_solved;
+      return finishSolvePath("pre_cpv", PATH_solved);
     };
 
     if (virtualizedJcc && isArgumentDerived(topSel->getCondition()) &&
@@ -595,7 +660,18 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
   // unsolved
   printvalue(simplifyValue);
   run = 0;
-  auto pvset = computePossibleValues(simplifyValue);
+  if (perf) {
+    perfDiag.noteSolvePathSite(pathSolveSite);
+  }
+  std::set<APInt, APIntComparator> pvset;
+  {
+    LiftPerfDiag::ScopedTimer cpvTimer(perf ? &perfDiag : nullptr,
+                                       perf ? &perfDiag.solvePathCpv : nullptr);
+    pvset = computePossibleValues(simplifyValue);
+  }
+  if (perf) {
+    perfDiag.noteCpvResult(pvset.size());
+  }
   if (currentPathSolveContext == PathSolveContext::Ret && pvset.size() > 2) {
     pvset.clear();
   }
@@ -1255,7 +1331,7 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
       backupQueuedTarget(blockInfo.block, resolved.generalizedBackup);
       unvisitedBlocks.push_back(blockInfo);
     }
-    return result;
+    return finishSolvePath("cpv_single", result);
   }
   if (pv.size() == 2) {
     uint64_t rawFirstTarget = pv[0].getZExtValue();
@@ -1305,7 +1381,7 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
             backupQueuedTarget(blockInfo.block, resolved.generalizedBackup);
             unvisitedBlocks.push_back(blockInfo);
           }
-          return result;
+          return finishSolvePath("cpv_filtered_sel", result);
         }
         dest = firstViable ? filteredFirstTarget : filteredSecondTarget;
         result = PATH_solved;
@@ -1318,7 +1394,7 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
           backupQueuedTarget(blockInfo.block, resolved.generalizedBackup);
           unvisitedBlocks.push_back(blockInfo);
         }
-        return result;
+        return finishSolvePath("cpv_filtered", result);
       }
     }
 
@@ -1444,7 +1520,7 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
     result = PATH_solved;
     dest = firstTarget;
     dumpRetDestDag("twoway", dest);
-    return result;
+    return finishSolvePath("cpv_dual", result);
   }
 
   if (pv.size() > 2) {
@@ -1456,7 +1532,7 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
         createBudgetedBasicBlock("bb_switch_default_unresolved", current_address);
     if (bb_default_unresolved == liftAbortBlock) {
       builder->CreateRet(UndefValue::get(function->getReturnType()));
-      return PATH_unsolved;
+      return finishSolvePath("cpv_multi_abort", PATH_unsolved);
     }
     DTU->applyUpdates(
         {{DominatorTree::Insert, this->blockInfo.block, bb_default_unresolved}});
@@ -1548,7 +1624,11 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
     // valid terminator; do NOT use unreachable, which would let LLVM erase
     // this reachable-but-unresolved path.
     builder->CreateRet(UndefValue::get(function->getReturnType()));
+    return finishSolvePath("cpv_empty", result);
   }
 
-  return result;
+  if (result == PATH_multi_solved) {
+    return finishSolvePath("cpv_multi", result);
+  }
+  return finishSolvePath("other", result);
 }

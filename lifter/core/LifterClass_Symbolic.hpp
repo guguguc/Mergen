@@ -139,9 +139,10 @@ public:
     return std::nullopt;
   }
 
-  void branch_backup_impl(BasicBlock* bb, bool generalized) {
-    //
-    return;
+  void branch_backup_impl(BasicBlock* bb, bool generalized, bool moveState = false) {
+    (void)bb;
+    (void)generalized;
+    (void)moveState;
   }
 
   void load_backup_impl(BasicBlock* bb) {

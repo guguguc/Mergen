@@ -100,4 +100,5 @@ inline void emitLiftOutputs(lifterConcolic<>* lifter, double elapsedMilliseconds
     }
     lifter->diagnostics.printSummary();
   }
+  lifter->dumpPerfDiagReport(std::cout);
 }

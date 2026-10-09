@@ -191,17 +191,22 @@ public:
     backup_point(backup_point&& other) noexcept
         : vec(std::move(other.vec)), vecflag(std::move(other.vecflag)),
           buffer(std::move(other.buffer)), cache(std::move(other.cache)),
-          assumptions(other.assumptions), ct(other.ct),
+          assumptions(std::move(other.assumptions)), ct(other.ct),
           sourceBlock(other.sourceBlock) {}
 
+    // By-value params: lvalue args copy once into the parameter, rvalue args
+    // move. Members always take ownership via move (avoids a second DenseMap
+    // deep-copy that previously dominated solvePath const-path time).
     backup_point(std::array<llvm::WeakTrackingVH, REGISTER_COUNT> vec,
                  std::array<llvm::WeakTrackingVH, FLAGS_END> vecflag,
                  llvm::DenseMap<uint64_t, ValueByteReference> buffer,
                  InstructionCache cc,
                  llvm::DenseMap<llvm::Instruction*, llvm::APInt> assumptions,
                  uint64_t ct, llvm::BasicBlock* sourceBlock)
-        : vec(vec), vecflag(vecflag), buffer(buffer), cache(cc),
-          assumptions(assumptions), ct(ct), sourceBlock(sourceBlock){};
+        : vec(std::move(vec)), vecflag(std::move(vecflag)),
+          buffer(std::move(buffer)), cache(std::move(cc)),
+          assumptions(std::move(assumptions)), ct(ct),
+          sourceBlock(sourceBlock) {}
     backup_point() = default;
     backup_point(const backup_point&) = default;
     backup_point& operator=(const backup_point&) = default;
@@ -736,13 +741,25 @@ public:
     this->counter = snapshot.ct;
   }
 
-  void branch_backup_impl(BasicBlock* bb, bool generalized) {
+  void branch_backup_impl(BasicBlock* bb, bool generalized,
+                          bool moveState = false) {
     printvalue2("backing up");
     printvalue2(this->counter);
 
-    auto snapshot = backup_point(vec, vecflag, this->buffer, this->cache,
-                                 this->assumptions, this->counter,
-                                 this->builder->GetInsertBlock());
+    // moveState: caller is abandoning the current path (run=0, single
+    // successor). Steal buffer/cache/assumptions instead of deep-copying —
+    // mix const-path: ~46k backups × DenseMap copy was ~3s.
+    // Never move into generalized backups: that path may store the snapshot
+    // twice (BBbackup + backedge vector).
+    const bool doMove = moveState && !generalized;
+    backup_point snapshot =
+        doMove ? backup_point(std::move(vec), std::move(vecflag),
+                              std::move(this->buffer), std::move(this->cache),
+                              std::move(this->assumptions), this->counter,
+                              this->builder->GetInsertBlock())
+               : backup_point(vec, vecflag, this->buffer, this->cache,
+                              this->assumptions, this->counter,
+                              this->builder->GetInsertBlock());
     if (generalized) {
       if (!BBbackup.contains(bb)) {
         BBbackup[bb] = snapshot;

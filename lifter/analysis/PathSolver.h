@@ -3,6 +3,8 @@
 #include <llvm/IR/Function.h>
 #include <llvm/IR/Value.h>
 
+struct LiftPerfDiag;
+
 enum PATH_info {
   PATH_unsolved = 0,
   PATH_solved = 1,
@@ -10,7 +12,7 @@ enum PATH_info {
 };
 
 PATH_info getConstraintVal(llvm::Function* function, llvm::Value* constraint,
-                           uint64_t& dest);
+                           uint64_t& dest, LiftPerfDiag* perf = nullptr);
 
 
 PATH_info solvePath(llvm::Function* function, uint64_t& dest,

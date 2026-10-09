@@ -1,5 +1,6 @@
 #pragma once
 
+#include "LiftPerfDiag.hpp"
 #include "MemoryPolicySetup.hpp"
 #include "RuntimeImageContext.hpp"
 #include "Utils.h"
@@ -27,6 +28,10 @@ createConfiguredLifterForRuntime(uint8_t* fileBase, size_t fileSize,
     lifter->liftProgressDiagEnabled =
         value == "1" || value == "true" || value == "TRUE";
   }
+  if (const char* env = std::getenv("MERGEN_DIAG_VIP")) {
+    lifter->vipDiagEnabled = env[0] != '\0' && env[0] != '0';
+  }
+  lifter->perfDiag.enabled = LiftPerfDiag::envEnabled();
   if (const char* env = std::getenv("MERGEN_MAX_BLOCK_BUDGET")) {
     char* end = nullptr;
     unsigned long parsed = std::strtoul(env, &end, 10);

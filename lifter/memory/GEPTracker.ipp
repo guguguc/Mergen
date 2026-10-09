@@ -13,6 +13,7 @@
 #include <llvm/IR/Dominators.h>
 #include <llvm/TargetParser/Triple.h>
 #include <llvm/Transforms/Utils/SCCPSolver.h>
+#include <chrono>
 #include <magic_enum/magic_enum.hpp>
 
 using namespace llvm;
@@ -1332,8 +1333,30 @@ calculatePossibleValues(std::set<APInt, APIntComparator> v1,
 
 MERGEN_LIFTER_DEFINITION_TEMPLATES(pvalueset)::computePossibleValues(
     Value* V, uint8_t Depth) {
+  const bool perf = perfDiag.enabled;
+  const bool perfTop = perf && Depth == 0;
+  const auto cpvStart = std::chrono::high_resolution_clock::now();
+  struct CpvTopScope {
+    LiftPerfDiag* diag;
+    bool active;
+    std::chrono::high_resolution_clock::time_point start;
+    ~CpvTopScope() {
+      if (!active || diag == nullptr) {
+        return;
+      }
+      const double ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::high_resolution_clock::now() - start)
+                              .count();
+      diag->noteCpvElapsed(ms);
+    }
+  } cpvTopScope{perfTop ? &perfDiag : nullptr, perfTop, cpvStart};
+  LiftPerfDiag::ScopedTimer cpvTimer(perf ? &perfDiag : nullptr,
+                                     perf ? &perfDiag.cpvTotal : nullptr);
   printvalue2(Depth);
   if (Depth > 64) {
+    if (perf) {
+      ++perfDiag.cpvDepthCut;
+    }
     debugging::doIfDebug([&]() {
       std::string Filename = "output_depth_exceeded.ll";
       std::error_code EC;
@@ -1347,8 +1370,17 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(pvalueset)::computePossibleValues(
   // solvePath invocation. The cache is valid because assumptions
   // don't change within a single path resolution.
   auto cache_it = pv_cache.find(V);
-  if (cache_it != pv_cache.end())
+  if (cache_it != pv_cache.end()) {
+    if (perf) {
+      ++perfDiag.cpvCacheHits;
+    }
     return cache_it->second;
+  }
+  if (perf) {
+    if (auto* inst = dyn_cast<Instruction>(V)) {
+      perfDiag.noteCpvRootOpcode(inst->getOpcode());
+    }
+  }
 
   std::set<APInt, APIntComparator> res;
   printvalue(V);
