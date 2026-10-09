@@ -119,10 +119,23 @@ private:
 
   static constexpr unsigned kCowDeltaLayers = 32;
 
-  std::array<std::shared_ptr<Layer>, 100> opcodeCaches;
-  std::array<CacheMap, 100> hot;
-  std::array<std::shared_ptr<CacheMap>, 100> index;
-  std::array<std::shared_ptr<Layer>, 100> indexAt;
+  // Heavy maps live behind a unique_ptr so backup move/steal is pointer-sized.
+  // Lookup/insert/COW behavior is unchanged; empty (nullptr) == empty cache.
+  struct Impl {
+    std::array<std::shared_ptr<Layer>, 100> opcodeCaches;
+    std::array<CacheMap, 100> hot;
+    std::array<std::shared_ptr<CacheMap>, 100> index;
+    std::array<std::shared_ptr<Layer>, 100> indexAt;
+  };
+
+  std::unique_ptr<Impl> impl;
+
+  Impl& ensure() {
+    if (!impl) {
+      impl = std::make_unique<Impl>();
+    }
+    return *impl;
+  }
 
   static void mergeInto(CacheMap& dest, const CacheMap& src) {
     for (const auto& kv : src) {
@@ -131,46 +144,54 @@ private:
   }
 
   unsigned deltaDepth(uint8_t opcode) const {
+    const Impl& s = *impl;
     unsigned depth = 0;
-    Layer* stop = indexAt[opcode].get();
-    for (Layer* p = opcodeCaches[opcode].get(); p && p != stop; p = p->prev.get()) {
+    Layer* stop = s.indexAt[opcode].get();
+    for (Layer* p = s.opcodeCaches[opcode].get(); p && p != stop;
+         p = p->prev.get()) {
       ++depth;
     }
     return depth;
   }
 
   void cowIndex(uint8_t opcode) {
+    Impl& s = *impl;
     llvm::SmallVector<Layer*, 16> newer;
-    Layer* stop = indexAt[opcode].get();
-    for (Layer* p = opcodeCaches[opcode].get(); p && p != stop; p = p->prev.get()) {
+    Layer* stop = s.indexAt[opcode].get();
+    for (Layer* p = s.opcodeCaches[opcode].get(); p && p != stop;
+         p = p->prev.get()) {
       newer.push_back(p);
     }
-    auto next = index[opcode] ? std::make_shared<CacheMap>(*index[opcode])
-                              : std::make_shared<CacheMap>();
+    auto next = s.index[opcode] ? std::make_shared<CacheMap>(*s.index[opcode])
+                                : std::make_shared<CacheMap>();
     for (int i = static_cast<int>(newer.size()) - 1; i >= 0; --i) {
       mergeInto(*next, newer[i]->map);
     }
-    index[opcode] = std::move(next);
-    indexAt[opcode] = opcodeCaches[opcode];
+    s.index[opcode] = std::move(next);
+    s.indexAt[opcode] = s.opcodeCaches[opcode];
   }
 
   void publish() {
-    for (unsigned op = 0; op < opcodeCaches.size(); ++op) {
-      if (hot[op].empty()) {
+    if (!impl) {
+      return;
+    }
+    Impl& s = *impl;
+    for (unsigned op = 0; op < s.opcodeCaches.size(); ++op) {
+      if (s.hot[op].empty()) {
         continue;
       }
       auto layer = std::make_shared<Layer>();
-      layer->map = std::move(hot[op]);
-      layer->prev = opcodeCaches[op];
-      if (!index[op]) {
-        index[op] = std::make_shared<CacheMap>(layer->map);
-        indexAt[op] = layer;
-      } else if (index[op].use_count() == 1) {
-        mergeInto(*index[op], layer->map);
-        indexAt[op] = layer;
+      layer->map = std::move(s.hot[op]);
+      layer->prev = s.opcodeCaches[op];
+      if (!s.index[op]) {
+        s.index[op] = std::make_shared<CacheMap>(layer->map);
+        s.indexAt[op] = layer;
+      } else if (s.index[op].use_count() == 1) {
+        mergeInto(*s.index[op], layer->map);
+        s.indexAt[op] = layer;
       }
-      opcodeCaches[op] = std::move(layer);
-      if (index[op] && index[op].use_count() > 1 &&
+      s.opcodeCaches[op] = std::move(layer);
+      if (s.index[op] && s.index[op].use_count() > 1 &&
           deltaDepth(static_cast<uint8_t>(op)) >= kCowDeltaLayers) {
         cowIndex(static_cast<uint8_t>(op));
       }
@@ -181,23 +202,35 @@ public:
   InstructionCache() = default;
 
   InstructionCache(const InstructionCache& other) {
+    if (!other.impl) {
+      return;
+    }
     const_cast<InstructionCache&>(other).publish();
-    opcodeCaches = other.opcodeCaches;
-    index = other.index;
-    indexAt = other.indexAt;
+    impl = std::make_unique<Impl>();
+    impl->opcodeCaches = other.impl->opcodeCaches;
+    impl->index = other.impl->index;
+    impl->indexAt = other.impl->indexAt;
   }
 
   InstructionCache(InstructionCache&& other) noexcept = default;
 
   InstructionCache& operator=(const InstructionCache& other) {
-    if (this != &other) {
-      const_cast<InstructionCache&>(other).publish();
-      opcodeCaches = other.opcodeCaches;
-      index = other.index;
-      indexAt = other.indexAt;
-      for (auto& h : hot) {
-        h.clear();
-      }
+    if (this == &other) {
+      return *this;
+    }
+    if (!other.impl) {
+      impl.reset();
+      return *this;
+    }
+    const_cast<InstructionCache&>(other).publish();
+    if (!impl) {
+      impl = std::make_unique<Impl>();
+    }
+    impl->opcodeCaches = other.impl->opcodeCaches;
+    impl->index = other.impl->index;
+    impl->indexAt = other.impl->indexAt;
+    for (auto& h : impl->hot) {
+      h.clear();
     }
     return *this;
   }
@@ -205,29 +238,34 @@ public:
   InstructionCache& operator=(InstructionCache&& other) noexcept = default;
 
   void insert(uint8_t opcode, const InstructionKey& key, Value* value) {
-    hot[opcode][key] = value;
-    if (index[opcode] && index[opcode].use_count() == 1) {
-      (*index[opcode])[key] = value;
+    Impl& s = ensure();
+    s.hot[opcode][key] = value;
+    if (s.index[opcode] && s.index[opcode].use_count() == 1) {
+      (*s.index[opcode])[key] = value;
     }
   }
 
   Value* lookup(uint8_t opcode, const InstructionKey& key) const {
-    const auto& hotMap = hot[opcode];
+    if (!impl) {
+      return nullptr;
+    }
+    const Impl& s = *impl;
+    const auto& hotMap = s.hot[opcode];
     auto it = hotMap.find(key);
     if (it != hotMap.end()) {
       return it->second;
     }
-    Layer* stop = indexAt[opcode].get();
-    for (Layer* p = opcodeCaches[opcode].get(); p && p != stop;
+    Layer* stop = s.indexAt[opcode].get();
+    for (Layer* p = s.opcodeCaches[opcode].get(); p && p != stop;
          p = p->prev.get()) {
       auto lit = p->map.find(key);
       if (lit != p->map.end()) {
         return lit->second;
       }
     }
-    if (index[opcode]) {
-      auto iit = index[opcode]->find(key);
-      if (iit != index[opcode]->end()) {
+    if (s.index[opcode]) {
+      auto iit = s.index[opcode]->find(key);
+      if (iit != s.index[opcode]->end()) {
         return iit->second;
       }
     }
@@ -633,7 +671,10 @@ public:
       printvalue2(offset);
       printvalue2(*(uint8_t*)offset);
 
-      runDisassembler((void*)offset, size);
+      {
+        LiftPerfDiag::ScopedTimer decodeTimer(&perfDiag, &perfDiag.decode);
+        runDisassembler((void*)offset, size);
+      }
 
       if (const char* insnPath = std::getenv("MERGEN_INSN_STREAM_FILE")) {
         static std::ofstream* insnStream = nullptr;

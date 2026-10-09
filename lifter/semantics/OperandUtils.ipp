@@ -768,13 +768,17 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::folderBinOps(
   // keeps the identity of the bytecode load that produced it - that load is
   // the VIP. Only values that feed the transfer ever carry it, so mutated
   // junk loads (intel.cc:16039) never contribute.
-  if (result) {
-    auto it = loadProvenance.find(LHS);
-    if (it == loadProvenance.end()) {
-      it = loadProvenance.find(RHS);
-    }
-    if (it != loadProvenance.end()) {
-      loadProvenance[result] = it->second;
+  {
+    LiftPerfDiag::ScopedTimer provenanceTimer(
+        &perfDiag, &perfDiag.folderProvenance);
+    if (result) {
+      auto it = loadProvenance.find(LHS);
+      if (it == loadProvenance.end()) {
+        it = loadProvenance.find(RHS);
+      }
+      if (it != loadProvenance.end()) {
+        loadProvenance[result] = it->second;
+      }
     }
   }
   return result;
@@ -783,6 +787,16 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::folderBinOps(
 MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::folderBinOpsImpl(
     Value* LHS, Value* RHS, const Twine& Name, Instruction::BinaryOps opcode) {
   auto folderSample = profiler.sample("sem_folder_binops");
+  const bool perf = perfDiag.enabled;
+  if (perf) {
+    ++perfDiag.folderCalls;
+  }
+  auto earlyExit = [&](Value* v) -> Value* {
+    if (perf) {
+      ++perfDiag.folderExitEarly;
+    }
+    return v;
+  };
   if (LHS->getType() != RHS->getType()) {
     // A mismatch here means the fold below combines constants of different bit
     // widths and takes the result type from the left operand. printvalue* write
@@ -809,10 +823,11 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::folderBinOpsImpl(
     switch (opcode) {
     case Instruction::Xor:
     case Instruction::Sub:
-      return builder->getIntN(LHS->getType()->getIntegerBitWidth(), 0);
+      return earlyExit(
+          builder->getIntN(LHS->getType()->getIntegerBitWidth(), 0));
     case Instruction::And:
     case Instruction::Or:
-      return LHS;
+      return earlyExit(LHS);
     default:
       break;
     }
@@ -824,15 +839,20 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::folderBinOpsImpl(
       const llvm::APInt& rhsValue = RHSConst->getValue();
       switch (opcode) {
       case Instruction::Add:
-        return ConstantInt::get(LHSConst->getType(), lhsValue + rhsValue);
+        return earlyExit(
+            ConstantInt::get(LHSConst->getType(), lhsValue + rhsValue));
       case Instruction::Sub:
-        return ConstantInt::get(LHSConst->getType(), lhsValue - rhsValue);
+        return earlyExit(
+            ConstantInt::get(LHSConst->getType(), lhsValue - rhsValue));
       case Instruction::And:
-        return ConstantInt::get(LHSConst->getType(), lhsValue & rhsValue);
+        return earlyExit(
+            ConstantInt::get(LHSConst->getType(), lhsValue & rhsValue));
       case Instruction::Or:
-        return ConstantInt::get(LHSConst->getType(), lhsValue | rhsValue);
+        return earlyExit(
+            ConstantInt::get(LHSConst->getType(), lhsValue | rhsValue));
       case Instruction::Xor:
-        return ConstantInt::get(LHSConst->getType(), lhsValue ^ rhsValue);
+        return earlyExit(
+            ConstantInt::get(LHSConst->getType(), lhsValue ^ rhsValue));
       default:
         break;
       }
@@ -851,9 +871,10 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::folderBinOpsImpl(
 
     if (ConstantInt* RHSConst = dyn_cast<ConstantInt>(RHS)) {
       if (RHSConst->isZero())
-        return LHS;
+        return earlyExit(LHS);
       if (RHSConst->getZExtValue() >= LHS->getType()->getIntegerBitWidth()) {
-        return builder->getIntN(LHS->getType()->getIntegerBitWidth(), 0);
+        return earlyExit(
+            builder->getIntN(LHS->getType()->getIntegerBitWidth(), 0));
       }
     }
     [[fallthrough]];
@@ -862,36 +883,36 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::folderBinOpsImpl(
 
     if (ConstantInt* LHSConst = dyn_cast<ConstantInt>(LHS)) {
       if (LHSConst->isZero())
-        return LHS;
+        return earlyExit(LHS);
     }
     break;
   }
   case Instruction::Xor: { // x ^ 0 = x ; ~~x = x
     if (ConstantInt* LHSConst = dyn_cast<ConstantInt>(LHS)) {
       if (LHSConst->isZero())
-        return RHS;
+        return earlyExit(RHS);
     }
     if (ConstantInt* RHSConst = dyn_cast<ConstantInt>(RHS)) {
       if (RHSConst->isZero())
-        return LHS;
+        return earlyExit(LHS);
     }
     Value* X = nullptr;
     if (match(RHS, m_SpecificInt(-1)) && match(LHS, m_Not(m_Value(X))))
-      return X;
+      return earlyExit(X);
     if (match(LHS, m_SpecificInt(-1)) && match(RHS, m_Not(m_Value(X))))
-      return X;
+      return earlyExit(X);
     break;
   }
   case Instruction::Add: { // x + 0 = x , 0 + x = 0
 
     if (ConstantInt* LHSConst = dyn_cast<ConstantInt>(LHS)) {
       if (LHSConst->isZero())
-        return RHS;
+        return earlyExit(RHS);
     }
 
     if (ConstantInt* RHSConst = dyn_cast<ConstantInt>(RHS)) {
       if (RHSConst->isZero())
-        return LHS;
+        return earlyExit(LHS);
     }
 
     break;
@@ -900,43 +921,51 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::folderBinOpsImpl(
 
     if (ConstantInt* RHSConst = dyn_cast<ConstantInt>(RHS)) {
       if (RHSConst->isZero())
-        return LHS;
+        return earlyExit(LHS);
     }
     break;
   }
   case Instruction::Or: {
     if (ConstantInt* LHSConst = dyn_cast<ConstantInt>(LHS)) {
       if (LHSConst->isZero())
-        return RHS;
+        return earlyExit(RHS);
       if (LHSConst->isMinusOne())
-        return LHS;
+        return earlyExit(LHS);
     }
     if (ConstantInt* RHSConst = dyn_cast<ConstantInt>(RHS)) {
       if (RHSConst->isZero())
-        return LHS;
+        return earlyExit(LHS);
       if (RHSConst->isMinusOne())
-        return RHS;
+        return earlyExit(RHS);
     }
     break;
   }
   case Instruction::And: {
     // ~~X & Y -> X & Y (VMP NAND masks often arrive double-complemented).
     Value* peeled = nullptr;
-    if (match(LHS, m_Not(m_Not(m_Value(peeled)))))
+    if (match(LHS, m_Not(m_Not(m_Value(peeled))))) {
+      if (perf) {
+        --perfDiag.folderCalls;
+      }
       return folderBinOps(peeled, RHS, Name, opcode);
-    if (match(RHS, m_Not(m_Not(m_Value(peeled)))))
+    }
+    if (match(RHS, m_Not(m_Not(m_Value(peeled))))) {
+      if (perf) {
+        --perfDiag.folderCalls;
+      }
       return folderBinOps(LHS, peeled, Name, opcode);
+    }
     if (ConstantInt* LHSConst = dyn_cast<ConstantInt>(LHS)) {
       if (LHSConst->isZero())
-        return builder->getIntN(LHSConst->getBitWidth(), 0);
+        return earlyExit(builder->getIntN(LHSConst->getBitWidth(), 0));
       if (LHSConst->isMinusOne())
-        return RHS;
+        return earlyExit(RHS);
     }
     if (ConstantInt* RHSConst = dyn_cast<ConstantInt>(RHS)) {
       if (RHSConst->isZero())
-        return builder->getIntN(RHSConst->getBitWidth(), 0);
+        return earlyExit(builder->getIntN(RHSConst->getBitWidth(), 0));
       if (RHSConst->isMinusOne())
-        return LHS;
+        return earlyExit(LHS);
     }
     break;
   }
@@ -945,11 +974,22 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::folderBinOpsImpl(
   }
   }
   // this part analyses if we can simplify the instruction
-  Value* inst;
-  inst = doPatternMatching(opcode, LHS, RHS);
-
-  if (!inst)
+  Value* inst = nullptr;
+  {
+    LiftPerfDiag::ScopedTimer patternTimer(&perfDiag, &perfDiag.folderPattern);
+    inst = doPatternMatching(opcode, LHS, RHS);
+  }
+  if (inst) {
+    if (perf) {
+      ++perfDiag.folderPatternHit;
+    }
+  } else {
+    LiftPerfDiag::ScopedTimer createTimer(&perfDiag, &perfDiag.folderCreate);
     inst = createInstruction(opcode, LHS, RHS, nullptr, Name);
+    if (perf) {
+      ++perfDiag.folderCreateUsed;
+    }
+  }
 
   // knownbits is recursive, and goes back 5 instructions, ideally it would be
   // not recursive and store the info for all values
@@ -957,13 +997,23 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::folderBinOpsImpl(
 
   // we can just swap analyzeValueKnownBits with something else later down the
   // road
-  auto LHSKB = analyzeValueKnownBits(LHS, dyn_cast<Instruction>(inst));
-  auto RHSKB = analyzeValueKnownBits(RHS, dyn_cast<Instruction>(inst));
+  {
+    LiftPerfDiag::ScopedTimer knownBitsTimer(&perfDiag,
+                                             &perfDiag.folderKnownBits);
+    auto LHSKB = analyzeValueKnownBits(LHS, dyn_cast<Instruction>(inst));
+    auto RHSKB = analyzeValueKnownBits(RHS, dyn_cast<Instruction>(inst));
 
-  auto computedBits = computeKnownBitsFromOperation(LHSKB, RHSKB, opcode);
-  if (computedBits.isConstant() && !computedBits.hasConflict()) {
-    return builder->getIntN(LHS->getType()->getIntegerBitWidth(),
-                            computedBits.getConstant().getZExtValue());
+    auto computedBits = computeKnownBitsFromOperation(LHSKB, RHSKB, opcode);
+    if (computedBits.isConstant() && !computedBits.hasConflict()) {
+      if (perf) {
+        ++perfDiag.folderExitKnownConst;
+      }
+      return builder->getIntN(LHS->getType()->getIntegerBitWidth(),
+                              computedBits.getConstant().getZExtValue());
+    }
+  }
+  if (perf) {
+    ++perfDiag.folderExitKeepInst;
   }
   return inst;
 }
@@ -1140,8 +1190,12 @@ Value* ICMPPatternMatcher(IRBuilder<>* builder,
 MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::createICMPFolder(
     CmpInst::Predicate P, Value* LHS, Value* RHS, const Twine& Name) {
   auto folderSample = profiler.sample("sem_folder_icmp");
-  if (auto patternCheck =
-          ICMPPatternMatcher(builder.get(), P, LHS, RHS, Name)) {
+  Value* patternCheck = nullptr;
+  {
+    LiftPerfDiag::ScopedTimer patternTimer(&perfDiag, &perfDiag.icmpPattern);
+    patternCheck = ICMPPatternMatcher(builder.get(), P, LHS, RHS, Name);
+  }
+  if (patternCheck) {
     printvalue(patternCheck);
     return patternCheck;
   }
@@ -1149,7 +1203,8 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::createICMPFolder(
   auto result = builder->CreateICmp(P, LHS, RHS, Name);
 
   if (auto ctxI = dyn_cast<Instruction>(result)) {
-
+    LiftPerfDiag::ScopedTimer knownBitsTimer(&perfDiag,
+                                             &perfDiag.icmpKnownBits);
     KnownBits KnownLHS = analyzeValueKnownBits(LHS, ctxI);
     KnownBits KnownRHS = analyzeValueKnownBits(RHS, ctxI);
 
@@ -1175,7 +1230,8 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::createTruncFolder(
       createInstruction(Instruction::Trunc, V, nullptr, DestTy, Name);
 
   if (auto ctxI = dyn_cast<Instruction>(result)) {
-
+    LiftPerfDiag::ScopedTimer knownBitsTimer(&perfDiag,
+                                             &perfDiag.truncKnownBits);
     KnownBits KnownTruncResult = analyzeValueKnownBits(result, ctxI);
     printvalue2(KnownTruncResult);
     if (!KnownTruncResult.hasConflict() && KnownTruncResult.getBitWidth() > 1 &&
@@ -1247,12 +1303,21 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::createSExtOrTruncFolder(
 MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::setFlag(const Flag flag,
                                                   Value* newValue) {
   auto flagSample = profiler.sample("sem_flags");
+  LiftPerfDiag::ScopedTimer flagTimer(&perfDiag, &perfDiag.flagSet);
+  if (perfDiag.enabled) {
+    ++perfDiag.flagSetCalls;
+  }
   return setFlagValue(flag, newValue);
 }
 
 MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::setFlag(
     const Flag flag, std::function<Value*()> calculation) {
   auto flagSample = profiler.sample("sem_flags");
+  LiftPerfDiag::ScopedTimer flagTimer(&perfDiag, &perfDiag.flagSet);
+  if (perfDiag.enabled) {
+    ++perfDiag.flagSetCalls;
+    ++perfDiag.flagSetLazyCalls;
+  }
   return setFlagValue(flag, calculation());
 }
 
@@ -1263,6 +1328,10 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(LazyValue)::getLazyFlag(const Flag flag) {
 
 MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::getFlag(const Flag flag) {
   auto flagSample = profiler.sample("sem_flags");
+  LiftPerfDiag::ScopedTimer flagTimer(&perfDiag, &perfDiag.flagGet);
+  if (perfDiag.enabled) {
+    ++perfDiag.flagGetCalls;
+  }
   return getFlagValue(flag);
 }
 
@@ -1420,6 +1489,10 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::dumpRflagsDiag(const char* tag,
 MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::GetRegisterValue(
     const Register key) {
   auto registerSample = profiler.sample("sem_registers");
+  LiftPerfDiag::ScopedTimer regTimer(&perfDiag, &perfDiag.regGet);
+  if (perfDiag.enabled) {
+    ++perfDiag.regGetCalls;
+  }
   // printvalue2(magic_enum::enum_name(key));
 
   if (key == Register::RIP || key == Register::EIP) {
@@ -1431,10 +1504,16 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::GetRegisterValue(
 
   if (key == Register::AH || key == Register::CH || key == Register::DH ||
       key == Register::BH) {
+    if (perfDiag.enabled) {
+      ++perfDiag.regGetHighByte;
+    }
     return GetValueFromHighByteRegister(key);
   }
 
   if (key == Register::RFLAGS || key == Register::EFLAGS) {
+    if (perfDiag.enabled) {
+      ++perfDiag.regGetRflags;
+    }
     return GetRFLAGSValue();
   }
 
@@ -1573,24 +1652,40 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::SetValueToSubRegister_16b(
 MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::SetRegisterValue(const Register key,
                                                            Value* value) {
   auto registerSample = profiler.sample("sem_registers");
+  LiftPerfDiag::ScopedTimer regTimer(&perfDiag, &perfDiag.regSet);
+  if (perfDiag.enabled) {
+    ++perfDiag.regSetCalls;
+  }
   if (key == Register::EIP || key == Register::RIP)
     return;
 
   if ((key >= Register::AL) && (key <= Register::R15B)) {
+    if (perfDiag.enabled) {
+      ++perfDiag.regSetSub8;
+    }
     value = SetValueToSubRegister_8b(key, value);
   }
 
   if (((key >= Register::AX) && (key <= Register::R15W))) {
+    if (perfDiag.enabled) {
+      ++perfDiag.regSetSub16;
+    }
     printvalue2("subreg_16");
     value = SetValueToSubRegister_16b(key, value);
   }
 
   if ((key >= Register::EAX) && (key <= Register::R15D)) {
+    if (perfDiag.enabled) {
+      ++perfDiag.regSetZext32;
+    }
     value = createZExtFolder(value, Type::getInt64Ty(this->context),
                              "zeroextend-32bit-write");
   }
 
   if (key == Register::RFLAGS) {
+    if (perfDiag.enabled) {
+      ++perfDiag.regSetRflags;
+    }
     SetRFLAGSValue(value);
     return;
   }

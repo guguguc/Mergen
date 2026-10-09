@@ -34,8 +34,45 @@ struct LiftPerfDiag {
   Acc solvePathConstBackup;
   Acc solvePathConstBr;
   Acc cpvTotal;
+  Acc backupMove;
+  Acc backupCopy;
+
+  Acc folderPattern;
+  Acc folderCreate;
+  Acc folderKnownBits;
+  Acc folderProvenance;
+  Acc icmpPattern;
+  Acc icmpKnownBits;
+  Acc truncKnownBits;
+
+  Acc regGet;
+  Acc regSet;
+  Acc flagGet;
+  Acc flagSet;
+  Acc decode;
+
   uint64_t constBackupSkipped = 0;
   uint64_t constBackupTaken = 0;
+
+  uint64_t folderCalls = 0;
+  uint64_t folderExitEarly = 0;
+  uint64_t folderPatternHit = 0;
+  uint64_t folderCreateUsed = 0;
+  uint64_t folderExitKnownConst = 0;
+  uint64_t folderExitKeepInst = 0;
+
+  uint64_t regGetCalls = 0;
+  uint64_t regSetCalls = 0;
+  uint64_t regGetHighByte = 0;
+  uint64_t regGetRflags = 0;
+  uint64_t regSetSub8 = 0;
+  uint64_t regSetSub16 = 0;
+  uint64_t regSetZext32 = 0;
+  uint64_t regSetRflags = 0;
+
+  uint64_t flagGetCalls = 0;
+  uint64_t flagSetCalls = 0;
+  uint64_t flagSetLazyCalls = 0;
 
   uint64_t cpvCacheHits = 0;
   uint64_t cpvDepthCut = 0;
@@ -67,7 +104,10 @@ struct LiftPerfDiag {
 
   public:
     ScopedTimer(LiftPerfDiag* d, Acc* b)
-        : diag(d), bucket(b), start(std::chrono::high_resolution_clock::now()) {}
+        : diag(d != nullptr && d->enabled ? d : nullptr),
+          bucket(diag != nullptr ? b : nullptr),
+          start(bucket != nullptr ? std::chrono::high_resolution_clock::now()
+                                  : std::chrono::high_resolution_clock::time_point{}) {}
 
     ~ScopedTimer() {
       if (diag == nullptr || bucket == nullptr) {
@@ -165,6 +205,12 @@ struct LiftPerfDiag {
        << " avg_ms=" << solvePathConstBackup.avgMs()
        << " taken=" << constBackupTaken << " skipped=" << constBackupSkipped
        << "\n";
+    os << "[perf]   backup_move calls=" << backupMove.count
+       << " total_ms=" << backupMove.totalMs << " avg_ms=" << backupMove.avgMs()
+       << "\n";
+    os << "[perf]   backup_copy calls=" << backupCopy.count
+       << " total_ms=" << backupCopy.totalMs << " avg_ms=" << backupCopy.avgMs()
+       << "\n";
     os << "[perf]   const_br calls=" << solvePathConstBr.count
        << " total_ms=" << solvePathConstBr.totalMs
        << " avg_ms=" << solvePathConstBr.avgMs() << "\n";
@@ -189,6 +235,49 @@ struct LiftPerfDiag {
       os << " " << name << "=" << count;
     }
     os << "\n";
+
+    os << "[perf] folder calls=" << folderCalls
+       << " early=" << folderExitEarly << " pattern_hit=" << folderPatternHit
+       << " create=" << folderCreateUsed
+       << " known_const=" << folderExitKnownConst
+       << " keep_inst=" << folderExitKeepInst << "\n";
+    os << "[perf]   folder_pattern calls=" << folderPattern.count
+       << " total_ms=" << folderPattern.totalMs
+       << " avg_ms=" << folderPattern.avgMs() << "\n";
+    os << "[perf]   folder_create calls=" << folderCreate.count
+       << " total_ms=" << folderCreate.totalMs
+       << " avg_ms=" << folderCreate.avgMs() << "\n";
+    os << "[perf]   folder_knownbits calls=" << folderKnownBits.count
+       << " total_ms=" << folderKnownBits.totalMs
+       << " avg_ms=" << folderKnownBits.avgMs() << "\n";
+    os << "[perf]   folder_provenance calls=" << folderProvenance.count
+       << " total_ms=" << folderProvenance.totalMs
+       << " avg_ms=" << folderProvenance.avgMs() << "\n";
+    os << "[perf]   icmp_pattern calls=" << icmpPattern.count
+       << " total_ms=" << icmpPattern.totalMs
+       << " avg_ms=" << icmpPattern.avgMs() << "\n";
+    os << "[perf]   icmp_knownbits calls=" << icmpKnownBits.count
+       << " total_ms=" << icmpKnownBits.totalMs
+       << " avg_ms=" << icmpKnownBits.avgMs() << "\n";
+    os << "[perf]   trunc_knownbits calls=" << truncKnownBits.count
+       << " total_ms=" << truncKnownBits.totalMs
+       << " avg_ms=" << truncKnownBits.avgMs() << "\n";
+
+    os << "[perf] reg_get calls=" << regGetCalls
+       << " total_ms=" << regGet.totalMs << " highbyte=" << regGetHighByte
+       << " rflags=" << regGetRflags << "\n";
+    os << "[perf] reg_set calls=" << regSetCalls
+       << " total_ms=" << regSet.totalMs << " sub8=" << regSetSub8
+       << " sub16=" << regSetSub16 << " zext32=" << regSetZext32
+       << " rflags=" << regSetRflags << "\n";
+    os << "[perf] flag_get calls=" << flagGetCalls
+       << " total_ms=" << flagGet.totalMs << "\n";
+    os << "[perf] flag_set calls=" << flagSetCalls
+       << " lazy=" << flagSetLazyCalls << " total_ms=" << flagSet.totalMs
+       << "\n";
+    os << "[perf] decode calls=" << decode.count
+       << " total_ms=" << decode.totalMs << " avg_ms=" << decode.avgMs()
+       << "\n";
 
     os << "[perf]   cpv_root_opcode top:";
     std::vector<std::pair<unsigned, uint64_t>> opcodeRank;

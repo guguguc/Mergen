@@ -752,14 +752,26 @@ public:
     // Never move into generalized backups: that path may store the snapshot
     // twice (BBbackup + backedge vector).
     const bool doMove = moveState && !generalized;
-    backup_point snapshot =
-        doMove ? backup_point(std::move(vec), std::move(vecflag),
-                              std::move(this->buffer), std::move(this->cache),
-                              std::move(this->assumptions), this->counter,
-                              this->builder->GetInsertBlock())
-               : backup_point(vec, vecflag, this->buffer, this->cache,
-                              this->assumptions, this->counter,
-                              this->builder->GetInsertBlock());
+    LiftPerfDiag::ScopedTimer backupTimer(
+        &this->perfDiag,
+        doMove ? &this->perfDiag.backupMove : &this->perfDiag.backupCopy);
+    if (doMove) {
+      // Steal directly into the map slot — avoids a temporary backup_point
+      // and a second InstructionCache move (now unique_ptr-sized anyway).
+      auto& slot = BBbackup[bb];
+      slot.vec = std::move(vec);
+      slot.vecflag = std::move(vecflag);
+      slot.buffer = std::move(this->buffer);
+      slot.cache = std::move(this->cache);
+      slot.assumptions = std::move(this->assumptions);
+      slot.ct = this->counter;
+      slot.sourceBlock = this->builder->GetInsertBlock();
+      return;
+    }
+
+    backup_point snapshot(vec, vecflag, this->buffer, this->cache,
+                          this->assumptions, this->counter,
+                          this->builder->GetInsertBlock());
     if (generalized) {
       if (!BBbackup.contains(bb)) {
         BBbackup[bb] = snapshot;
