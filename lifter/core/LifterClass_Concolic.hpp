@@ -501,6 +501,17 @@ public:
     out = combined.getZExtValue();
     return true;
   }
+  // The fast path: the requested span is one contiguous run of bytes inside one
+  // tracked Value.
+  //
+  // "Contiguous" is checked by pointer identity plus a *consecutive* byteOffset
+  // run, and both halves are required. Same Value but non-consecutive offsets
+  // means the value's bytes are being read out of order or with a gap -- an
+  // extract over that range would silently include bytes the caller did not ask
+  // for. Different Values is the non-contiguous case handled below.
+  //
+  // Strict: returns null rather than a partial answer, so the caller can fall
+  // back to the general path instead of acting on a truncated value.
   llvm::Value* retrieveContiguousBufferedValue(
       const llvm::DenseMap<uint64_t, ValueByteReference>& sourceBuffer,
       uint64_t startAddress, uint8_t byteCount) {
@@ -521,6 +532,18 @@ public:
     return this->extractBytes(sharedValue, firstByteOffset,
                               firstByteOffset + byteCount);
   }
+  // The general path: assemble the span byte by byte, whether or not the bytes
+  // share one Value.
+  //
+  // Tries the contiguous case first because it is a single extract rather than
+  // byteCount shifts and ors, and the contiguous case is the common one -- a VM
+  // that stored a qword in one instruction.
+  //
+  // The byte-by-byte assembly goes through the folders rather than IRBuilder so
+  // that a run of known bytes folds to a constant here, before the path solver
+  // sees the value. Emitting raw shifts and ors would defer the fold to the O2
+  // fixpoint, which is after the solver has already had to decide what to do
+  // with the result.
   llvm::Value* retrieveValueFromBufferSlice(
       const llvm::DenseMap<uint64_t, ValueByteReference>& sourceBuffer,
       uint64_t startAddress, uint8_t byteCount) {
@@ -529,6 +552,9 @@ public:
       return nullptr;
     }
 
+    // Not a rejection, a downgrade: the loop below records whether the span
+    // stayed contiguous rather than bailing on the first mismatch, because a
+    // span can be partly contiguous and still be answerable byte by byte.
     bool contiguousSingleValue = true;
     llvm::Value* sharedValue = firstIt->second.value;
     uint8_t firstByteOffset = firstIt->second.byteOffset;
@@ -565,6 +591,23 @@ public:
     }
     return result;
   }
+  // Three-tier lookup: tracked buffer, normalised buffer, then file.
+  //
+  // The tiers are ordered by trust. A byte the lifter itself tracked is what the
+  // program actually stored, so it beats the file image. The file is the
+  // fallback and is subject to shouldPromoteFileValue -- a file byte is only
+  // promoted if the memory policy says that region is safe to constant-fold,
+  // because folding an unrelocated image value produces a concrete answer that
+  // is wrong for a relocated sample.
+  //
+  // The normalisation retry is not redundant with the file retry. An address
+  // outside the PE's base lane may be tracked under its normalised form and
+  // readable under it, or neither; each tier has to be tried at both spellings
+  // before giving up.
+  //
+  // `usedAddress` records which spelling actually answered, because
+  // shouldPromoteFileValue has to judge the address the bytes came from, not
+  // the one that was asked for.
   llvm::Value* retrieveBufferedOrConcreteValue(
       const llvm::DenseMap<uint64_t, ValueByteReference>& sourceBuffer,
       uint64_t startAddress, uint8_t byteCount) {
@@ -594,6 +637,16 @@ public:
     }
     return this->builder->getIntN(byteCount * 8, concreteValue);
   }
+
+  // Reset every field of the active generalized-loop state.
+  //
+  // Field-by-field rather than assigning a fresh struct so that a field added
+  // later is visibly not cleared here -- a whole-struct assignment would
+  // silently reset it, and the compiler would not point that out.
+  //
+  // Note `valid = false` rather than relying on any later check: this is the
+  // single guard that tells the restore paths whether any of the other fields
+  // mean anything.
   void clearGeneralizedLoopControlFieldState() {
     activeGeneralizedLoopEntrySourceBlock = nullptr;
     activeGeneralizedLoopControlFieldState.valid = false;
@@ -608,6 +661,29 @@ public:
     activeGeneralizedLoopControlFieldState.backedgeBuffers.clear();
     activeGeneralizedLoopControlFieldState.carriedSlots.clear();
   }
+  // Constant-fold a loop-carried expression *for one specific incoming edge*.
+  //
+  // This is the key asymmetry with ordinary constant folding. A phi here is not
+  // an unknown to be guarded against -- it is a known-multivalued value, and the
+  // question "what is it?" has a different answer per incoming block. So the
+  // phi case below selects the incoming value for `incomingBlock` and recurses,
+  // rather than giving up the way a general folder would.
+  //
+  // That is what makes a generalized loop's control field concrete at all. The
+  // phi built during generalization is the loop-carried variable, and evaluating
+  // it edge-by-edge is what lets the dispatcher be resolved per iteration
+  // instead of collapsing to a single wrong value.
+  //
+  // Deliberately a small whitelist -- constant, phi, trunc/zext/sext, and a few
+  // binary ops. Not a general interpreter, and it should not become one: this
+  // runs inside path solving, and a general evaluator would both be slower and
+  // start answering for expression shapes whose edge-specific meaning has not
+  // been reasoned about. An opcode not listed returns false, which makes the
+  // caller fall back to a symbolic value -- the safe direction.
+  //
+  // No recursion depth cap. Every recursive step goes through a phi edge, a
+  // cast, or a binary operator, and the IR DAG is acyclic, so the walk
+  // terminates. A phi's incoming value cannot be the phi itself.
   bool evaluateConcreteGeneralizedLoopInt(llvm::Value* candidate,
                                           llvm::BasicBlock* incomingBlock,
                                           llvm::APInt& out) {
@@ -619,10 +695,17 @@ public:
       return true;
     }
     if (auto* phi = llvm::dyn_cast<llvm::PHINode>(candidate)) {
+      // Negative means this edge does not reach the phi at all, which is a real
+      // answer: the value has no meaning on this incoming block, and returning
+      // false here rather than picking another edge's value is what stops one
+      // iteration's control from being used for another's.
       int incomingIndex = phi->getBasicBlockIndex(incomingBlock);
       if (incomingIndex < 0) {
         return false;
       }
+      // Recurse with the *same* incomingBlock: nested phis in the chain belong
+      // to the same edge, and substituting the phi's block would select values
+      // from the wrong path.
       return evaluateConcreteGeneralizedLoopInt(phi->getIncomingValue(incomingIndex),
                                                 incomingBlock, out);
     }
@@ -681,12 +764,34 @@ public:
       case llvm::Instruction::LShr:
         out = lhs.lshr(rhs.getLimitedValue(width));
         return true;
+      // AShr, the rotates, the divisions and the comparisons are all absent on
+      // purpose. Each would need its own edge-specific reasoning to be safe
+      // here, and none of them has been reasoned about -- an unreviewed case
+      // that folds to a wrong constant is worse than one that declines and
+      // leaves the value symbolic.
+      //
+      // getLimitedValue above is likewise not a general shift: LLVM requires the
+      // shift amount to be strictly less than the width, and the value came
+      // from a constant in this expression, so clamping rather than trapping is
+      // the right failure.
       default:
         return false;
       }
     }
+    // Unhandled node type. Falling out rather than returning true is the whole
+    // contract: the caller treats false as "leave this symbolic", which is a
+    // worse answer than a fold but a correct one.
     return false;
   }
+
+  // uint64_t convenience overload.
+  //
+  // Widens the APInt result to 64 rather than asserting the width. A control
+  // field narrower than 64 is normal -- the sample's offsets are 0x6/0xA/0xC,
+  // which are byte offsets, and the field itself is a qword or less -- so the
+  // caller gets a zero-extended value and decides for itself whether the narrow
+  // width mattered. zextOrTrunc rather than sext is deliberate: these are
+  // bytecode offsets and cursors, which are unsigned quantities.
   bool evaluateConcreteGeneralizedLoopInt(llvm::Value* candidate,
                                           llvm::BasicBlock* incomingBlock,
                                           uint64_t& out) {
@@ -697,6 +802,16 @@ public:
     out = value.zextOrTrunc(64).getZExtValue();
     return true;
   }
+
+  // Peel integer casts off a load operand, for address matching.
+  //
+  // Only integer-to-integer. A float or pointer cast in the chain stops the
+  // peel: the remaining value is no longer an address expression this function
+  // knows how to interpret, and stripping further would match a shape it has no
+  // meaning for.
+  //
+  // The loop rather than a single strip because the lifter's own 32/64-bit
+  // normalisation routinely stacks two casts on one operand.
   llvm::Value* stripIntegerCastsForGeneralizedLoad(llvm::Value* candidate) {
     while (auto* castInst = llvm::dyn_cast<llvm::CastInst>(candidate)) {
       auto* srcTy = castInst->getOperand(0)->getType();
