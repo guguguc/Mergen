@@ -2941,6 +2941,9 @@ void writeFunctionToFile(const std::string filename) {
   // self-loop.
   bool recordFoldOrigin(llvm::Value* result, unsigned opcode, llvm::Value* lhs,
                         llvm::Value* rhs) {
+    // Constant-only. A non-constant result has no uniquing hazard and no
+    // consumer -- vipFromFoldChain only ever asks about constants -- so
+    // recording one would cost an entry nobody reads.
     if (!result || !llvm::isa<llvm::Constant>(result)) return false;
     // An identity fold (the result is one of the operands, e.g. a same-width
     // sext or `or C, C`) carries no provenance; recording it would overwrite
@@ -2999,10 +3002,16 @@ void writeFunctionToFile(const std::string filename) {
         auto prov = loadProvenance.find(v);
         return prov != loadProvenance.end() ? prov->second : 0;
       }
+      // "Is this the base constant" -- the per-instance module address the
+      // decrypt expression is built against. Required because when both sides
+      // have chains the walk cannot tell them apart by shape alone.
       auto isModuleConst = [&](llvm::Value* x) {
         auto* ci = llvm::dyn_cast_or_null<llvm::ConstantInt>(x);
         return ci && isModuleAddress(ci->getZExtValue());
       };
+      // "Can this side be followed" -- either a recorded fold or a recorded
+      // provenance entry. Both count, because the walk must be able to cross
+      // either kind of step, and a side that is neither is the end of the line.
       auto hasChain = [&](llvm::Value* x) {
         return x && (foldOrigin.count(x) || loadProvenance.count(x));
       };
@@ -3010,6 +3019,11 @@ void writeFunctionToFile(const std::string filename) {
       if (hasChain(it->second.lhs) && hasChain(it->second.rhs)) {
         // Both sides continue; the base is the module-address constant, so the
         // other side is the decrypt chain that reaches the bytecode load.
+        //
+        // Delegated to the VMP model rather than decided here, because the
+        // choice encodes a fact about the protector's codegen -- which side is
+        // the base -- and that belongs with the rest of the model knowledge
+        // rather than duplicated at each call site.
         next = vmp.pickDecryptOperand(
             it->second.lhs, it->second.rhs, isModuleConst(it->second.lhs),
             hasChain(it->second.lhs), hasChain(it->second.rhs));
@@ -3018,15 +3032,32 @@ void writeFunctionToFile(const std::string filename) {
       } else if (hasChain(it->second.rhs)) {
         next = it->second.rhs;
       }
+      // Terminate on either no successor or a repeat. The repeat check is a
+      // second cycle guard: foldOrigin can legitimately contain a cycle of
+      // folds (a -> b -> a is possible once constants are uniqued), and
+      // following it would loop until the depth cap with no progress made.
       if (!next || !seen.insert(next).second) {
         return 0;
       }
       v = next;
     }
+    // Depth cap or ran off the end of the chain. 0 means "no provenance found",
+    // and the caller falls back to the cursor offset -- which is a weaker answer
+    // but a correct-direction one, so an exhausted chain degrades rather than
+    // misresolves.
     return 0;
   }
+
+  // The register file. Concolic, so every write goes through a backup-aware
+  // path -- this is the object whose state the loop generalization machinery
+  // snapshots and restores.
   RegisterManagerConcolic<Register> Registers;
 
+  // Heuristic-owned, hence the raw `new` and no destructor. LLVM's condition
+  // cache outlives individual instructions by way of the DominatorTree, and it
+  // is not owned by anything in this class. It is leaked rather than freed at
+  // the end of the lift, which is the lesser evil: a use-after-free here would
+  // corrupt path solving, and the allocation is one object per lifter instance.
   llvm::DomConditionCache* DC = new llvm::DomConditionCache();
 
   unsigned int instct = 0;
@@ -3042,22 +3073,60 @@ void writeFunctionToFile(const std::string filename) {
   LiftPerfDiag perfDiag;
   LiftDiagnostics diagnostics;
   PipelineProfiler profiler;
+  // Reused SimplifyQuery, because constructing one is not free and the folders
+  // ask LLVM for simplification on every instruction. Not owned -- see DC above
+  // for the same reasoning, though here the caller is expected to supply a
+  // longer-lived object.
   llvm::SimplifyQuery* cachedquery;
 
+  // Previous block and the number of branches recorded so far. Used by the
+  // straight-line reroll pass to find the region a block belongs to.
   llvm::BasicBlock* lastBB = nullptr;
   unsigned int BIlistsize = 0;
 
+  // Runtime address -> file offset, for addresses the PE does not cover.
+  //
+  // std::map rather than DenseMap: the population is small (pages the lifter
+  // synthesised rather than read) and insertion is scattered. A dense structure
+  // would cost more in memory than it saves in lookup here.
   std::map<uint64_t, uint64_t> pageMap;
+
+  // Every branch instruction emitted during this lift.
+  //
+  // A vector of raw pointers, which is only safe because no pass that could free
+  // an instruction runs between emission and the last use. That invariant is
+  // why the post-passes in MergenPB.hpp rebuild this rather than assume it is
+  // still valid afterwards.
   std::vector<llvm::BranchInst*> BIlist;
 
   // Set by branchHelper after resolving a conditional branch.
   // Test framework reads this to verify jcc taken/not-taken.
+  //
+  // Three separate booleans rather than one tri-state because they answer
+  // different questions: whether a branch occurred, whether it was resolved to a
+  // concrete direction, and which direction it took. "Not resolved" and
+  // "resolved as not-taken" must stay distinguishable -- the first means the
+  // lift kept both paths, the second means it committed.
   bool hadConditionalBranch = false;
   bool lastConditionalBranchResolved = false;
   bool lastBranchTaken = false;
   // DenseMap<InstructionKey, Value*, InstructionKey::InstructionKeyInfo>
   // cache;
+  //
+  // Superseded by InstructionCache, kept as a record of the flat design and of
+  // why it could not work: a plain map shares writes across diverged paths, and
+  // the lifter backtracks.
   InstructionCache cache;
+  // A remembered GEP, keyed so an identical address computation is not rebuilt.
+  //
+  // `type` is the operand width the GEP was built for, and it is part of the key
+  // rather than an implementation detail: the same address used for an i8 and an
+  // i32 access produces differently-typed results, so sharing one entry between
+  // them would hand a caller a value of the wrong type.
+  //
+  // `TEB` is separate from the address for the same class of reason: a
+  // TEB-relative address and a plain one can resolve to the same numeric value
+  // and must not share a cached GEP, because the surrounding fold differs.
   struct GEPinfo {
     Value* addr;
     uint8_t type;
@@ -3094,6 +3163,11 @@ void writeFunctionToFile(const std::string filename) {
       }
 
       // Define empty and tombstone keys
+      //
+      // Distinct because DenseMap requires it. The tombstone uses the maximal
+      // `type` and `TEB=true` rather than repeating the empty key's values, so
+      // neither sentinel can be produced by an ordinary insert: a real GEPinfo
+      // with a null address would otherwise collide with the empty key.
       static inline GEPinfo getEmptyKey() { return GEPinfo(nullptr, 0, 0); }
 
       static inline GEPinfo getTombstoneKey() {
@@ -3105,6 +3179,17 @@ void writeFunctionToFile(const std::string filename) {
   std::vector<llvm::Instruction*> memInfos;
 
   // todo : std::set
+  //
+  // The todo is about ordering, not membership. A vector plus an explicit stack
+  // discipline is what makes the lift deterministic: std::set would iterate in
+  // address order, which is reproducible but changes which block is explored
+  // first, and with it the whole shape of the resulting IR. LIFO is chosen
+  // because it approximates the natural fall-through order of the original code.
+  //
+  // All four sets below are std::set rather than DenseSet because they are
+  // iterated in diagnostics and in getUnvisitedAddr's lookups, and the
+  // population is in the hundreds -- hashing is not the bottleneck and stable
+  // iteration order is worth more than it.
   std::vector<BBInfo> unvisitedBlocks;
   std::set<uint64_t> visitedAddresses;
   std::set<uint64_t> generalizedLoopAddresses;
