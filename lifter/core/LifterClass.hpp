@@ -787,16 +787,31 @@ public:
     IndirectJump,
     Ret,
   };
+  // Decides which calls the lifter is willing to inline and which become
+  // outlined function calls. Consulted from getOrCreateBB's reuse rule, so it is
+  // not merely a lifting-policy knob: it also determines whether an address is
+  // one block or many. See InlinePolicy.hpp.
   FunctionInlinePolicy inlinePolicy;
 
   // ABI call-boundary configuration.
   // Strict: clobber volatile regs after non-inlineable calls (ABI-correct).
   // Compat: preserve all registers (legacy behavior, for diagnostics only).
+  //
+  // Compat exists because it is the *only* setting under which a register
+  // surviving a call can be attributed to that call rather than to a
+  // modelling error. It is unsound as an ABI description and must not become
+  // the default; the diagnostics it enables are worth the unsoundness, which is
+  // why it is a mode rather than removed.
   CallModelMode callModelMode = CallModelMode::Strict;
   AbiKind       defaultAbi    = AbiKind::Unknown; // auto-detected from arch mode
 
   // Returns the effective ABI for this binary. If defaultAbi is Unknown,
   // infers from file mode.
+  //
+  // Inference rather than a fixed default is required because the two ABIs
+  // disagree about who owns the shadow store and the stack alignment on entry,
+  // and getting it wrong does not crash -- it silently mis-attributes stack
+  // slots, which then read as whatever the previous block left there.
   AbiKind getEffectiveAbi() {
     if (defaultAbi != AbiKind::Unknown) return defaultAbi;
     return (file.getMode() == arch_mode::X64) ? AbiKind::X64_MSVC
@@ -826,6 +841,12 @@ public:
 
     uint64_t dispVal = 0;
     if (!file.readMemory(targetVA + 2, 4, dispVal)) return 0;
+    // Sign-extend explicitly rather than letting the unsigned readMemory result
+    // stand. The displacement is signed by definition, and an FF 25 thunk with a
+    // backward displacement -- entirely ordinary, since the IAT usually precedes
+    // the thunk -- would otherwise compute a slot roughly 4GB past the image and
+    // simply never match. The failure is silent: the thunk is misclassified as
+    // ordinary code and gets lifted as a jump into the image.
     int32_t disp = static_cast<int32_t>(dispVal & 0xFFFFFFFF);
     return targetVA + 6 + disp;
   }
@@ -843,6 +864,12 @@ public:
 
     uint64_t importAddr = 0;
     if (!file.readMemory(iatSlot, 8, importAddr)) return false;
+    // The slot is read as 8 bytes unconditionally, even for a 32-bit image.
+    // That is what makes the predicate conservative in the right direction: on
+    // a 32-bit image the upper half is whatever the file has there, so the
+    // combined value will essentially never map, and the thunk is classified as
+    // an import. Erring toward "import" costs an outlined named call; erring
+    // the other way costs lifting into an unmapped address.
     return file.address_to_mapped_address(importAddr) == 0;
   }
 
@@ -870,6 +897,12 @@ public:
 
   // If targetVA is an import thunk, returns the import name.
   // Otherwise returns empty string.
+  // Resolve a thunk to its import name.
+  //
+  // Empty string is the failure signal, not a special value. Callers use it to
+  // decide between emitting a named external and an opaque call, and there is no
+  // third case: a thunk whose slot is not in the PE import directory is not a
+  // named import by any reading.
   std::string resolveImportName(uint64_t targetVA) {
     uint64_t iatSlot = parseImportThunk(targetVA);
     if (iatSlot == 0) return {};
@@ -880,6 +913,11 @@ public:
   }
 
   // Returns true if the target should be outlined instead of inlined.
+  //
+  // Deliberately the same predicate as isImportThunk, with no independent
+  // threshold or size heuristic. Adding one here would mean two functions
+  // disagreeing about what an import thunk is, and the disagreement would show
+  // up as a call the lifter tried to inline and could not.
   bool shouldOutlineCall(uint64_t targetVA) {
     return isImportThunk(targetVA);
   }
@@ -930,6 +968,17 @@ public:
   }
 
   SpeculativeCallInfo speculativeCall;
+
+  // One active speculative inline. Not a stack: nested speculation would need
+  // the outer entry's worklistFloor to survive the inner's bail-out, and the
+  // rollback restores a single floor. Supporting nesting means carrying the
+  // outer state alongside, which has not been needed.
+  //
+  // `bailedOut` is separate from `active` so a diagnostic can tell "we never
+  // speculated here" from "we speculated and gave up". Those are very different
+  // lift results and collapsing them hides the case where the budget is
+  // systematically too small.
+
   // Budgets, and the distinction between "0" meanings.
   //
   //   speculativeCallBudget   instructions still allowed in the current
@@ -951,6 +1000,13 @@ public:
   // Cached BB count: Function::size() walks the BB list (O(n)). Calling it on
   // every createBudgetedBasicBlock made mix PathSolver ~O(n²) (~5s of
   // const_resolve). Keep this in sync with every BB we create on fnc.
+  //
+  // That last sentence is a standing obligation, not advice. The lifter creates
+  // blocks through more than one route, and any block created outside
+  // createBudgetedBasicBlock is invisible to the budget while still occupying
+  // memory -- so a new creation site must either route through the helper or
+  // increment this. The abort block is the one deliberate exception and is
+  // counted in place.
   uint32_t basicBlockCount         = 0;
   // The block every budget exhaustion and unrecoverable path routes to.
   //
@@ -960,22 +1016,42 @@ public:
   // identical blocks. Every route here is also recorded as a diagnostic, so
   // the block is a structural fallback, never a silent sink.
   llvm::BasicBlock* liftAbortBlock = nullptr;
+
+  // The three per-block / per-solve ambient settings the lifter carries instead
+  // of threading as parameters.
+  //
+  // They are ambient because the code that needs them is the memory-restore
+  // path, which is reached from many places -- a block entry, a loop
+  // generalisation, a speculative bail-out -- and passing three arguments
+  // through all of them would mean every one of them could forget. Ambient state
+  // with a single writer is easier to keep honest than a parameter with many
+  // call sites, provided each field is set in exactly one place.
   bool bypassStackConcolicTracking = false;
   BlockRestoreMode currentBlockRestoreMode = BlockRestoreMode::Normal;
   PathSolveContext currentPathSolveContext = PathSolveContext::Unknown;
-  
+
+  // RAII setter for the path-solve context.
+  //
+  // Not a plain field assignment at each call site: solvePath has several early
+  // returns, and a context that survives one of them silently reclassifies the
+  // next solve -- enabling the dispatch recovery strategies for a plain direct
+  // jump, or attributing its diagnostics to the wrong site.
   class ScopedPathSolveContext {
     lifterClassBase<Derived, Mnemonic, Register, DisassemblerBase>* lifter;
     PathSolveContext previous;
-  
+
   public:
+    // Saves the enclosing context rather than resetting to Unknown, so nested
+    // solves restore correctly. A direct jump solved inside an indirect-jump
+    // solve inherits the outer context, which is the right reading: the inner
+    // solve is still part of the VM dispatch it was reached from.
     ScopedPathSolveContext(
         lifterClassBase<Derived, Mnemonic, Register, DisassemblerBase>* lifter,
         PathSolveContext next)
         : lifter(lifter), previous(lifter->currentPathSolveContext) {
       lifter->currentPathSolveContext = next;
     }
-  
+
     // Restores on scope exit rather than at each solvePath call site. The
     // context has to be correct for every path *out* of a solve, including
     // early returns, and a manual restore would have to be repeated at each
