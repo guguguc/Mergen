@@ -1587,6 +1587,14 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(pvalueset)::computePossibleValues(
     if (v_inst->getOpcode() == Instruction::Alloca) {
       return {};
     }
+    // A load through the tracked base is answered from the tracked bytes when
+    // possible, and enumerated per-offset otherwise. Three sub-cases in order:
+    // constant offset first (one lookup), then a solved non-constant offset
+    // (recurse on the answer), then offset enumeration (one lookup per case).
+    //
+    // loadBits % 8 == 0 is required because the tracked buffer is byte-keyed:
+    // a non-multiple-of-8 load has no byte span to look up, and rounding would
+    // read a neighbouring byte's worth of value into the result.
     if (auto* loadInst = dyn_cast<LoadInst>(v_inst)) {
       if (loadInst->getType()->isIntegerTy()) {
         auto* gep = dyn_cast<GetElementPtrInst>(loadInst->getPointerOperand());
@@ -1608,6 +1616,12 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(pvalueset)::computePossibleValues(
             } else if (auto* resolved = solveLoad(
                            nestedLoad, gep,
                            static_cast<uint8_t>(loadBits))) {
+              // `resolved != loadInst` means solveLoad actually answered.
+              // Without the check this would recurse on the load itself --
+              // solveLoad returns the LoadInst unchanged when it cannot
+              // resolve -- which is unbounded self-recursion saved only by
+              // the Depth cap, and even then it wastes 64 levels to learn
+              // nothing.
               if (resolved != loadInst) {
                 auto resolvedValues = computePossibleValues(resolved, Depth + 1);
                 if (!resolvedValues.empty()) {
@@ -1650,6 +1664,12 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(pvalueset)::computePossibleValues(
       }
     }
 
+    // A phi's possible values are the union over its incoming edges. No
+    // edge-gating here, unlike the edge-specific evaluator in
+    // LifterClass_Concolic.hpp: this enumerates what the value COULD be across
+    // all paths, so every edge contributes. Gating by edge would turn an
+    // exhaustive set into a partial one -- the same reason a Depth overflow
+    // bails to empty rather than partial.
     if (auto* phi = dyn_cast<PHINode>(v_inst)) {
       for (unsigned i = 0; i < phi->getNumIncomingValues(); ++i) {
         auto incomingValues =
@@ -1660,6 +1680,9 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(pvalueset)::computePossibleValues(
       return res;
     }
 
+    // Single-operand instructions (casts and friends) recurse on the operand.
+    // The cast-width fixup below is what makes this correct rather than merely
+    // convenient; see there.
     if (v_inst->getNumOperands() == 1) {
       auto result = computePossibleValues(v_inst->getOperand(0), Depth + 1);
       // Integer casts change the bit-width of every value in the set.  Without
@@ -1698,6 +1721,11 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(pvalueset)::computePossibleValues(
     }
 
 
+    // A select with a decided condition enumerates only the taken arm. The
+    // KnownBits test is what makes this sound: kb.isZero/isNonZero means the
+    // condition is constant on all paths, so the other arm is unreachable and
+    // its values would only pollute the set. An undecided condition unions
+    // both arms -- the exhaustive direction, matching the phi handling above.
     if (v_inst->getOpcode() == Instruction::Select) {
       auto cond = v_inst->getOperand(0);
       auto trueValue = v_inst->getOperand(1);
@@ -1730,6 +1758,15 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(pvalueset)::computePossibleValues(
       pv_cache[V] = res;
       return res;
     }
+    // Two-operand fallback: count the unknown bits on each side and on the
+    // result, then decide between enumerating operands (exact but costly) and
+    // enumerating the result's KnownBits directly (cheap but admits values the
+    // operands cannot produce).
+    //
+    // The `- 64 + getBitWidth` adjusts the 64-bit popcount to the actual
+    // width: popcount runs over the full APInt storage, and without the
+    // adjustment a 32-bit value would always report 32 phantom unknowns from
+    // its upper half.
     auto op1 = v_inst->getOperand(0);
     auto op2 = v_inst->getOperand(1);
     auto op1_knownbits = analyzeValueKnownBits(op1, v_inst);
