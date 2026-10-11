@@ -1,4 +1,32 @@
 
+// The folding and constant-propagation engine.
+//
+// Whenever the lifter would emit an operation, it calls a *folder* rather than
+// builder->CreateX and friends. A folder first asks "is this already a
+// constant, or derivable to one?" and if so returns the constant; otherwise it
+// emits the instruction and returns that. Call sites can therefore be written
+// once and are simultaneously a constant-folding opportunity, which is why
+// there is no separate constant-propagation pass over the lifted IR.
+//
+// The folders come in two layers:
+//
+//   computeXXX()  pure value transforms -- known-bits, pattern matching,
+//                 complexity heuristics
+//   createXXX()   emit-or-return-a-constant, using the above
+//
+// The heuristic underneath is "is this worth folding?". createComplexity
+// scores a candidate expression; past a threshold the folder gives up and
+// emits the instruction rather than walking further. Without that, lifting VM
+// code with deeply nested address arithmetic degrades into exponential
+// pattern-matching work. See getComplexity.
+//
+// This file and GEPTracker.ipp include each other, which is why the shared
+// diagnostic helpers live in LifterDiagHelpers.hpp rather than in either one.
+//
+// The include guard below is load-bearing for exactly that reason: without it,
+// the mutual include resolves against a half-defined class and the build
+// fails pointing at the wrong file.
+
 #pragma once
 
 #include "CommonDisassembler.hpp"
@@ -29,6 +57,12 @@
 
 using namespace llvm;
 
+// Per-opcode enables for the individual folding strategies. All on by
+// default; the macros exist so a single strategy can be isolated when
+// bisecting a bad fold. Do not narrow one of these without a golden-IR diff
+// showing the wider behaviour is wrong -- they gate optimisations, not
+// correctness, so the symptom of over-narrowing is "IR got bigger", which is
+// easy to miss in a large diff.
 #ifndef TESTFOLDER
 #define TESTFOLDER
 #define TESTFOLDER3
@@ -43,6 +77,19 @@ using namespace llvm;
 
 using namespace PatternMatch;
 
+// Walk backwards from a branch condition to collect the values whose
+  // concretisation would let the branch be resolved.
+  //
+  // This is the candidate set for path solving: it looks *through* the
+  // condition's shape to the values underneath, because resolving the
+  // condition usually means resolving one of those, not the icmp itself.
+  // Only arguments and instructions are collected -- those are the values the
+  // lifter can actually assign; picking up a global or a constant here would
+  // hand the solver something it cannot act on.
+  //
+  // The two shape cases below exist because lifted VM code has a strong
+  // tendency to guard on masked or shifted values rather than on the raw
+  // register. Resolving `icmp eq (X & 0xFF), 0` means resolving X.
 static void findAffectedValues(Value* Cond, SmallVectorImpl<Value*>& Affected) {
   auto AddAffected = [&Affected](Value* V) {
     if (isa<Argument>(V) || isa<GlobalValue>(V)) {
@@ -53,7 +100,12 @@ static void findAffectedValues(Value* Cond, SmallVectorImpl<Value*>& Affected) {
       // Peek through unary operators to find the source of the condition.
 
       Value* Op;
+      // ptrtoint is what appears when a register holds a pointer-shaped value
+      // and the condition compares it. Peeling it reaches the thing that can
+      // actually be resolved.
       if (match(I, m_PtrToInt(m_Value(Op)))) {
+        // hasNUsesOrMore(1) guards against collecting a value that is dead
+        // apart from this use -- assigning it would be pure waste.
         if ((isa<Instruction>(Op) || isa<Argument>(Op)) &&
             Op->hasNUsesOrMore(1))
           Affected.push_back(Op);
@@ -61,8 +113,21 @@ static void findAffectedValues(Value* Cond, SmallVectorImpl<Value*>& Affected) {
     }
   };
 
+  // Two shape cases, split on whether the comparison is an equality test.
+  //
+  // Equality: the masked/shifted forms. (X & C) == 0 is the overwhelmingly
+  // common VM null-check, so resolving X rather than the mask is what makes
+  // these branches solvable at all.
+  //
+  // Inequality: the range check. `X + C1 u< C2` is the canonical lowering of
+  // `X > C3 && X < C4`, which is how bounds checks appear after optimisation.
+  // Only the add form is handled -- a multiply-based bounds check would need
+  // its own case and is not currently recognised.
   llvm::ICmpInst::Predicate Pred = {};
   Value* A;
+  // LLVM 19 moved the predicate out of ICmpInst::Predicate into a distinct
+  // CmpPredicate type. Both spellings are kept so the file compiles across
+  // the LLVM 18 / 19 boundary; CI currently pins 18.
 #if LLVM_VERSION_MAJOR > 18
   llvm::CmpPredicate CmpPred{Pred};
   if (match(Cond, m_ICmp(CmpPred, m_Value(A), m_Constant()))) {
@@ -87,6 +152,18 @@ static void findAffectedValues(Value* Cond, SmallVectorImpl<Value*>& Affected) {
   }
 }
 
+// Build the SimplifyQuery used by the LLVM-based fallback folding.
+//
+// TLI is function-local *static* rather than a per-call object. The
+// TargetLibraryInfo is expensive to construct and its contents depend only on
+// the target triple, which is fixed for the whole module -- rebuilding it per
+// fold would dominate the cost of the path solver.
+//
+// The two trailing `true` flags are simplifyQueryDisproves and
+// isUnsafeGEP. They are both enabled deliberately: enabling the first lets
+// LLVM reject transformations it can prove wrong, and the second is what
+// allows the solver to conclude "this GEP is out of bounds" rather than
+// assuming every pointer is valid.
 MERGEN_LIFTER_DEFINITION_TEMPLATES(llvm::SimplifyQuery)::createSimplifyQuery(
     Instruction* Inst) {
   // updateDomTree(*fnc);
@@ -486,7 +563,23 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::getOrCreate(
           }
         }
       }
-      if (hit != SelectArm::None && sel != nullptr) {
+      // Distributing a binary operator into a select.
+//
+// `op(select(c, A, B), Y)` becomes `select(c, op(A, Y), op(B, Y))`, and
+// symmetrically for the second operand. This is the single most valuable
+// rewrite for VM IR: protector dispatch almost always arrives as
+// `select(handler_id, add(...), add(...))` or its mirror, and distributing it
+// is what lets each arm fold to a concrete value. Without it the whole select
+// stays symbolic and the dispatcher state never concretises -- which is the
+// failure recorded in LiftPerfDiag's `createSelectDistEntered` counter rising
+// without a matching `createSelectDistHit`.
+//
+// The hit variable records *which* of the four operand/position combinations
+// matched, because LLVM fixes operand order and the rewrite has to preserve
+// it. The cast-aware matchers above (m_ZExtOrSExtOrSelf around m_Select) are
+// what let a cast-wrapped select still be recognised -- lifted code very
+// often has the cast between the operator and the select.
+if (hit != SelectArm::None && sel != nullptr) {
         if (perf) {
           ++perfDiag.createSelectDistHit;
         }
@@ -520,11 +613,18 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::getOrCreate(
         }
       }
     }
-    {
-      LiftPerfDiag::ScopedTimer binOpTimer(&perfDiag, &perfDiag.createBinOp);
-      newInstruction =
-          builder->CreateBinOp(binOp, key.operand1, key.operand2, Name);
-    }
+    // The fall-through: emit the operation and remember it.
+//
+// Wrapped in a ScopedTimer so the cost of *emitting* is separated from the
+// cost of the lookups and folding that preceded it. That split is the whole
+// point of the createBinOp / createComplexity pair -- if createComplexity
+// dominates, the expensive part is deciding whether to fold; if createBinOp
+// dominates, the expensive part is just building the IR.
+{
+  LiftPerfDiag::ScopedTimer binOpTimer(&perfDiag, &perfDiag.createBinOp);
+  newInstruction =
+      builder->CreateBinOp(binOp, key.operand1, key.operand2, Name);
+}
     if (perf) {
       ++perfDiag.createPlainBinOp;
     }
@@ -540,6 +640,14 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::getOrCreate(
     case Instruction::ZExt:
     case Instruction::SExt:
       printvalue(key.operand1);
+      // Cast of a select: cast(select(c, A, B), T) is emitted as
+      // select(c, cast(A, T), cast(B, T)).
+      //
+      // Same motivation as the binary distribution above, and equally
+      // necessary: this is the shape produced whenever the VM widens a handler
+      // identifier before comparing it, which is most of them. Only the three
+      // integer casts are listed; the default arm is UNREACHABLE because the
+      // dispatcher filters by isCast and no other cast reaches here.
       if (auto select_inst = dyn_cast<llvm::SelectInst>(key.operand1)) {
         return createSelectFolder(
             select_inst->getCondition(),
@@ -558,11 +666,20 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::getOrCreate(
       UNREACHABLE("Unsupported cast opcode");
     }
   }
-  {
-    LiftPerfDiag::ScopedTimer insertTimer(&perfDiag,
+  // Record the emitted instruction so the next identical request reuses it
+  // instead of building a duplicate.
+  //
+  // The cache is keyed on (opcode, operand types, operand identities, dest
+  // type). That key is what makes reuse *safe*: the same opcode applied to
+  // literally the same SSA values with the same result type always produces an
+  // equivalent instruction, so handing back the existing one cannot change
+  // semantics. Weakening the key to ignore an operand would make this a
+  // correctness bug rather than an optimisation.
+{
+  LiftPerfDiag::ScopedTimer insertTimer(&perfDiag,
                                           &perfDiag.createCacheInsert);
-    cache.insert(opcode, key, newInstruction);
-  }
+  cache.insert(opcode, key, newInstruction);
+}
   return newInstruction;
 }
 
