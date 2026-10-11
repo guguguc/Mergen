@@ -107,16 +107,42 @@ struct InstructionKey {
   };
 };
 
+// The instruction cache: memoises folded results per opcode.
+//
+// Two things make this more than a plain map, and both exist because the lifter
+// backtracks -- a block is restored under different assumptions and re-lifted,
+// and the same opcode is looked up again with the same operands.
+//
+// 1. A persistent (layered) map. Lookups must see entries written by an earlier
+//    path without that path's *later* writes leaking into this one, so writes go
+//    to a new layer and reads walk back through the chain. A flat map cannot
+//    express that: either the branches share writes (wrong) or they do not see
+//    them (useless).
+//
+// 2. Copy-on-write flattening. After kCowDeltaLayers layers, merging the chain
+//    into one layer is cheaper than continuing to walk it. Without this a deep
+//    backtracking chain degrades every lookup to O(depth).
+//
+// The Impl indirection exists for the backup path: the concolic lift takes
+// ~46k state snapshots per run, and holding the four 100-entry arrays by value
+// would make each snapshot a multi-kilobyte copy. unique_ptr makes a backup
+// steal pointer-sized.
 class InstructionCache {
 private:
   using CacheMap = llvm::SmallDenseMap<InstructionKey, Value*, 4,
                                        InstructionKey::InstructionKeyInfo>;
 
+  // One write-scope. `prev` is shared, not owned, and is never mutated -- that
+  // immutability is what makes it safe to share a layer between two diverged
+  // paths.
   struct Layer {
     CacheMap map;
     std::shared_ptr<Layer> prev;
   };
 
+  // Flatten once the chain reaches this depth. 32 is empirical: deep enough
+  // that normal lifting rarely flattens, shallow enough that a pathological
+  // backtracking loop cannot make lookups quadratic.
   static constexpr unsigned kCowDeltaLayers = 32;
 
   // Heavy maps live behind a unique_ptr so backup move/steal is pointer-sized.
