@@ -1299,6 +1299,25 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(pvalueset)::getPossibleValues(
   return values;
 }
 
+// Cross-product an instruction over two enumerated operand sets.
+//
+// The caller enumerates each operand separately (via getPossibleValues) and
+// this combines them through the instruction's own semantics. Sets rather than
+// ranges because the values need not be contiguous -- a dispatch key masked to
+// a table is a sparse set, and a range would admit addresses that are not
+// actually reachable.
+//
+// Two different bails, and they mean different things. An unsupported OPCODE
+// returns empty at once: the combination cannot be computed, so the whole
+// enumeration is abandoned. A result set past 256 ALSO returns empty, but for
+// cost: the cross product of two modest sets is already too big to case-split
+// on. Both surface as empty to the caller (PATH_unsolved), which is the safe
+// conflation -- the caller cannot distinguish "uncomputable" from "too big"
+// and does not need to, since its fallback is the same.
+//
+// UDiv/SDiv skip the zero divisor rather than trapping. Division by zero is
+// the one operation here whose mathematical result does not exist; skipping it
+// keeps the set to values the program could actually have produced.
 std::set<APInt, APIntComparator>
 calculatePossibleValues(std::set<APInt, APIntComparator> v1,
                         std::set<APInt, APIntComparator> v2,
@@ -1407,6 +1426,12 @@ calculatePossibleValues(std::set<APInt, APIntComparator> v1,
           res.insert(APInt(64, vv1.ugt(vv2)));
           break;
         }
+        // All ten integer predicates are covered above, so this default is
+        // reached only for a non-integer predicate on an ICmp -- which LLVM's
+        // own verifier rejects. UNREACHABLE rather than empty is deliberate
+        // here (unlike the opcode default above): reaching this means the
+        // lifter produced IR that should not exist, which is a bug upstream
+        // rather than an input that is too big.
         default: {
           outs() << "\n : " << cast<ICmpInst>(inst)->getPredicate();
           outs().flush();
@@ -1432,6 +1457,21 @@ calculatePossibleValues(std::set<APInt, APIntComparator> v1,
   return res;
 }
 
+// The recursive enumerator behind indirect-jump case analysis.
+//
+// Depth-bounded at 64, memoized per solvePath call, and perf-instrumented at
+// the top level only. The three properties interact: the Depth cap bounds the
+// recursion, the memo bounds the re-computation, and the top-only timer keeps
+// the instrumentation from dominating the thing it measures (a per-level timer
+// on a 64-deep walk would be mostly timer).
+//
+// Depth > 64 bails to empty rather than to the values found so far. A partial
+// set would be worse than none: the caller turns the set into an exhaustive
+// case split, and a truncated set silently drops reachable targets.
+//
+// pv_cache is keyed by Value* and cleared per solvePath call (see the note at
+// its declaration in LifterClass.hpp). Reusing it across solves would answer
+// with a set computed under constraints that no longer hold.
 MERGEN_LIFTER_DEFINITION_TEMPLATES(pvalueset)::computePossibleValues(
     Value* V, uint8_t Depth) {
   const bool perf = perfDiag.enabled;
