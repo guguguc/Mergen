@@ -298,13 +298,31 @@ public:
     // derived artefacts that can differ without the architectural state
     // differing, and treating a cache difference as a state difference would
     // make almost every backup point look unique and defeat the check.
+    //
+    // `ct` (the instruction counter) is also not compared, for the same reason:
+    // two points taken at the same state but different instruction positions are
+    // still the same architectural state, and the lift cannot tell them apart
+    // in any way that matters.
     bool operator==(const backup_point& other) const {
+      // buffer first. It is the most expensive comparison and also the one that
+      // most often differs -- tracked memory diverges far more readily than
+      // registers do -- so checking it first avoids the array walks in the
+      // common negative case.
       if (buffer != other.buffer)
         return false;
       return vec == other.vec && vecflag == other.vecflag &&
              sourceBlock == other.sourceBlock;
     }
 
+    // Copy/move constructors.
+    //
+    // backup_point(backup_point&) is a non-const lvalue overload, which means it
+    // is NOT what a `backup_point b = a;` with a mutable `a` selects -- that
+    // binds to the defaulted copy ctor below. It exists for callers passing a
+    // mutable lvalue to a by-value parameter. The two paths produce the same
+    // state, so the distinction is a compile-time detail rather than a semantic
+    // one, but it is the kind of thing worth knowing before "simplifying" one
+    // away.
     backup_point(backup_point& other)
         : vec(other.vec), vecflag(other.vecflag), buffer(other.buffer),
           cache(other.cache), assumptions(other.assumptions), ct(other.ct),
@@ -335,7 +353,14 @@ public:
     backup_point& operator=(backup_point&&) noexcept = default;
   };
 
+  // Ordinary backup points, one per block.
+  //
+  // Single-valued, unlike the generalized map below. A non-generalized block
+  // has exactly one way to be re-entered, so one snapshot describes it; making
+  // this a SmallVector too would cost an allocation on every block for a case
+  // that does not occur.
   llvm::DenseMap<BasicBlock*, backup_point> BBbackup;
+
   // Backedge-side state is a variable-width vector keyed by header. A loop
   // header may be reached from multiple backedges - each distinct backedge
   // sourceBlock contributes its own backup_point. Size 1 is the common
@@ -344,22 +369,58 @@ public:
   // all jump back to the same header).
   llvm::DenseMap<BasicBlock*, llvm::SmallVector<backup_point, 2>> generalizedLoopBackedgeBackup;
 
+  // The phis that *are* the loop-carried variables.
+  //
+  // One phi per register per header, built once at generalization time and then
+  // reused by every subsequent iteration. That is what makes the loop a loop in
+  // the IR rather than a chain of copies, and it is why these are keyed by
+  // header: the phi has to live in the header block for LLVM's dominance rules
+  // to accept it.
+  //
+  // std::array rather than a map of PHINode* because the register count is
+  // fixed and dense. A null entry means "this register does not vary across the
+  // loop", which is the common case and saves building a phi that would just
+  // forward one value.
   llvm::DenseMap<BasicBlock*, std::array<llvm::PHINode*, REGISTER_COUNT>>
       generalizedLoopRegisterPhis;
   llvm::DenseMap<BasicBlock*, std::array<llvm::PHINode*, FLAGS_END>>
       generalizedLoopFlagPhis;
+
+  // The tracked buffer as it stands inside a generalized loop.
+  //
+  // Separate from the lifter's main `buffer` because the restore path needs to
+  // compare the loop's own state against each backedge's, and doing that against
+  // the live buffer would mean mutating it during a comparison.
   llvm::DenseMap<uint64_t, ValueByteReference> activeGeneralizedLoopLocalBuffer;
+
   // A non-primary loop-carried memory qword: tracked across the loop boundary
   // with per-backedge values, but not the primary dispatcher control cursor.
   // Used by the generalized retrieve helpers to build phis for all varying
   // memory slots, not just the first two (control + target).
+  //
+  // `canonicalValue` is the value on the first iteration and `backedgeValues`
+  // the ones that arrive on each backedge; the phi for this slot is
+  // canonical -> [0], backedge[0] -> [1], and so on. Storing the canonical value
+  // separately rather than as backedgeValues[0] is what lets the phi have a
+  // different first incoming block than the rest.
   struct LoopCarriedSlot {
     uint64_t address = 0;
     uint64_t canonicalValue = 0;
     llvm::SmallVector<uint64_t, 2> backedgeValues;
   };
 
+  // Everything known about one generalized loop's control field.
+  //
+  // The canonical/backedge pairing runs through the whole struct and is the
+  // central idea: a generalized loop was reached in two or more ways, and each
+  // way carried a different value. Rather than choosing one, the lift records
+  // all of them and builds a phi, so the loop body is emitted once and the
+  // dispatcher's variable part becomes an explicit incoming value.
   struct GeneralizedLoopControlFieldState {
+    // Guards every other field. `valid` exists because the struct is a member of
+    // the lifter and therefore always constructed; without it, the default-
+    // constructed state would be indistinguishable from a discovered one whose
+    // control value happens to be 0.
     bool valid = false;
     llvm::BasicBlock* headerBlock = nullptr;
     llvm::BasicBlock* canonicalSource = nullptr;
@@ -367,6 +428,11 @@ public:
     llvm::SmallVector<llvm::BasicBlock*, 2> backedgeSources;
     uint64_t canonicalControl = 0;
     llvm::SmallVector<uint64_t, 2> backedgeControls;
+    // Buffer snapshots parallel to the above: the canonical source's tracked
+    // memory and each backedge's. Needed because a phi over a memory slot
+    // requires knowing which bytes that slot spans *per incoming edge* -- a
+    // byte that varies on one backedge but not another still needs the edge's
+    // value to build a correct phi.
     llvm::DenseMap<uint64_t, ValueByteReference> canonicalBuffer;
     llvm::SmallVector<llvm::DenseMap<uint64_t, ValueByteReference>, 2> backedgeBuffers;
     // Per-loop-discovered memory slots (Phase A: seeded to the Themida defaults
@@ -385,10 +451,37 @@ public:
   } activeGeneralizedLoopControlFieldState;
   llvm::DenseMap<llvm::BasicBlock*, GeneralizedLoopControlFieldState>
       generalizedLoopControlFieldStates;
+
+  // Sample-specific seeds, and they are exactly that.
+  //
+  // These addresses come from one Themida-protected binary. They are the
+  // dispatcher's control-cursor slot and one loop-carried slot in that sample,
+  // used until active discovery (Phase B) replaces them. They are NOT derived
+  // from anything the lifter can compute, and nothing validates them against the
+  // sample being lifted -- a different protector, or the same protector with a
+  // different layout, will seed the wrong slots and the resulting loop will be
+  // structurally plausible and wrong.
+  //
+  // Kept as constants rather than removed because they are the only thing that
+  // makes generalization work at all today. The offsets list below has the same
+  // property: three offsets that happened to be right for this sample's control
+  // field encoding.
   static constexpr uint64_t kThemidaControlCursorSlot = 0x14004DD19ULL;
   static constexpr uint64_t kThemidaLoopCarriedSlot = 0x14004DC67ULL;
   static constexpr std::array<uint64_t, 3> kSupportedGeneralizedControlFieldOffsets = {
       0x6ULL, 0xAULL, 0xCULL};
+
+  // Read a qword out of a tracked-buffer snapshot, byte by byte.
+  //
+  // Byte-wise rather than through retrieveCombinedValue because the source here
+  // is a *snapshot* (canonicalBuffer, a backedgeBuffer, or the live buffer) and
+  // not the lifter's buffer. The tracked-buffer helpers read the live map, so
+  // routing through them would read the wrong edge's value -- which is exactly
+  // the bug the phi construction is supposed to avoid.
+  //
+  // All-or-nothing: any missing or non-constant byte fails the whole read. A
+  // partially-known qword has no correct phi representation here, and returning
+  // a value built from the known bytes would be worse than declining.
   bool readConstantTrackedQword(
       const llvm::DenseMap<uint64_t, ValueByteReference>& src, uint64_t qwordStart,
       uint64_t& out) {
