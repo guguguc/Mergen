@@ -1,12 +1,47 @@
 // Semantics_Bitwise.ipp — Bitwise ops, rotate, inc/dec, stack push/pop
+//
+// Every handler here follows the same four-step shape, and reading one of
+// them tells you what all of them do:
+//
+//   1. fetch operands via GetIndexValue
+//   2. widen the source to the destination's type
+//   3. emit the operation through a *folder* (createXorFolder etc.)
+//   4. set SF/ZF/PF from the result, clear OF/CF, write the destination
+//
+// Two things are worth knowing before editing any of them.
+//
+// Step 2 is not optional. GetIndexValue can hand back a narrower LLVM type
+// than the destination -- an 8-bit source read as i8 against an i32
+// destination -- and LLVM's bitwise ops require both operands to have
+// identical types. Sign-extension (not zero-extension) is what the
+// architecture specifies for these forms.
+//
+// Step 4 passes *lambdas*, not values. setFlag stores the closure and forces
+// it later, so the flag computation is only materialised if something
+// actually reads the flag. On VM code where most flags are never consumed
+// this removes a large amount of dead arithmetic from the lifted IR. The
+// captures are by value for exactly that reason -- `result` must be pinned,
+// not re-read from the builder, which may have moved on.
+//
+// The OF/CF clears follow the Intel SDM: logic operations always clear both.
+// Do not "fix" that into a computed overflow flag.
+
 MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_xor() {
   /* auto dest = operands[0];
   auto src = operands[1]; */
   auto Lvalue = GetIndexValue(0);
   auto Rvalue = GetIndexValue(1);
 
+  // Widen the source to the destination's width before the XOR. See the file
+  // header: LLVM requires matching operand types, and the architecture
+  // specifies sign extension for this form.
   Rvalue = createSExtFolder(Rvalue, Lvalue->getType());
 
+  // Named with the address baked in. These names are load-bearing: the
+  // rewrite smoke corpus and the semantic reports both match on the emitted
+  // value names, and an address-qualified name is what lets a report say
+  // *which* instruction produced a value after the IR has been merged and
+  // optimised.
   auto result = createXorFolder(
       Lvalue, Rvalue, "realxor-" + std::to_string(current_address) + "-");
 
@@ -16,6 +51,12 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_xor() {
   //  The OF and CF flags are cleared; the SF, ZF, and PF flags are set
   //  according to the result. The state of the AF flag is undefined.
 
+  // Lazy: each lambda is stored and only forced if the flag is read later.
+  // SF/ZF/PF come from the result; OF and CF are unconditionally cleared,
+  // which is architecturally defined for XOR. AF is left untouched because
+  // the SDM calls its state undefined after a logic operation -- modelling
+  // "undefined" as "unchanged" is the only option that does not assert
+  // something the ISA does not guarantee.
   setFlag(FLAG_SF, [this, result]() { return computeSignFlag(result); });
   setFlag(FLAG_ZF, [this, result]() { return computeZeroFlag(result); });
   setFlag(FLAG_PF, [this, result]() { return computeParityFlag(result); });
@@ -95,6 +136,13 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_and() {
 
   SetIndexValue(0, result);
 }
+// VEX three-operand form: the destination is NOT one of the inputs, so
+  // operands map as [dest, src1, src2] and the read starts at index 1.
+//
+// This is the one handler in the file that does not widen: all three operands
+// already share a width under the VEX encoding, so there is no narrow-source
+// case to normalise. ANDN computes (~src1) & src2 -- note the operand order,
+// which is the opposite of AND and a frequent source of silent bugs.
 MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_andn() {
   // ANDN (VEX): dest = ~src1 & src2, so operands map to [dest, src1, src2].
   auto src1 = GetIndexValue(1);
@@ -148,9 +196,17 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_rol() {
   auto Lvalue = GetIndexValue(0);
   auto Rvalue = GetIndexValue(1);
 
-  Rvalue = createZExtFolder(Rvalue, Lvalue->getType());
+  // Zero-extend here, unlike the logic ops above which sign-extend. The count
+  // is masked immediately afterwards, so the high bits are discarded either
+  // way; sign-extension would only risk making the mask interact with a
+  // negative-looking value.
+  auto Rvalue = createZExtFolder(Rvalue, Lvalue->getType());
 
   auto bitWidth = ConstantInt::get(Lvalue->getType(), destsize);
+  // x86 masks rotate counts to 6 bits on 64-bit operands and 5 on 32-bit
+  // before reducing modulo the width. Masking first (rather than just doing
+  // mod width) is what reproduces the ISA's behaviour for large counts -- a
+  // count of 64 rotates by 0, and only this masking makes that fall out.
   auto countmask =
       ConstantInt::get(Lvalue->getType(), destsize == 64 ? 0x3f : 0x1f);
 
@@ -158,9 +214,14 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_rol() {
   auto zero = ConstantInt::get(Lvalue->getType(), 0);
 
   auto MSBpos = ConstantInt::get(Lvalue->getType(), destsize - 1);
+  // COUNTMASK then MOD SIZE -- the two steps from the SDM pseudocode above,
+  // kept separate because they are not the same operation.
   Rvalue = createURemFolder(createAndFolder(Rvalue, countmask, "maskRvalue"),
                             bitWidth);
 
+  // The rotate is expressed as a left shift by n OR a right shift by
+  // (width - n). The right shift brings the top n bits down to the bottom,
+  // which is exactly the wraparound half of the rotation.
   Value* shiftedLeft = createShlFolder(Lvalue, Rvalue);
 
   Value* shiftedRight =
@@ -168,8 +229,14 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_rol() {
 
   Value* result = createOrFolder(shiftedLeft, shiftedRight);
 
+  // CF is the bit rotated out of the top, which is bit 0 of shiftedRight.
   Value* cf = createZExtOrTruncFolder(shiftedRight, Type::getInt1Ty(context));
 
+  // When the masked count is 0 the SDM says CF and OF are *unmodified*, not
+  // zero. These two selects are what implement that: the old values are read
+  // back and selected through instead of the computed ones. Modelling
+  // "unmodified" as "zero" would silently change the flags for a no-op rotate,
+  // which is common in VM dispatch code that rotates by a computed amount.
   Value* isZeroBitRotation = createICMPFolder(CmpInst::ICMP_EQ, Rvalue, zero);
   Value* oldcf = getFlag(FLAG_CF); // undefined
 
@@ -177,6 +244,9 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_rol() {
 
   result = createSelectFolder(isZeroBitRotation, Lvalue, result);
   // of = cf ^ MSB
+  //
+  // Read the MSB of the *result*, not the input: the SDM defines OF as the new
+  // MSB XOR CF, which is only meaningful once the rotation has happened.
   Value* newMSB = createLShrFolder(result, MSBpos, "rolmsb");
   auto of1 = createZExtOrTruncFolder(newMSB, Type::getInt1Ty(context));
 
@@ -185,6 +255,11 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_rol() {
 
   // Use Select to conditionally update OF based on whether the shift
   // amount is 1
+  //
+  // OF is only architecturally defined when the masked count is exactly 1.
+  // For any other count it is undefined, and the SDM's own pseudocode says so.
+  // The implementation keeps the old OF in that case rather than inventing a
+  // value -- the same "unmodified" reading used for CF above.
   Value* isOneBitRotation = createICMPFolder(CmpInst::ICMP_EQ, Rvalue, one);
   Value* ofCurrent = getFlag(FLAG_OF);
   of = createSelectFolder(isOneBitRotation, of, ofCurrent);
