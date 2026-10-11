@@ -325,6 +325,17 @@ struct llvm::DenseMapInfo<CursorMuxForkKey> {
   }
 };
 
+// The worklist entry: a runtime address and the basic block that lifts it.
+//
+// The pairing is not redundant. block_address is the *runtime* address, which
+// is what path solving, diagnostics, and the perf site histograms are keyed
+// by; `block` is the LLVM object, which is what the lifter emits into. A
+// block reached under different assumptions shares the runtime address but
+// not necessarily the BasicBlock -- which is why both are carried.
+//
+// Not hashed or compared: the commented-out operator== below records an
+// abandoned attempt to key a map on it. The type is a worklist payload, not a
+// map key, and adding the comparison would invite using it as one.
 struct BBInfo {
   uint64_t block_address = 0;
   llvm::BasicBlock* block = nullptr;
@@ -362,6 +373,25 @@ struct BBInfo {
   // };
 };
 
+// A value that is computed on first use rather than at construction.
+//
+// The lifter uses this wherever computing a value eagerly would be wrong or
+// wasteful: a memory read whose address may not be resolvable, a value whose
+// computation would emit IR that must land at a particular point, or a result
+// that is often never needed. Deferring means the compute function runs with
+// the builder and the module in whatever state they are at *first use*, which
+// is usually the only state in which the computation is valid.
+//
+// The three-state representation is the subtle part:
+//
+//   value == some Value    already computed (or supplied directly)
+//   value == nullopt       not yet computed; computeFunc is pending
+//   value == nullptr       explicitly null
+//
+// nullopt and a stored nullptr are different and both are reachable: the
+// compute function can legitimately return null when a read fails. Collapsing
+// them would make a failed computation recompute forever, and would lose the
+// distinction between "failed" and "not asked yet".
 class LazyValue {
 public:
   using ComputeFunc = std::function<llvm::Value*()>;
@@ -375,7 +405,15 @@ public:
   LazyValue(std::function<llvm::Value*()> calc)
       : value(std::nullopt), computeFunc(calc) {}
 
-  // get value, calculate if doesnt exist
+  // Get the value, computing it if that has not happened yet.
+  //
+  // The `&& computeFunc` guard is not defensive noise: a LazyValue default-
+  // constructed and never assigned has nullopt with no pending computation,
+  // and calling it unconditionally would dereference an empty std::function.
+  //
+  // A compute function returning null caches that null rather than being
+  // retried. Retrying would re-emit IR on each call and, for a failed read,
+  // would produce a different answer each time.
   llvm::Value* get() const {
     if (!value.has_value() && computeFunc) {
 
@@ -386,10 +424,20 @@ public:
   }
 
   // Set a new value directly, bypassing lazy evaluation
+  //
+  // The pending computation is cleared, not just overridden. Leaving it in
+  // place would be harmless today because `get` short-circuits on a stored
+  // value -- but it keeps a closure, and any future change that invalidates
+  // on setCalculation would make the stale one live again.
   void set(llvm::Value* newValue) {
     value = newValue;
     computeFunc = nullptr;
   }
+  // Replace the pending computation and discard any already-computed value.
+  //
+  // Resetting the value is the point: the new computation almost certainly
+  // describes a different address or width, so reusing the old result would be
+  // wrong rather than merely stale.
   void setCalculation(const std::function<llvm::Value*()> calc) {
     computeFunc = calc;
     value = std::nullopt; // Reset the stored value
@@ -413,6 +461,19 @@ concept lifterConcept = Registers<R> && requires(T t) {
   } -> std::same_as<void>;
 };
 
+// Expands to the out-of-line definition of a lifterClassBase member.
+//
+// Every member of the base is declared inside the class template but defined
+// here, because the definitions need the Derived template parameter and the
+// full template parameter list -- which cannot be spelled at the use site. The
+// macro exists so those four lines are written once rather than at each of the
+// several hundred definition sites.
+//
+// Note the parameter order differs between the macro (Derived, Mnemonic,
+// Register, DisassemblerBase) and the class declaration below
+// (Derived, Mnemonic, Register, DisassemblerBase as written). They must stay in
+// sync; the requires clause repeated here is not decorative, it is what makes
+// the out-of-line definition legal.
 #define MERGEN_LIFTER_DEFINITION_TEMPLATES(ret)                                \
   template <typename Derived, Mnemonics Mnemonic, Registers Register,          \
             template <typename, typename> class DisassemblerBase>              \
@@ -429,9 +490,31 @@ concept lifterConcept = Registers<R> && requires(T t) {
 // object: the register-stream hook lives in a member template, so a static local
 // there would be instantiated once per translation unit and the two streams would
 // disagree on numbering. Defined in Utils.cpp.
+//
+// The reason this is worth stating: the whole feature depends on the two
+// streams interleaving correctly, and that is only true because the counter is
+// program-wide rather than per-hook. Making it a static local would look
+// equivalent and silently produce two timelines that could not be merged --
+// the kind of bug that produces plausible but wrong traces rather than an
+// error.
 unsigned long long nextMemEventSeq();
 
-// main lifter
+// The lifter base: everything the concrete lifter shares.
+//
+// CRTP throughout -- the base never holds a Derived pointer, it casts `this`
+// at each dispatch point. That keeps the register and memory access on the hot
+// path free of vtable indirection and lets the compiler inline across the
+// boundary, at the cost of the base being abstract in practice.
+//
+// The class hierarchy is three levels and each adds one thing:
+//
+//   lifterClassBase   this: state, IR emission, and the machinery
+//   lifterSymbolic    registers as a memory-resident struct (execution model)
+//   lifterConcolic    path exploration on top (execution strategy)
+//
+// Nothing below this class should need to know which of the two concrete
+// lifter classes it is running under; that is what makes the semantics files
+// backend- and strategy-agnostic.
 template <typename Derived = void,
 #ifdef ICED_FOUND
           Mnemonics Mnemonic = Mergen::IcedMnemonics,
@@ -454,12 +537,42 @@ public:
   // ConstantFolder (not InstSimplifyFolder): the simplifier folder can delete an
   // instruction it just created when it folds it to an existing value, which
   // invalidates ValueHandles held by the concolic state during lifting.
+  //
+  // This is the single most consequential line in the class. With the
+  // simplifier folder, a fold can destroy the very instruction the concolic
+  // backup points are holding, and the WeakTrackingVH that was supposed to
+  // make that safe would silently null -- producing wrong IR rather than a
+  // crash. The plain ConstantFolder creates-or-returns and never deletes, which
+  // is what makes the handle-based state tracking viable.
   std::unique_ptr<llvm::IRBuilder<>> builder;
   BBInfo blockInfo;
+  // The address of the instruction currently being lifted. Note it is *past*
+  // the instruction, i.e. it equals RIP after it executes -- which is why
+  // RIP-relative operands and jump displacements are computed as
+  // current_address + displacement, and why diagnostic sites are recorded as
+  // current_address - instruction.length.
   uint64_t current_address;
+
+  // Three mutually-consistent termination flags, and reading them correctly
+  // matters more than it looks:
+  //
+  //   run        stop lifting *this block*; the lift loop moves to the next
+  //              queued one. Set after any branch, call, or return.
+  //   finished   stop the entire lift. Set on a real function return, and on
+  //              every path that cannot continue (not_implemented, trap).
+  //   isUnreachable  this block cannot be reached; it still needs sealing so
+  //              the module verifies, but nothing should be emitted into it.
+  //
+  // run=1 with finished=1 is the normal end of a block. finished without run
+  // means the whole lift is over. Clearing run without finishing means "keep
+  // lifting here", which is why lift_ret clears `run` before continuing on a
+  // continuation return.
   bool run = 0;      // we may set 0 so to trigger jumping to next basic block
   bool finished = 0; // finished, unfinished, unreachable
   bool isUnreachable = 0;
+  // Monotonic instruction counter. Used to distinguish two values printed from
+  // the same source line in a debug trace, and to correlate an IR value with
+  // the instruction that produced it.
   uint32_t counter = 0;
   // unique
 
