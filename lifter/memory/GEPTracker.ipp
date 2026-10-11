@@ -109,9 +109,9 @@ static llvm::ConstantInt* peelToConstantInt(llvm::Value* v, unsigned depth = 0) 
   // Aftermath / BLARE2: store-forward is byte-level. A VM store of
   // `zext i32 C to i64` is still a concrete qword; returning the narrow
   // ConstantInt made addValueReference reject the peel (width mismatch) and
-  // left unaligned cross-slot loads unable to compose (work.md 7.12.9鈥?0).
+  // left unaligned cross-slot loads unable to compose (work.md 7.12.9—0).
   // Re-apply the cast to the peeled constant so the result matches `v`'s
-  // width. Do not walk or/shl FLAGS chains 鈥?that is the 7.12.7 regression.
+  // width. Do not walk or/shl FLAGS chains — that is the 7.12.7 regression.
   // Re-apply the cast to the peeled constant rather than returning the inner
   // one. The width has to match `v`'s: returning a narrower ConstantInt made
   // addValueReference reject the peel on a width mismatch, which silently
@@ -889,7 +889,7 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::retrieveCombinedValueImpl(
   printvalue(result);
   if (auto* ci = dyn_cast<ConstantInt>(result)) {
     // trackedBufferConstant already returned real stored zeros. A composed
-    // zero at this point is file bytes or empty buffer slots 鈥?the Themida
+    // zero at this point is file bytes or empty buffer slots — the Themida
     // range-policy failure mode (promote a slot rewritten before the lift).
     if (byteCount >= 8 && ci->isZero() &&
         !file.isImmutableImageAddress(policyStartAddress)) {
