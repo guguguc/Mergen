@@ -1,5 +1,25 @@
 #ifndef LIFTERCLASS_CONCRETE_H
 #define LIFTERCLASS_CONCRETE_H
+
+// The concolic execution model: lifterSymbolic plus path exploration.
+//
+// The division of labour with its base is worth stating before reading any of
+// it. lifterSymbolic (LifterClass_Symbolic.hpp) owns the architectural state
+// -- registers as a memory-resident struct, pseudo-memory as an alloca -- and
+// has no notion of exploring alternatives. This class adds exactly one idea on
+// top: when a symbolic value could be more than one thing, the lifter can
+// *choose* a value, lift down that path, and remember the choice so a later
+// block can be entered under the other assumption.
+//
+// That turns a single symbolic walk into a guided concrete one. The mechanism
+// is the `assumptions` map -- an SSA value mapped to the value it was assumed
+// to hold -- plus the worklist of blocks to visit. A block queued twice with
+// different assumptions is visited twice.
+//
+// The cost, and the reason this is bounded rather than exhaustive: the
+// worklist can grow multiplicatively with branch depth, so LiftBlockBudgetExceeded
+// is a real diagnostic rather than a theoretical one.
+
 #include "CommonDisassembler.hpp"
 #include "RegisterManager.hpp"
 #include "IcedDisassembler.hpp"
@@ -167,6 +187,20 @@ public:
 
   constexpr ControlFlow getControlFlow_impl() { return ControlFlow::Unflatten; }
 
+  // A snapshot of everything needed to resume a block later under possibly
+  // different assumptions.
+  //
+  // This is what makes concolic exploration possible: the lift loop reaches a
+  // branch, cannot resolve the condition, and must try both sides. Each side
+  // needs the state as it was *at the branch*, not as it is now -- so a
+  // backup_point is taken before either side is explored and restored when that
+  // side's block is reached.
+  //
+  // The fields are WeakTrackingVH rather than raw pointers on purpose. The
+  // module is mutated constantly during lifting, and a raw pointer into it
+  // would dangle after any pass or promotion replaced an instruction.
+  // WeakTrackingVH nulls itself instead, which turns a use-after-free into a
+  // visible null.
   struct backup_point {
     std::array<llvm::WeakTrackingVH, REGISTER_COUNT> vec;
     std::array<llvm::WeakTrackingVH, FLAGS_END> vecflag;
@@ -176,6 +210,14 @@ public:
     uint64_t ct;
     llvm::BasicBlock* sourceBlock;
 
+    // Equality is used to decide whether a backup point is redundant with one
+    // already stored -- queueing a block whose state is identical to an
+    // existing entry would visit it twice for the same result.
+    //
+    // Note `cache` and `assumptions` are deliberately NOT compared. Both are
+    // derived artefacts that can differ without the architectural state
+    // differing, and treating a cache difference as a state difference would
+    // make almost every backup point look unique and defeat the check.
     bool operator==(const backup_point& other) const {
       if (buffer != other.buffer)
         return false;
@@ -751,6 +793,16 @@ public:
     // mix const-path: ~46k backups × DenseMap copy was ~3s.
     // Never move into generalized backups: that path may store the snapshot
     // twice (BBbackup + backedge vector).
+    //
+    // The move is only sound when the current path is genuinely finished with.
+    // If the caller intends to keep lifting along this path, the state it
+    // moved away is gone -- which is why this is opt-in per call site and not
+    // a general optimisation.
+    //
+    // The `!generalized` guard is not merely a fast path. The generalized
+    // branch below stores the snapshot in two places, so moving into it would
+    // leave one of the two holding emptied maps, and restoring that copy would
+    // silently lose the entire block state.
     const bool doMove = moveState && !generalized;
     LiftPerfDiag::ScopedTimer backupTimer(
         &this->perfDiag,
@@ -758,6 +810,15 @@ public:
     if (doMove) {
       // Steal directly into the map slot — avoids a temporary backup_point
       // and a second InstructionCache move (now unique_ptr-sized anyway).
+      //
+      // Writing into the slot rather than constructing a temporary and moving
+      // that matters: default-constructing a backup_point then moving into it
+      // would allocate and release the DenseMaps an extra time, and this path
+      // runs ~46k times per lift of a protected sample.
+      //
+      // ct and sourceBlock are copied rather than stolen because they are
+      // scalars the caller still needs -- counter continues to be incremented,
+      // and sourceBlock is the insert block that stays current.
       auto& slot = BBbackup[bb];
       slot.vec = std::move(vec);
       slot.vecflag = std::move(vecflag);
@@ -806,6 +867,16 @@ public:
     return tArm && fArm;
   }
 
+  // Fork a VM pcode-cursor multiplex: a select between two constant bytecode
+  // addresses is the shape a VM dispatcher uses to choose its next handler,
+  // and exploring both arms is how the lifter follows the VM rather than
+  // giving up at the first symbolic dispatch.
+  //
+  // The cursorMuxForked set makes this idempotent per (condition, slot). On
+  // the first call it creates the two blocks; on every later call with the same
+  // key it *replays* the recorded assumption instead of forking again. Without
+  // that, a loop containing the same mux would fork on every iteration and the
+  // worklist would grow without bound.
   bool tryForkCursorSelectMux_impl(llvm::SelectInst* sel, uint64_t slot,
                                    llvm::ConstantInt* tArm,
                                    llvm::ConstantInt* fArm) {
@@ -816,6 +887,13 @@ public:
 
     const CursorMuxForkKey key{condInst, slot};
     if (this->cursorMuxForked.contains(key)) {
+      // Already forked for this condition. The assumption recorded on the
+      // condition now *is* the answer: write the chosen arm back into the
+      // slot and return, rather than creating another pair of blocks.
+      //
+      // A missing assumption here means the restore path did not carry it
+      // across -- returning false lets the caller fall back to the generic
+      // handling, which is the safe degradation.
       auto it = this->assumptions.find(condInst);
       if (it == this->assumptions.end()) {
         return false;
