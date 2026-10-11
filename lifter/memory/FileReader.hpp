@@ -1,6 +1,24 @@
 #ifndef FILEREADER_HPP
 #define FILEREADER_HPP
 
+// The lifter's view of the input file, and the authority on whether a given
+// address can be read concretely.
+//
+// Two jobs, and they are related:
+//
+//   1. Address translation. The rest of the lifter works in VAs; the file is
+//      laid out in sections. address_to_mapped_address bridges them.
+//
+//   2. Trust. Every concrete read the lifter performs is justified by this
+//      class. A zero in the file and a zero written by the loader after
+//      mapping are indistinguishable, and conflating them is how a lifter ends
+//      up trusting a decrypted-at-runtime value that is still encrypted in the
+//      file. isImmutableImageAddress / shouldPromoteFileValue exist to keep
+//      that distinction sharp.
+//
+// RuntimeMemoryOverlay is consulted *before* the file in readMemory, so a
+// supplied dump takes precedence over on-disk bytes at the same address.
+
 #include "nt/nt_headers.hpp"
 #include "RuntimeMemDump.hpp"
 #include <algorithm>
@@ -11,7 +29,17 @@
 #include <cstring>
 #include <vector>
 
+// Which PE optional-header layout the input uses. Kept as a plain enum rather
+// than enum class because it is stored in RuntimeImageContext and compared
+// against values produced in several places; the unscoped form keeps those
+// call sites terse.
 enum arch_mode : uint8_t { X86 = 0, X64 = 1 };
+
+// Section access rights, as a bitset. Section characteristics in a PE are a
+// two-byte flags field with overlapping meanings (CONTENT_UNINITIALIZED,
+// MEM_DISCARDABLE, MEM_SHARED all set bits 0x20/0x1000/0x1000000 alongside the
+// access bits), so this models only the access triple and composes the common
+// combinations rather than mirroring the raw bit layout.
 enum class characteristics : uint8_t {
   NONE = 1 << 0,
   R = 1 << 1,
@@ -51,6 +79,18 @@ inline bool isFileImmutableSection(const char* name) {
   return false;
 }
 
+// Whether a VA lands in a section whose on-disk bytes are still valid after
+// mapping.
+//
+// Note the early `true`: an RVA that precedes every section is in the PE
+// headers, which are always file-immutable. The caller passes a *sorted*
+// section range, so upper_bound plus one decrement finds the containing
+// section; if there is none, the address is in the headers.
+//
+// short_name is copied into a fixed 9-byte buffer before comparison rather
+// than compared as raw bytes, because win::section_header_t pads the 8-byte
+// name to 10 and the padding is not guaranteed to be zero-terminated or
+// zero-filled.
 template <typename SectionRange>
 inline bool isImmutableImageAddressIn(uint64_t imageBase,
                                       const SectionRange& sections,
@@ -79,6 +119,8 @@ inline bool isImmutableImageAddressIn(uint64_t imageBase,
   return isFileImmutableSection(name);
 }
 
+// Compile-time contract for a concrete reader, checked at construction so a
+// half-implemented reader fails at its own definition.
 template <typename T>
 concept FileRead = requires(T t) {
   { t.init_impl(std::declval<uint8_t*>()) } -> std::same_as<bool>;
@@ -87,6 +129,9 @@ concept FileRead = requires(T t) {
   } -> std::same_as<uint64_t>;
 };
 
+// CRTP base. Static dispatch for the same reason as MemoryPolicy: readMemory
+// and address_to_mapped_address are on the hot path of every lowered operand,
+// and there is no polymorphic ownership to justify a vtable.
 template <typename Derived> class FileReader {
 protected:
   uint8_t* FileBase;
@@ -103,6 +148,13 @@ public:
   uint64_t address_to_mapped_address(uint64_t rva) {
     return static_cast<Derived*>(this)->address_to_mapped_address_impl(rva);
   }
+  // Overlay first, file second.
+  //
+  // A dump is process memory observed later than the file on disk, so when
+  // both have the address the dump is the more current answer. A miss in the
+  // overlay is the normal case rather than an error, so the fallback is
+  // unconditional and silent -- the overlay's own failure modes are already
+  // conservative (it refuses to serve anything not wholly inside one span).
   bool readMemory(uint64_t rva, unsigned count, uint64_t& out) {
     if (runtimeOverlay.read(rva, count, out)) {
       return true;
@@ -121,6 +173,14 @@ public:
   // mapping. Refuse the whole load, including 1-4 byte slices of an 8-byte
   // zero qword. Bytecode zeros that sit inside a nonzero qword still promote.
   // Dump-backed bytes are process memory at the lift RVA, including valid zeros.
+  //
+  // The qword-widening in the narrow case is the subtle part: a 4-byte read
+  // that happens to return zero is not evidence that the slot was never
+  // written, because the protector may have written the *other* half. Reading
+  // the containing qword and requiring it to be entirely zero is the only
+  // check that holds. `!readMemory` returning true on failure is likewise
+  // deliberate -- an unreadable qword is not evidence of a rewrite, so the
+  // conservative promote is correct.
   bool shouldPromoteFileValue(uint64_t va, unsigned byteSize, uint64_t value) {
     if (runtimeOverlay.covers(va, byteSize)) {
       return true;
@@ -141,6 +201,9 @@ public:
     }
     return qword != 0;
   }
+  // Debug-only precondition check. assert, not a throw or a diagnostic: the
+  // caller contract is established by init(), and violating it is a
+  // programming error in the lifter rather than bad input from the user.
   inline void filebase_exists() {
 
     assert(FileBase != nullptr && "fileBase is NULL");
