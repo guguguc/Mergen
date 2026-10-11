@@ -1026,6 +1026,14 @@ KnownBits computeKnownBitsFromOperation(KnownBits& vv1, KnownBits& vv2,
   return KnownBits(0); // never reach
 }
 
+// Public entry for binary folding: impl, then bookkeeping.
+//
+// Kept separate from folderBinOpsImpl so that every binary operation goes
+// through the same two side channels regardless of which folding path handled
+// it -- folding, early exit, or plain emission. If the provenance logic lived
+// inside the impl it would be skipped on the early-exit paths, and those are
+// exactly the cases where a computed target collapses to something the VMP
+// model still needs to recognise.
 MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::folderBinOps(
     Value* LHS, Value* RHS, const Twine& Name, Instruction::BinaryOps opcode) {
   Value* result = folderBinOpsImpl(LHS, RHS, Name, opcode);
@@ -1035,7 +1043,18 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::folderBinOps(
   // keeps the identity of the bytecode load that produced it - that load is
   // the VIP. Only values that feed the transfer ever carry it, so mutated
   // junk loads (intel.cc:16039) never contribute.
-  {
+  // Memory provenance: remember which bytecode load produced a value.
+//
+// The rationale is specific to VMProtect-style dispatch. A transfer target is
+// usually computed as `base + index` where the index came from a bytecode
+// load; that load *is* the VIP. If the arithmetic that combines them is
+// recorded as opaque, the VMP model cannot tell a transfer target from an
+// ordinary computed address.
+//
+// LHS is checked first, then RHS. The asymmetry is a preference, not a
+// correctness rule -- when both carry provenance the left one wins, which is
+// stable across runs and keeps the cache deterministic.
+{
     LiftPerfDiag::ScopedTimer provenanceTimer(
         &perfDiag, &perfDiag.folderProvenance);
     if (result) {
@@ -1051,6 +1070,22 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::folderBinOps(
   return result;
 }
 
+// The heart of the folding engine.
+//
+// Strategy order, cheapest first:
+//
+//   1. identity folds   LHS == RHS, no arithmetic needed at all
+//   2. constant x const straight APInt arithmetic
+//   3. single-constant  strength reductions and identities
+//   4. pattern matching  algebraic identities over constants (x & 0 = 0,
+//                       x | ~0 = -1, x ^ x = 0, ...)
+//   5. known bits       neither operand constant, but the result is provable
+//   6. LLVM fallback    ConstantFoldInstruction / simplifyInstruction
+//   7. emit
+//
+// Every early exit goes through the `earlyExit` lambda rather than returning
+// directly, so the folderExitEarly counter sees all of them. Counting only
+// some exits would make that counter useless for locating the hot path.
 MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::folderBinOpsImpl(
     Value* LHS, Value* RHS, const Twine& Name, Instruction::BinaryOps opcode) {
   auto folderSample = profiler.sample("sem_folder_binops");
@@ -1086,6 +1121,20 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::folderBinOpsImpl(
     }
   }
 
+  // Identity folds for LHS == RHS.
+  //
+  // Only four operations qualify, and the exclusions are as informative as the
+  // inclusions. There is deliberately NO case for:
+  //
+  //   Mul    x * x != x in general (only for 0 and 1)
+  //   Shl/LShr  x << x and x >> x are undefined when the shift amount is >= the
+  //            bit width, and x itself frequently is
+  //   Div/Rem  x / x is 1 only for x != 0, and divides by zero is undefined
+  //   Add     x + x is 2*x, not an identity worth special-casing here
+  //
+  // Folding any of those unconditionally would be wrong, and folding them with
+  // guards is left to the pattern-matching stage where the guard can be
+  // expressed once.
   if (LHS == RHS) {
     switch (opcode) {
     case Instruction::Xor:
@@ -1100,6 +1149,12 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::folderBinOpsImpl(
     }
   }
 
+  // Both operands constant: fold directly with APInt arithmetic.
+  //
+  // This is the cheapest genuinely useful case and it runs before any pattern
+  // matching. APInt handles the wraparound for free, which matters: the lifter
+  // does not model wrapping as impossible (see computeKnownBitsFromOperation),
+  // so the fold here must wrap the same way rather than trap or saturate.
   if (auto* LHSConst = dyn_cast<ConstantInt>(LHS)) {
     if (auto* RHSConst = dyn_cast<ConstantInt>(RHS)) {
       const llvm::APInt& lhsValue = LHSConst->getValue();
