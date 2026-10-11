@@ -1188,16 +1188,41 @@ public:
     this->counter++;
   };
 
+  // Deliberately empty: lifting from an in-memory buffer rather than from the
+  // mapped PE has no implementation. Kept as a declaration so the signature
+  // is reserved without implying the feature exists. Adding a body here would
+  // need the same address resolution the byte-array path does, and doing that
+  // against bytes with no image base behind them is a different feature, not a
+  // stub.
   void liftBasicBlockFromBytes(std::vector<uint8_t> bytes) {
     //
   }
 
-  // useless in symbolic?
+  // The state-transfer hooks. Every one of these is a pure forwarding call into
+  // Derived, and all of them are meaningful only under lifterConcolic's
+  // path-exploration strategy -- lifterSymbolic never takes a backup because it
+  // never backtracks. The "useless in symbolic?" notes in the file are that
+  // observation, not a request to delete them.
+  //
+  // They live on the base because the lift loop in LiftDriver.hpp is written
+  // against the base and must not know which strategy it is driving.
   void branch_backup(BasicBlock* bb, bool generalized = false,
                      bool moveState = false) {
     static_cast<Derived*>(this)->branch_backup_impl(bb, generalized, moveState);
   }
 
+  // Write a constant into the tracked buffer, one byte at a time.
+  //
+  // Byte granularity is the point, not an accident of the loop. The buffer is
+  // how the lifter records what it *believes* each address holds, and reads
+  // against it are frequently narrower than the write -- an 8-byte constant
+  // written here may be read back as 4 bytes by the next instruction. Storing
+  // whole values instead of bytes would make those partial reads impossible to
+  // answer.
+  //
+  // Null is an early return rather than a crash: callers pass the result of a
+  // conditional resolution, and "the value is unknown" is a normal outcome
+  // that should leave the buffer untouched rather than fabricate zeroes.
   void writeBufferQwordFromConstant(uint64_t address, llvm::ConstantInt* ci) {
     if (ci == nullptr) {
       return;
@@ -2724,8 +2749,22 @@ public:
     //
   }
 
+  // Operand access by position. Every semantics handler goes through these
+  // rather than touching the instruction's operand list directly, because the
+  // backend normalisation happens here: `index` is an operand *position*, and
+  // resolving it to a register, an immediate, or a memory address requires the
+  // operand-type model that differs between the disassembler backends.
+  //
+  // Keeping that in one pair of functions is what lets the semantics files be
+  // backend-agnostic. A handler reaching into instruction.operands directly
+  // would have to re-derive the position-to-operand mapping for each backend.
   llvm::Value* GetIndexValue(uint8_t index);
 
+  // Partial-width writes are the caller's responsibility to request: this
+  // writes the full width of the operand's register. The semantics handlers do
+  // the narrowing explicitly before calling, which is why they are the ones
+  // that know the architecture's rules about which writes zero-extend and which
+  // preserve the upper bits.
   void SetIndexValue(uint8_t index, Value* value);
   /*
     llvm::Value* GetOperandValue(const ZydisDecodedOperand& op,
@@ -2740,6 +2779,17 @@ public:
   void dumpRflagsDiag(const char* tag, uint64_t rva,
                       llvm::Value* rflagsIr = nullptr, uint64_t extraAddr = 0);
 
+  // Two distinct things, deliberately not merged.
+  //
+  // getSPaddress returns RSP as a *value* -- the stack pointer's integer
+  // contents. getSP returns it as a *pointer* -- the pseudo-stack address the
+  // lift can GEP and load from. Callers that mean "where is the stack pointer"
+  // want the first; callers that mean "read a stack slot" want the second.
+  //
+  // Conflating them is the classic mistake here: using the raw integer where a
+  // pointer was intended produces a GEP on a non-pointer, and using the pointer
+  // where the value was intended loses the register's identity, which matters
+  // for the RSP-drift checks and the pop/ret logic.
   llvm::Value* getSPaddress() { return GetRegisterValue(Register::RSP); }
   llvm::Value* getSP() { return getPointer(getSPaddress()); };
   // end getters-setters
@@ -2747,6 +2797,13 @@ public:
   llvm::Value* callFunctionIR(const std::string& functionName,
                               funcsignatures<Register>::functioninfo* funcInfo);
   llvm::Value* GetEffectiveAddress();
+  // Integer -> pointer. Used wherever the lifter has an address-valued
+  // expression that must become a GEP base.
+  //
+  // This is also the point where pseudo-memory stops being pseudo. Until a
+  // value has been through getPointer it is an ordinary integer and LLVM will
+  // not accept it as a GEP operand; PromotePseudoMemory later does the reverse
+  // for addresses that never resolve.
   llvm::Value* getPointer(llvm::Value* value);
 
   std::vector<llvm::Value*>
