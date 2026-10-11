@@ -1548,15 +1548,31 @@ public:
       //    and pick the most-varying. A "qword start" is an address A where
       //    canonical has 8 contiguous tracked bytes from A and has no key at
       //    A-1 (filters overlapping qwords from a single tracked region).
+      //
+      // The addr-1 test is what makes the candidate set non-overlapping. Without
+      // it, a 16-byte tracked region yields 9 "qword starts" all describing the
+      // same bytes, each scoring the same variance -- so the tiebreak would pick
+      // by address rather than by anything meaningful, and could land on an
+      // unaligned offset into the middle of a real slot.
       llvm::SmallVector<uint64_t, 16> candidates;
       for (const auto& entry : canonical.buffer) {
         const uint64_t addr = entry.first;
+        // isTrackedStackAddress here, not isTrackedLocalStackAddress, even
+        // though the exclusion is broader than necessary. The scan is looking
+        // for VM memory, and being conservative about what counts as stack costs
+        // nothing: stack addresses are restored by the local-buffer path and
+        // would never have qualified anyway.
         if (this->isTrackedStackAddress(addr)) continue;
         if (canonical.buffer.contains(addr - 1)) continue;
         uint64_t dummy = 0;
         if (!readConstantTrackedQword(canonical.buffer, addr, dummy)) continue;
         candidates.push_back(addr);
       }
+      // Sorted so the "lowest address wins" tiebreak below is a stable, stated
+      // rule rather than an accident of DenseMap iteration order. Unsorted, the
+      // same input could select a different slot across runs or across a
+      // rebuild -- and the discovery result feeds straight into phi
+      // construction, so a nondeterministic choice is a nondeterministic lift.
       std::sort(candidates.begin(), candidates.end());
       size_t bestVarianceCount = 0;
       for (uint64_t addr : candidates) {
@@ -1564,6 +1580,9 @@ public:
         if (!tryPopulateControlFromSlot(canonical, backedges, addr, probe)) {
           continue;
         }
+        // Strict >, not >=. A tie keeps the earlier -- that is, the
+        // lower-addressed -- candidate, which is the documented tiebreak and is
+        // only a stable rule because the sort above ran.
         if (probe.backedgeSources.size() > bestVarianceCount) {
           bestVarianceCount = probe.backedgeSources.size();
           result.controlSlot = probe.controlSlot;
@@ -1577,6 +1596,10 @@ public:
         return result;  // no varying qword anywhere -> no control slot
       }
     }
+    // `valid` set only here, after a control slot was actually found. Setting it
+    // any earlier would mark a result whose backedge vectors are empty as a
+    // valid discovery, and the phi construction would then build a zero-incoming
+    // phi.
     result.valid = true;
 
     // Target slot: prefer legacy Themida carried slot if usable across all
@@ -1593,6 +1616,12 @@ public:
     if (targetUsableAt(kThemidaLoopCarriedSlot)) {
       result.targetSlot = kThemidaLoopCarriedSlot;
     } else {
+      // Same candidate enumeration as the control scan but WITHOUT the
+      // readConstantTrackedQword filter. The control slot must be readable to be
+      // a control; the target slot only has to be *tracked on every selected
+      // backedge* (which targetUsableAt checks), and requiring it readable in
+      // canonical too would reject a target whose canonical value happens not to
+      // be a constant yet. The helper handles the matching-values case.
       llvm::SmallVector<uint64_t, 16> targetCandidates;
       for (const auto& entry : canonical.buffer) {
         const uint64_t addr = entry.first;
@@ -1600,13 +1629,21 @@ public:
         if (canonical.buffer.contains(addr - 1)) continue;
         targetCandidates.push_back(addr);
       }
+      // Sorted for the same reason as the control scan: "lowest address" is a
+      // stated tiebreak only if the iteration order is one.
       std::sort(targetCandidates.begin(), targetCandidates.end());
+      // First usable wins, which given the sort means lowest address.
       for (uint64_t addr : targetCandidates) {
         if (targetUsableAt(addr)) {
           result.targetSlot = addr;
           break;
         }
       }
+      // targetSlot may remain 0 if nothing qualified. That is not an error: the
+      // target-slot helper is optional, and the control slot alone is enough to
+      // generalize a loop. A zero targetSlot is distinguishable from a real
+      // slot at address 0 only by the surrounding validity checks, which is why
+      // those checks exist.
     }
 
     // Collect ALL additional varying qwords beyond controlSlot/targetSlot.
@@ -1631,6 +1668,12 @@ public:
         // Unlike controlSlot, we include slots even when some backedges match
         // the canonical value — the helper will collapse to the shared value
         // when all match, and build a phi when any differ.
+        //
+        // This is the TEA-round fix: the earlier code required a slot to differ
+        // from canonical on every backedge, so a slot that varied on two backedges
+        // out of three was silently dropped and the loop body read the wrong
+        // value on the third. Dropping a constant-valued slot costs a phi; it
+        // does not cost correctness, so the permissive test is the right one.
         bool anyBackedgeHasSlot = false;
         LoopCarriedSlot slot;
         slot.address = addr;
@@ -1643,6 +1686,17 @@ public:
           } else {
             // Backedge buffer lacks this slot — skip entire slot to avoid
             // mismatched backedge vector sizes.
+            //
+            // All-or-nothing, and the sizes really do have to match: the phi
+            // built from this slot takes one incoming value per selected
+            // backedge, in the same order as result.backedgeBuffers. A partial
+            // vector would silently pair the wrong backedge with the wrong
+            // value -- producing a phi that is well-formed and wrong, rather
+            // than one that fails to build.
+            //
+            // Note this makes the slot set depend on every selected backedge
+            // having it, so adding a backedge later can retroactively drop a
+            // slot that was previously discovered.
             anyBackedgeHasSlot = false;
             break;
           }
@@ -1656,6 +1710,16 @@ public:
     return result;
   }
 
+  // Restore a generalized loop's merged entry state.
+  //
+  // Both containers must be present. BBbackup alone means the block was backed
+  // up but never reached through a backedge, so there is nothing to merge and
+  // the ordinary restore is the right thing -- and it has already happened, so
+  // falling through with cleared state is correct rather than a silent skip.
+  //
+  // The clear() calls come FIRST and unconditionally, including on the path
+  // that does nothing. Leaving a previous loop's control-field state in place
+  // would let this loop's helper calls read the previous loop's slots.
   void load_generalized_backup_impl(BasicBlock* bb) {
     activeGeneralizedLoopLocalBuffer.clear();
     clearGeneralizedLoopControlFieldState();
@@ -1675,6 +1739,15 @@ public:
       // slots), check if the canonical buffer contains the cursor slot —
       // if so, it's likely a dispatcher that hasn't diverged yet.
       // Otherwise (no cursor slot in buffer at all), it's a guest loop.
+      //
+      // Two probes rather than one, because the two situations need different
+      // evidence. A valid discovery that landed on the Themida cursor is a
+      // positive identification. An INVALID discovery is ambiguous -- the loop
+      // may simply not have diverged yet -- so the weaker probe (is the cursor
+      // present at all?) is used, which is a heuristic and will misclassify a
+      // guest loop that happens to touch that address. That direction is the
+      // mild one: the dispatcher set preserves more registers, which costs
+      // folding opportunities rather than correctness.
       bool dispatcherShaped = false;
       if (discovery.valid) {
         dispatcherShaped = (discovery.controlSlot == kThemidaControlCursorSlot);
