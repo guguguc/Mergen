@@ -2007,6 +2007,12 @@ public:
     return &it->second;
   }
 
+  // Read a stack slot inside a generalized loop, from the loop's own buffer.
+  //
+  // Only the *active* loop's local buffer, so this is only correct while a
+  // generalized loop is entered. Outside one the buffer is empty and this
+  // returns null, which is the right answer -- an ordinary stack read goes
+  // through the normal path.
   llvm::Value* retrieve_generalized_loop_local_value_impl(uint64_t startAddress,
                                                           uint8_t byteCount) {
     if (activeGeneralizedLoopLocalBuffer.empty()) {
@@ -2015,12 +2021,33 @@ public:
     return retrieveValueFromBufferSlice(activeGeneralizedLoopLocalBuffer, startAddress,
                                         byteCount);
   }
+
+  // Resolve a *stack address* that became a phi, to the value each edge loaded.
+  //
+  // Distinct from the function above, and the difference is the whole point:
+  // this one is handed the ADDRESS rather than a known slot, and that address
+  // varies per incoming edge. That happens when the code computes the stack
+  // slot arithmetically and the lifter generalizes the resulting address
+  // expression into a phi.
+  //
+  // Per-edge resolution rather than picking one edge: the phi's whole purpose is
+  // that different edges named different slots, so answering with a single
+  // edge's value would be wrong by construction.
+  //
+  // orgLoad is explicitly ignored ((void) above). There is no meaningful
+  // fallback for an address that is itself uncertain: issuing the original load
+  // would read whatever the current state's stack pointer happens to point at,
+  // which is not what any edge did. Returning null and letting the caller leave
+  // the value symbolic is the honest outcome.
   llvm::Value* retrieve_generalized_loop_local_phi_address_value_impl(
       llvm::Value* loadOffset, uint8_t byteCount, LazyValue orgLoad) {
     (void)orgLoad;
     if (byteCount == 0) {
       return nullptr;
     }
+    // Peel casts to reach the phi -- same reason as
+    // stripIntegerCastsForGeneralizedLoad: the lift's width normalisation stacks
+    // them, and a phi behind a trunc is still a phi.
     while (auto* castInst = llvm::dyn_cast<llvm::CastInst>(loadOffset)) {
       if (!castInst->getOperand(0)->getType()->isIntegerTy() ||
           !castInst->getType()->isIntegerTy()) {
@@ -2028,15 +2055,27 @@ public:
       }
       loadOffset = castInst->getOperand(0);
     }
+    // Fewer than two incoming values means there is nothing to choose between --
+    // a single-incoming phi is not a generalization artifact and is handled
+    // elsewhere.
     auto* phi = llvm::dyn_cast<llvm::PHINode>(loadOffset);
     if (!phi || phi->getNumIncomingValues() < 2) {
       return nullptr;
     }
+    // The state must come from the phi's OWN parent, not the active loop. This
+    // helper can be reached while a different loop is the active one, and using
+    // the active state would resolve this phi's edges against the wrong loop's
+    // buffers.
     auto* state = getGeneralizedLoopStateForHeader(phi->getParent());
     if (!state) {
       return nullptr;
     }
 
+    // Resolve one edge. Three rejections, each for a distinct reason:
+    // a non-constant address means the edge computed a slot we cannot name; a
+    // non-stack address is not this helper's business; and an edge belonging to
+    // neither the canonical source nor a recorded backedge belongs to a path
+    // whose state was never snapshotted.
     auto resolveIncomingLocalValue = [&](llvm::Value* incomingAddress,
                                          llvm::BasicBlock* incomingBlock)
         -> llvm::Value* {
@@ -2097,20 +2136,42 @@ public:
       }
       std::cout << "\n";
     }
+    // All edges agreed: return the value rather than a phi that forwards it.
+    // A phi with N identical incoming values is correct but opaque -- it hides
+    // the fact that nothing varies, which is exactly the fact that makes the
+    // loop simpler to read.
     if (allSameValue) {
       return firstValue;
     }
+    // Inserted at the header's begin(), same requirement as
+    // make_generalized_loop_backup: phis must precede non-phi instructions.
     llvm::IRBuilder<> phiBuilder(state->headerBlock, state->headerBlock->begin());
+    // The type comes from the first incoming value rather than from byteCount,
+    // because the values were resolved from each edge's own buffer and they may
+    // not all be the same width. If they are not, CreatePHI would assert on the
+    // mismatched incoming; the resolve step above is what has already
+    // established they agree.
     auto* phiLoad =
         phiBuilder.CreatePHI(incomingLoads.front().first->getType(),
                              incomingLoads.size(),
                              "generalized_local_phi_load");
+    // Pairs, not two parallel vectors -- addIncoming takes them together and
+    // getting them out of step would attach a value to the wrong edge.
     for (const auto& incoming : incomingLoads) {
       phiLoad->addIncoming(incoming.first, incoming.second);
     }
     return phiLoad;
   }
 
+  // Resolve a phi'd address that is NOT stack -- the VM's own memory.
+  //
+  // Same idea as the local variant above but for tracked slots, so the first
+  // thing it does is peel a constant displacement off the address. A VM slot is
+  // commonly reached as `base + constant`, and the base is what becomes the phi;
+  // the constant is what identifies *which* field within it.
+  //
+  // Sign handling below is the subtle part and is why Sub is handled explicitly
+  // rather than folded into the Add case.
   llvm::Value* retrieve_generalized_loop_phi_address_value_impl(
       llvm::Value* loadOffset, uint8_t byteCount, LazyValue orgLoad) {
     (void)orgLoad;
@@ -2134,18 +2195,31 @@ public:
                     binOp->getOpcode() == llvm::Instruction::Sub)) {
         loadOffset = lhs;
         displacement = rhsCI->getSExtValue();
+        // Negate for Sub so downstream address arithmetic is uniformly
+        // `phiValue + displacement`. Without this the two opcodes would need
+        // parallel handling everywhere the displacement is used, and the
+        // omission is silent -- it reads the right bytes of the wrong slot.
         if (binOp->getOpcode() == llvm::Instruction::Sub) {
           displacement = -displacement;
         }
       } else if (lhsCI && binOp->getOpcode() == llvm::Instruction::Add) {
+        // Constant on the left. Only Add -- `const - phi` cannot be expressed as
+        // phi + displacement, and pretending otherwise would invert the
+        // meaning of the address.
         loadOffset = rhs;
         displacement = lhsCI->getSExtValue();
       }
+      // Anything else (a Mul, a symbolic displacement, a non-binop) leaves
+      // loadOffset as it was, with displacement 0. Falling through to the phi
+      // check then fails and this returns null, which is the correct outcome for
+      // an address expression whose constant part could not be identified.
     }
     auto* phi = llvm::dyn_cast<llvm::PHINode>(loadOffset);
     if (!phi || phi->getNumIncomingValues() < 2) {
       return nullptr;
     }
+    // The phi's own parent, not the active loop -- this helper can be reached
+    // while a different loop is active. See the local variant above.
     auto* state = getGeneralizedLoopStateForHeader(phi->getParent());
     if (!state) {
       return nullptr;
@@ -2166,6 +2240,11 @@ public:
       if (!incomingCI) {
         return nullptr;
       }
+      // Sign-extend then add then wrap. A VM slot address is a signed 64-bit
+      // value that may legitimately sit above 2^63 once the displacement is
+      // applied -- the addresses here are runtime addresses, not quantities with
+      // a sign. The cast back to uint64_t is what makes the wrap explicit
+      // rather than relying on the addition's own behaviour.
       const uint64_t address =
           static_cast<uint64_t>(incomingCI->getSExtValue() + displacement);
       if (incomingBlock == state->canonicalSource) {
@@ -2214,6 +2293,19 @@ public:
     return phiLoad;
   }
 
+  // Read the loop's control slot, building a phi when the edges disagree.
+  //
+  // Three gates, each rejecting a distinct mismatch:
+  //
+  //   !state.valid          not inside a generalized loop
+  //   startAddress mismatch the caller asked about a different slot
+  //   byteCount out of range  0 would produce a zero-width type; >8 cannot be
+  //                         masked out of a uint64_t, so the truncation below
+  //                         would silently wrap rather than narrow
+  //
+  // All three return null rather than a partial answer, because the caller's
+  // fallback is to issue the original load, and issuing that load at the wrong
+  // width would produce a plausible value from the wrong bytes.
   llvm::Value* retrieve_generalized_loop_control_slot_value_impl(
       uint64_t startAddress, uint8_t byteCount) {
     auto& state = activeGeneralizedLoopControlFieldState;
@@ -2221,6 +2313,11 @@ public:
         byteCount == 0 || byteCount > 8) {
       return nullptr;
     }
+    // maskTrailingOnes narrows the stored qword to the requested width rather
+    // than truncating the ConstantInt, so the value is right for a 4-byte read
+    // of an 8-byte slot. Without the mask, getIntN would take the low bits
+    // anyway -- but doing it here makes the narrowing explicit and keeps the
+    // same expression on the backedge side below.
     auto* canonicalValue = this->builder->getIntN(
         byteCount * 8, state.canonicalControl & llvm::maskTrailingOnes<uint64_t>(byteCount * 8));
     if (this->liftProgressDiagEnabled) {
