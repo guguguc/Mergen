@@ -1,6 +1,32 @@
 #ifndef CUSTOMPASSES_H
 #define CUSTOMPASSES_H
 
+// The custom LLVM passes that turn lifted IR into something readable.
+//
+// Unlike LLVM's own passes, these exist because the IR being transformed is
+// not ordinary SSA code -- it is a mid-lift module where:
+//
+//   - blocks may exist that have been created but not yet lifted (empty, no
+//     terminator). Stock passes reject such a function outright, which is why
+//     Mergen's passes tolerate them and why promoteModuleLoads runs GEPLoadPass
+//     alone rather than a standard pipeline.
+//   - "memory" is a single alloca addressed by integer GEPs, not real
+//     pointers. Everything that would normally be a load is a load from
+//     pseudo-memory until PromotePseudoMemory turns it into a raw pointer.
+//   - region classification (which addresses are concrete) comes from the
+//     MemoryPolicy and the PE section map, not from LLVM's alias analysis.
+//
+// The promotion passes therefore run in a fixed order, and that order is
+// load-bearing in a way that fails silently. MergenPB.hpp documents it and
+// ARCHITECTURE.md records it; the constraint is:
+//
+//   GEPLoadPass              before PromotePseudoMemory
+//   PromotePseudoStackPass   before PromotePseudoMemory
+//
+// Reversing either lets PromotePseudoMemory inttoptr the accesses away first,
+// after which the earlier pass has nothing it recognises and the folded
+// constants are simply gone -- no error, worse IR.
+
 #include "MemoryPolicy.hpp"
 #include "FileReader.hpp"
 #include "Includes.h"
@@ -95,6 +121,12 @@ public:
   }
 };
 
+// PromotePseudoStackPass: turn pseudo-memory accesses inside the stack window
+// into real alloca accesses, so LLVM's SROA and DSE can see them.
+//
+// Must run before PromotePseudoMemory. Once that pass converts a stack access
+// to an inttoptr, this one can no longer recognise it and the stack stays
+// un-promoted -- silently, with no error.
 class PromotePseudoStackPass
     : public llvm::PassInfoMixin<PromotePseudoStackPass> {
 public:
@@ -306,6 +338,11 @@ public:
 // it, and the lifter never exposes those concrete addresses to the
 // caller. Walk each block backwards from its terminator and drop the
 // trailing run of inttoptr-constant stores.
+// Matches a store to a constant address reached through inttoptr.
+//
+// Both spellings are checked because the lifter emits both: a ConstantExpr
+// when the address was already known at IR construction, and an IntToPtrInst
+// when it was computed. Missing either form means missing real stores.
 class StripTrailingScratchStoresPass
     : public llvm::PassInfoMixin<StripTrailingScratchStoresPass> {
 public:
@@ -355,6 +392,22 @@ public:
 };
 
 // refactor & template for filereader
+// GEPLoadPass: fold constant loads out of the PE image into integer constants.
+//
+// This is the pass that turns lifted code from "reads memory at a known
+// address" into "is the constant X", and it is the single most valuable pass
+// for VM input -- every folded constant is one fewer thing the path solver has
+// to reason about.
+//
+// Must run before PromotePseudoMemory. If that pass runs first it converts
+// every remaining memory-base GEP into an inttoptr, and the GEPs this pass
+// keys on no longer exist. The folded constants are simply lost, with no error
+// and worse IR.
+//
+// Like PromotePseudoStackPass it carries its own copy of the stack window. The
+// duplicate is deliberate rather than a shared helper: this pass runs at
+// points where the lifter object is not available, and the window is two
+// fields. If the clamp ever changes, both copies must change together.
 class GEPLoadPass : public llvm::PassInfoMixin<GEPLoadPass> {
 public:
   Value* mem = nullptr;
@@ -395,6 +448,24 @@ public:
           if (!ConstInt) continue;
 
           uint64_t constintvalue = ConstInt->getZExtValue();
+          // Three separate rejections, each for a different reason, and the order
+          // matters only for speed. All three must agree before folding:
+          //
+          //   stack address     -- the stack is modelled, not file-backed.
+          //                        Folding it would replace a tracked value
+          //                        with a stale constant and break the loop
+          //                        state the lifter maintains.
+          //   symbolic policy   -- the whole point of the memory policy is
+          //                        that these addresses are NOT known; folding
+          //                        them would defeat it. This is the check
+          //                        that makes the pass safe on packer
+          //                        sections.
+          //   unmapped          -- no bytes to read.
+          //
+          // Note `continue` on the last two is correct here but is NOT a
+          // general rule: this pass only ever skips, never rewrites, so the
+          // inverse case (folding something it should not) cannot arise from
+          // these guards.
           if (isTrackedStackAddress(constintvalue)) continue;
           if (mempolicy.isSymbolic(constintvalue)) continue;
 
@@ -455,6 +526,22 @@ public:
   }
 };
 
+// ReplaceTruncWithLoadPass: `trunc(load wide, p)` -> `load narrow, p`.
+//
+// Rewrites a wide load followed by a truncation into a single narrow load.
+// The narrowing is where the value comes from -- a i64 load truncated to i32
+// is reading only the low 32 bits -- so this removes both the wide load and
+// the trunc, and lets InstCombine see a single typed access.
+//
+// Correctness rests entirely on little-endianness, which is not a property
+// this lifter gets to assume so much as confirm: a big-endian target would
+// make the narrow load read the wrong bytes. The comment in the body states
+// the assumption; there is no target check because there is only one supported
+// lane (x86).
+//
+// Runs after GEPLoadPass in the fixpoint loop. If the wide load was folded to
+// a constant there is nothing to narrow, and the pass becomes a no-op, which
+// is why the order is fixed.
 class ReplaceTruncWithLoadPass
     : public llvm::PassInfoMixin<ReplaceTruncWithLoadPass> {
 public:
@@ -495,7 +582,13 @@ public:
         }
       }
     }
-    // Erase truncs first so their operand loads lose a user.
+    // Two-phase erasure, and the order is required.
+    //
+    // The truncs must go first so the wide loads lose a user. Erasing a load
+    // while it still has a use would assert; erasing truncs first is what
+    // makes the second loop's use_empty() test meaningful. Doing it in one
+    // pass would require re-checking, and the two-phase form is both simpler
+    // and cheaper than tracking which loads still have live users.
     for (llvm::Instruction* Inst : toRemoveTruncs)
       Inst->eraseFromParent();
 
@@ -517,6 +610,19 @@ convert
 to
 %GEPLoadxd-5368713239- = inttoptr i64 5368725620 to ptr
 */
+// PromotePseudoMemory: the catch-all. Any pseudo-memory GEP that the two
+// passes above did not claim becomes a raw pointer.
+//
+// This is the LAST pass in the fixpoint's promotion group, and running it
+// early is the failure mode ARCHITECTURE.md warns about -- it turns the
+// handles the earlier passes key on into inttoptr, after which they cannot
+// find anything and the folded constants are lost silently.
+//
+// "Did not claim" is the whole design. There is no list of what the earlier
+// passes handle; each earlier pass takes what it recognises and leaves the
+// rest, and whatever arrives here is genuinely unhandled. That is what makes
+// the ordering requirement safe to state simply: this pass is a fallback, not
+// a competitor.
 class PromotePseudoMemory : public llvm::PassInfoMixin<PromotePseudoMemory> {
 public:
   Value* mem = nullptr;
@@ -1145,6 +1251,18 @@ public:
 //   Values:  semantic prefix preserved, address suffix removed.
 //            e.g. 'realadd-5368713230-' -> 'realadd'
 //            Unnamed values keep LLVM's default %0, %1, etc.
+// CanonicalNamingPass: strip address-dependent suffixes so that two lifts of
+// the same code produce the same IR.
+//
+// The lifter embeds instruction addresses in value and block names
+// ("realxor-5369433110-"). That is invaluable while debugging a single sample,
+// but it means the same program lifted twice differs at every name, which
+// defeats golden-IR hashing -- the determinism gate the regression workflow
+// depends on. This pass removes the address so the output is stable.
+//
+// Runs LAST in the post-O2 sequence. Naming earlier would mean later passes
+// rename what this pass had already normalised, and the golden hashes would
+// key off names that are about to change.
 class CanonicalNamingPass
     : public llvm::PassInfoMixin<CanonicalNamingPass> {
 
@@ -1224,6 +1342,17 @@ public:
   }
 };
 
+// SignedCompareFromFlagsPass: recover the sign of a comparison that the
+// lifter emitted as flag materialisation.
+//
+// Flag-based code compares by materialising SF/ZF/CF into boolean values, so
+// an `icmp slt` that a human would write shows up as several flag reads and
+// an and/or. This pass recognises that shape and folds it back into a single
+// signed compare, which InstCombine can then reason about as one operation.
+//
+// Post-O2 and paired with the switch normalisation passes: the flag reads are
+// most often the arms of a jump table, and folding them first means the switch
+// sees compares rather than flag conjunctions.
 class SignedCompareFromFlagsPass
     : public llvm::PassInfoMixin<SignedCompareFromFlagsPass> {
   static constexpr int kMaxDepth = 24;
