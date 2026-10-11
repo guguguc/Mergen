@@ -180,12 +180,45 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(llvm::SimplifyQuery)::createSimplifyQuery(
 
 using namespace llvm::PatternMatch;
 
+// Algebraic pattern matching over constants.
+//
+// This is the stage that folds things neither of the cheap strategies can:
+// expressions where one side is symbolic but the *shape* plus the constants
+// pin the result. Three recognisable families live here:
+//
+//   masked-shift-add      protector index decoding
+//   and-not-dispatch      (~A & B) | (A & C) -> select on A
+//   x & ~x               the identity that folds to 0
+//
+// Returns null when nothing matched; the caller falls through to known bits
+// and then to emission.
+//
+// Note the general shape of each rule: it only fires when a *known-bits* check
+// on the symbolic operand confirms the guard, never on syntactic coincidence
+// alone. That discipline is what keeps these folds sound -- a pattern that
+// matched only by shape would fold real programs incorrectly.
+//
+// No `#pragma once`-style guard is needed for this function's lambdas; they
+// are locals, and the cast-wrapped matchers below are what let these rules
+// survive the inttoptr/bitcast noise that lifted IR carries.
 MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::doPatternMatching(
     Instruction::BinaryOps const I, Value* const op0, Value* const op1) {
 
   switch (I) {
   case Instruction::Add: {
-    auto and_by_power = [&](Value* op, ConstantInt*& power) {
+    // Masked-shift-add, the protector's index-decode shape:
+//
+//     (a & (1 << power)) >> (power - lula)   +   -(2**lula)
+//
+// Recognised by walking inward from the add: the constant must be a negative
+// power of two, one operand must be a logical shift by a constant, and the
+// shift's source must be a mask by a power of two. That combination is
+// characteristic enough in real code that the match is worth taking.
+//
+// The fold is a select on the shifted value being zero, because the arithmetic
+// does not actually simplify to a constant -- it produces one of two values
+// depending on whether the extracted bit was set.
+auto and_by_power = [&](Value* op, ConstantInt*& power) {
       Value* LHS;
       return match(op, m_And(m_Value(LHS), m_ConstantInt(power))) &&
              power->getValue().isPowerOf2();
@@ -201,6 +234,9 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::doPatternMatching(
              ci->getValue().abs().isPowerOf2();
     };
 
+    // The add is commutative, so both operand orders have to be tried. The helper
+    // takes them as parameters rather than reading op0/op1 directly, which is
+    // what lets one implementation serve both.
     auto matchPattern = [&](Value* op0, Value* op1) -> Value* {
       ConstantInt *power = nullptr, *ShiftAmount = nullptr, *ci = nullptr;
       Value* LHS = nullptr;
@@ -237,7 +273,9 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::doPatternMatching(
         -(2**(lula))
     */
 
-    // Check if the pattern matches with op0 and op1 in both configurations
+    // Both configurations are checked because the add above is commutative: the
+    // constant can be on either side. A single check would miss half the
+    // instances for no benefit.
     if (auto aaaaa = matchPattern(op0, op1)) {
       return aaaaa;
     }
@@ -248,7 +286,15 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::doPatternMatching(
     Value *A = nullptr, *B = nullptr, *C = nullptr;
 
     // Match (~A & B) | (A & C)
-    auto handleAndNotPattern = [&](Value* op0, Value* op1) -> bool {
+    // (~A & B) | (A & C) -- the classic non-linear dispatch shape.
+//
+// When A is a mask the whole expression is a multiplexer on A: A == 0 selects
+// B, A == all-ones selects C. That is the pattern lifted VM code uses for
+// "if (flag_bit) { take path B } else { take path C }" once the flag has been
+// masked, and recognising it is what lets the dispatcher concretise.
+//
+// Symmetric check on op0/op1 for the same commutativity reason as above.
+auto handleAndNotPattern = [&](Value* op0, Value* op1) -> bool {
       return (match(op0, m_And(m_Not(m_Value(A)), m_Value(B))) &&
               match(op1, m_And(m_Value(A), m_Value(C))));
     };
@@ -260,7 +306,15 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::doPatternMatching(
       // if a is 0, select B
       // if a is -1, select C
       // then... ?
-      if (auto X_inst = dyn_cast<Instruction>(A)) {
+      // The fold is only sound if A is genuinely a mask. analyzeValueKnownBits
+    // establishes that A is between 0 and all-ones without A being a constant
+    // -- a zero-extended narrow load qualifies, which is the common case.
+    //
+    // Without that check the rewrite would be wrong: (A & B) | (A & C) is only
+    // a multiplexer when A selects between them rather than combining them.
+    // The comment left in the code ("then... ?") is asking exactly this
+    // question, and the known-bits test is the answer.
+    if (auto X_inst = dyn_cast<Instruction>(A)) {
 
         auto possible_condition = analyzeValueKnownBits(X_inst, X_inst);
         if (possible_condition.getMaxValue().isAllOnes() &&
@@ -273,7 +327,16 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::doPatternMatching(
     }
     break;
   }
-  case Instruction::And: {
+  // X & ~X == 0, and ~X & ~X == ~X.
+//
+// The cast-aware matchers are load-bearing: lifted IR routinely widens or
+// narrows the two operands to the same width *after* the not was formed, so
+// `m_Not(X)` and `m_Specific(X)` would not match literally. m_ZExtOrSelf and
+// m_Trunc let the rule see through that.
+//
+// Both operand orders are tried for the same commutativity reason as the Add
+// case above.
+case Instruction::And: {
     // X & ~X
     Value* X = nullptr;
     static auto isXAndNotX = [](Value* op0, Value* op1, Value* X) {
@@ -294,7 +357,10 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::doPatternMatching(
 
     break;
   }
-  case Instruction::Xor: {
+  // ~~X -> X and X ^ -1 -> ~X. Both are `not` applied twice or once to the
+  // all-ones constant; folded by shape alone because the rewrite is valid for
+  // every X.
+case Instruction::Xor: {
     // ~~X -> X
     Value* X = nullptr;
     if (match(op1, m_SpecificInt(-1)) && match(op0, m_Not(m_Value(X))))
