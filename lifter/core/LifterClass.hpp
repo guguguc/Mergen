@@ -2368,6 +2368,25 @@ void writeFunctionToFile(const std::string filename) {
 
   // creates an edge to created bb
   // TODO: wrapper for createbr, condbr, switch and update it there.
+  // The single choke point for creating a basic block, and the only place the
+  // block budget is enforced.
+  //
+  // Centralising it matters because the budget has to be exact. Counted at each
+  // call site it would miss any path that creates a block another way, and a
+  // missed count is how a runaway lift turns into an out-of-memory kill instead
+  // of a bounded abort with a diagnostic.
+  //
+  // The diagnostic fires once, not per block: past the budget this returns
+  // immediately, so without the liftBudgetExceeded latch a sample crossing the
+  // threshold would emit thousands of identical errors.
+  //
+  // The abort block itself is counted, and created once. Counting it keeps the
+  // budget honest; creating it once keeps a 10k-block budget failure from
+  // becoming a 10k-block artifact.
+  //
+  // Callers must compare the result against liftAbortBlock rather than
+  // assuming success -- replaceWithGeneralizedLoopBlock below shows the
+  // required check.
   BasicBlock* createBudgetedBasicBlock(const std::string& name, uint64_t diagAddr) {
     if (maxBasicBlockBudget > 0 && basicBlockCount >= maxBasicBlockBudget) {
       if (!liftBudgetExceeded) {
@@ -2391,6 +2410,18 @@ void writeFunctionToFile(const std::string filename) {
   }
 
 
+  // Replace a lifted block with a generalized-loop version, keeping the address
+  // mapping consistent.
+  //
+  // replaceAllUsesWith rather than moving the body across by hand: the old
+  // block may already have predecessors queued by the path solver, and
+  // repointing those is exactly what replaceAllUsesWith does. Splicing
+  // instructions manually would leave those predecessors branching into an
+  // orphaned block.
+  //
+  // The self-check (it->second != newBlock) guards the case where the address
+  // already maps to the block just created -- without it a self-replacement
+  // would have LLVM erase the block it was asked to populate.
   BasicBlock* replaceWithGeneralizedLoopBlock(uint64_t addr, const std::string& name) {
     auto* newBlock = createBudgetedBasicBlock(name, addr);
     if (newBlock == liftAbortBlock) {
@@ -2409,6 +2440,17 @@ void writeFunctionToFile(const std::string filename) {
   }
 
 
+  // All four guards are required, and each rules out a different false reuse:
+  //
+  //   control flow mode     generalization is an Unflatten-only strategy
+  //   path-solve allowance  not every solve site permits it
+  //   addr > current        must actually be a *backward* target
+  //   non-empty block       reusing an empty block would orphan the body that
+  //                         a later iteration would have written into it
+  //
+  // Requiring a non-empty block is what makes this a loop at all: an empty
+  // block at a previously-visited address means we are re-entering a header
+  // whose body has not been lifted, which is a different situation entirely.
   BasicBlock* getLiftedBackedgeBB(uint64_t addr) {
     // A resolved backward target is eligible for reuse regardless of whether
     // the branching source was direct, conditional, or indirect. Once we have
@@ -2431,6 +2473,23 @@ void writeFunctionToFile(const std::string filename) {
   }
 
 
+  // Resolve an address to its basic block, creating one if needed.
+  //
+  // Address normalisation happens here, so every caller gets a canonical key
+  // without having to know about the truncation problem. That is also why the
+  // map is only ever written from here and from the worklist-pop path.
+  //
+  // Under Unflatten the default is NOT to reuse: a given address may be
+  // reached under different assumptions, and each needs its own block, so an
+  // existing entry is replaced unless the inline policy identifies it as a real
+  // function entry. The outline check is what distinguishes the two cases --
+  // a genuine function entry is not path-sensitive, so one block serves every
+  // call site, whereas a jump-table state is.
+  //
+  // The dominator-tree update on creation is not optional. DTU is the lifter's
+  // own tree and the path solver queries it; skipping the update leaves a node
+  // unreachable in the tree, and comesBefore in OperandUtils.h then answers
+  // "neither dominates" for pairs that actually are ordered.
   BasicBlock* getOrCreateBB(uint64_t addr, const std::string& name) {
     addr = normalizeFileBackedRuntimeTargetAddress(addr);
     auto it = addrToBB.find(addr);
