@@ -1,5 +1,35 @@
 #pragma once
 
+// The path solver: turning an address-valued expression into a concrete
+// destination, or refusing to.
+//
+// This decides whether the lifter can walk forward at all, and it is on the
+// critical path -- the perf counters show ~42k calls on a typical protected
+// sample. Its contract is deliberately narrow:
+//
+//   PATH_solved        exactly one destination, known
+//   PATH_multi_solved  several destinations, known, lowered as a switch
+//   PATH_unsolved      no answer
+//
+// There is no "probably" and no best guess. A wrong resolution sends the walk
+// into a handler that does not correspond to real execution, and from there
+// the IR is confidently wrong for the rest of the function. An unresolved
+// branch instead stops the concrete walk and records UnresolvedIndirectJump,
+// which is recoverable and visible.
+//
+// Tiers, tried in order:
+//
+//   1. the value is already a constant
+//   2. the load path -- a target read out of pseudo-memory, which is the
+//      common VM dispatch shape
+//   3. getConstraintVal -- hand off to LLVM's folder/simplifier
+//   4. possible-value enumeration, plus the VMP transfer rules that narrow it
+//
+// Tiers 2 and 4 are where the bulk of the code is, and their existence is the
+// reason this file is large: they handle shapes specific to lifted VM output
+// that LLVM cannot see, because by the time they apply the value has passed
+// through instructions LLVM considers ordinary.
+
 #include "CommonDisassembler.hpp"
 #include "PathSolver.h"
 #include "LifterClass.hpp"
@@ -32,6 +62,10 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
     perfDiag.noteSolvePathContext(
         static_cast<unsigned>(currentPathSolveContext));
   }
+  // Single exit for recording an outcome, so every return path is counted.
+  // Counting only some returns would make the outcome histogram useless, and
+  // that histogram is the tool for deciding whether the expensive tiers earn
+  // their cost.
   auto finishSolvePath = [&](const char* outcome, PATH_info rv) -> PATH_info {
     if (perf) {
       perfDiag.noteSolvePathOutcome(outcome);
@@ -39,6 +73,9 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
     return rv;
   };
 
+  // The address of the instruction doing the jumping, not the destination.
+  // This is the key for the per-site histogram in the perf dump, which is what
+  // turns "the solver is slow" into "this instruction is slow".
   const uint64_t pathSolveSite = current_address - instruction.length;
   auto normalizeTargetAddress = [&](uint64_t target) -> uint64_t {
     return normalizeRuntimeTargetAddress(target);
@@ -52,7 +89,16 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
 
   // Local cache is enough: all import-resolution lambdas live in this call.
   // Avoid make_shared on the 42k-call const fast path.
+  // Function-local rather than a member: the BasicBlock pointers it holds
+  // belong to the module under construction, and an entry surviving across
+  // calls would return a block belonging to a different function.
   std::unordered_map<uint64_t, BasicBlock*> importBlocks;
+  // Materialise an import as a real basic block: one call, then unreachable.
+  //
+  // The builder save/restore in the body is mandatory, not hygiene. This runs
+  // inside control-flow handling, and leaving the insert point inside the
+  // import block would make the next emitted instruction land there instead of
+  // in the block being lifted.
   auto resolveImportTarget = [&](uint64_t target) -> BasicBlock* {
     auto importIt = importMap.find(target);
     if (importIt == importMap.end()) return nullptr;
@@ -222,6 +268,11 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
   // Clear memoization cache for value enumeration.
   // Each solvePath invocation may have different assumptions
   // (from different branch paths), so cached results don't carry over.
+  // Cleared per invocation rather than kept across calls. Each solvePath runs
+  // under a different set of assumptions -- the branch being resolved implies
+  // particular values for the registers and stack slots it reads -- so an
+  // entry computed for one branch is not stale for the next, it is wrong.
+  // Clearing is the only sound option.
   pv_cache.clear();
   if (currentPathSolveContext != PathSolveContext::Ret) {
     if (auto* loadInst = dyn_cast<LoadInst>(simplifyValue)) {
@@ -1338,6 +1389,17 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
     uint64_t rawSecondTarget = pv[1].getZExtValue();
     uint64_t filteredFirstTarget = normalizeTargetAddress(rawFirstTarget);
     uint64_t filteredSecondTarget = normalizeTargetAddress(rawSecondTarget);
+    // Two candidates, and the interesting case is when exactly one survives.
+    //
+    // Possible-value enumeration often yields a real handler plus a garbage
+    // candidate -- an unmapped address, or a relocated pointer that normalised
+    // to nothing. When only one of the two is paged memory, the other is not a
+    // real target and the branch is decided, even though the value itself
+    // never folded. That is the single most valuable recovery in this file.
+    //
+    // Both raw and normalized forms are checked. A relocated target may be
+    // zero before normalisation and valid after, or the reverse, so testing
+    // only one form would reject real handlers.
     auto isViableIndirectTarget = [&](uint64_t rawTarget, uint64_t normalizedTarget) {
       return rawTarget != 0 && normalizedTarget != 0 &&
              isMemPaged(normalizedTarget);
@@ -1566,6 +1628,24 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(PATH_info)::solvePath(
       // already known code - a re-visited block or an outlined function entry.
       // Everything else is left to the (unresolved) default below instead of
       // being guessed at.
+      // Adoption test for a switch case, and the conservative half of the
+      // multi-target contract.
+      //
+      // A candidate must be *known code* before it becomes a case target.
+      // Possible-value enumeration can yield addresses that are paged but are
+      // not instructions -- data read as a pointer, a table entry. Lifting
+      // those decodes arbitrary bytes, and enough of them corrupts the IR
+      // (mid-instruction operand types, switch blow-up) until the process
+      // dies. Being paged is necessary but not sufficient.
+      //
+      // Three ways to be known code: derived from the select analysis (so it
+      // came from a real dispatch), an address already lifted, or an entry the
+      // inline policy outlines. Anything else is left to the unresolved
+      // default rather than guessed at.
+      //
+      // This is the "decline rather than guess" rule from the file header,
+      // applied per case. Dropping a case narrows the switch; emitting a
+      // wrong one produces IR that looks valid and computes the wrong thing.
       const bool knownCode =
           selectDerived || visitedAddresses.contains(normalizedTarget) ||
           inlinePolicy.isOutline(normalizedTarget);
