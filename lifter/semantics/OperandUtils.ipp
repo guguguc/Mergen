@@ -1759,6 +1759,13 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::createSExtOrTruncFolder(
 }
 
 
+// Eager flag write: store `newValue` as the flag's value.
+//
+// Both overloads funnel into setFlagValue (SetFlagValue_impl); the perf
+// counters are the only behavioural difference between them
+// (flagSetEagerCalls vs flagSetLazyCalls), which is what lets a profile tell
+// how many flag computations were written inline as lambdas versus passed as
+// values.
 MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::setFlag(const Flag flag,
                                                   Value* newValue) {
   auto flagSample = profiler.sample("sem_flags");
@@ -1775,6 +1782,16 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::setFlag(const Flag flag,
   return setFlagValue(flag, newValue);
 }
 
+// "Lazy" flag write: the computation is passed as a lambda.
+//
+// NOTE: the laziness is call-site syntax only -- calculation() is invoked
+// immediately below, so the value is always computed. There is no deferred or
+// conditional evaluation here, despite the overload's suggestion. What the
+// lambda buys is readability at arithmetic call sites (the flag expression
+// reads inline next to the operation that sets it) plus a separate perf
+// bucket. Anyone adding a genuinely lazy flag (computed on first read) must
+// not extend this overload; that needs the LazyValue machinery in flagManager,
+// not a std::function that is called before it returns.
 MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::setFlag(
     const Flag flag, std::function<Value*()> calculation) {
   auto flagSample = profiler.sample("sem_flags");
@@ -1796,6 +1813,13 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::setFlag(
   return setFlagValue(flag, computed);
 }
 
+// Wrap the flag's current value without reading through it.
+//
+// The LazyValue defers the *use*, not the fetch: getFlagValue runs now, and
+// what is lazy is when the wrapped value gets forced into IR by a consumer.
+// That distinction is why this is a one-liner -- the laziness lives in
+// LazyValue's consumers (solveLoad's orgLoad fallback, the phi resolvers), not
+// here.
 MERGEN_LIFTER_DEFINITION_TEMPLATES(LazyValue)::getLazyFlag(const Flag flag) {
   //
   return LazyValue(getFlagValue(flag));
@@ -1810,6 +1834,16 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::getFlag(const Flag flag) {
   return getFlagValue(flag);
 }
 
+// Extract bits [15:8] of a 16-bit register: the AH/CH/DH/BH view.
+//
+// Reads through getBiggestEncoding (the full 64-bit slot), not the 16-bit
+// view. The high byte is only meaningful as bits 8-15 of the wider register,
+// and reading a narrower view first would lose the upper bits the shift needs
+// -- or worse, read a stale 16-bit value that a 32-bit write already replaced.
+//
+// Shift-then-mask-then-trunc rather than a single extract: each step folds
+// through the folder when the input is constant, so `mov ah, ...` on a known
+// register resolves without emitting IR.
 MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::GetValueFromHighByteRegister(
     const Register reg) {
 
@@ -1823,6 +1857,13 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::GetValueFromHighByteRegister(
   return createTruncFolder(highByteValue, builder->getIntNTy(8));
 }
 
+// Whether the current privilege level may modify the interrupt flag.
+//
+// Compares the constant 3 against IOPL rather than the other way round so the
+// comparison reads as the architecture manual states it (CPL <= IOPL). The ULE
+// is unsigned because privilege levels are an ordering, not a quantity -- a
+// signed comparison would mis-order levels whose high bit is set, which cannot
+// occur here but keeps the predicate honest about what it means.
 MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::privilegeAllowsIF() {
   LLVMContext& context = builder->getContext();
   Value* iopl = createOrFolder(
@@ -1835,6 +1876,24 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::privilegeAllowsIF() {
       ConstantInt::get(Type::getInt64Ty(context), 3), iopl);
 }
 
+// Scatter a whole RFLAGS value into individual flags.
+//
+// Three flag classes, each handled differently, because the architecture gives
+// them different write semantics:
+//
+//   RESERVED1        forced to 1: the architecture defines the bit as always
+//                    set, so a write of 0 is not honoured but ignored.
+//   RESERVED3/5, IOPLx, VM/VIP/VIF   skipped: not writable from this context,
+//                    and storing the written bits would model state the CPU
+//                    would not have.
+//   IF               conditional on privilegeAllowsIF: an unprivileged write
+//                    keeps the old value via select, which is what makes
+//                    pushf/popf round-trip without spuriously enabling
+//                    interrupts.
+//
+// Computing allowIF once outside the loop rather than per flag: it does not
+// depend on the flag, and rebuilding the same comparison 20 times would both
+// waste IR and give the cache 20 entries for one fact.
 MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::SetRFLAGSValue(Value* value) {
   LLVMContext& context = builder->getContext();
   Value* allowIF = privilegeAllowsIF();
@@ -1863,6 +1922,19 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::SetRFLAGSValue(Value* value) {
   return;
 }
 
+// Gather one byte of RFLAGS from the individual flags.
+//
+// Out-of-range byteIndex yields zero rather than asserting. The index comes
+// from decoded instruction bytes (lahf/sahf-style accesses and the RFLAGSByte
+// path), so a malformed decode produces 8+ -- and crashing the lift on a
+// decode artefact would turn every fuzzer-found encoding into a lifter abort.
+// Zero is the value an out-of-range read would compose anyway, since no flag
+// maps into it.
+//
+// The flag enum doubles as the bit position (flag == shiftAmount), which is
+// why the loop tests membership by range instead of a table. That coupling is
+// load-bearing: renumbering Flag without updating these shifts silently moves
+// every flag's bit.
 MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::GetRFLAGSByte(unsigned byteIndex) {
   LLVMContext& context = builder->getContext();
   auto* i8Ty = Type::getInt8Ty(context);
@@ -1887,6 +1959,12 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::GetRFLAGSByte(unsigned byteIndex) {
   return packed;
 }
 
+// Gather the whole RFLAGS register from individual flags. The inverse of
+// SetRFLAGSValue, but not its mirror: this reads every flag including the
+// reserved and privileged ones, because a LAHF/PUSHF observes the actual
+// register contents rather than the writable subset. The RESERVED1-is-1
+// invariant is what makes bit 1 read correctly here without special-casing --
+// InitRegisters set it, and SetRFLAGSValue never clears it.
 MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::GetRFLAGSValue() {
   LLVMContext& context = builder->getContext();
   Value* rflags = ConstantInt::get(Type::getInt64Ty(context), 0);
