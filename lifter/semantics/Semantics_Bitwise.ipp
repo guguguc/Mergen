@@ -200,7 +200,7 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_rol() {
   // is masked immediately afterwards, so the high bits are discarded either
   // way; sign-extension would only risk making the mask interact with a
   // negative-looking value.
-  auto Rvalue = createZExtFolder(Rvalue, Lvalue->getType());
+  Rvalue = createZExtFolder(Rvalue, Lvalue->getType());
 
   auto bitWidth = ConstantInt::get(Lvalue->getType(), destsize);
   // x86 masks rotate counts to 6 bits on 64-bit operands and 5 on 32-bit
