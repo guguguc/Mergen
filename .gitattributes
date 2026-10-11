@@ -1,3 +1,39 @@
+# Line endings
+#
+# Every text blob in this repository is stored with LF endings and is checked
+# out with LF endings. This restates in a form git enforces what .editorconfig
+# (end_of_line = lf) and the LLVM-based .clang-format style already describe.
+#
+# The rule is purely protective: as of the last audit no committed text blob
+# used CRLF, so turning it on changes no existing content. Without it the
+# contract lived only in the editor config, and anything that rewrote the
+# working tree with CRLF turned all 664 tracked files into a 203k-line phantom
+# diff that buried the 4 files that had actually changed.
+* text=auto eol=lf
+
+# Binary files.
+#
+# `text=auto` already classifies these correctly today via git's NUL-byte
+# sniff (verified: every tracked image trips it), but a binary that happened
+# to carry no NUL in its first 8000 bytes would be silently line-ending
+# normalised and corrupted. State it instead of trusting the heuristic. The
+# PE entries are not hypothetical: .gitignore whitelists sample/**/*.exe and
+# sample/**/*.dmp, and the Windows lanes build .obj/.pdb/.dll beside the tree.
+*.png binary
+*.PNG binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.exe binary
+*.dll binary
+*.lib binary
+*.dmp binary
+*.obj binary
+*.pdb binary
+*.i64 binary
+*.vtil binary
+*.pdf binary
+
 # cmkr
 /**/CMakeLists.txt linguist-generated
 /**/cmkr.cmake linguist-vendored
