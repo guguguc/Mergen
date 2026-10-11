@@ -844,23 +844,39 @@ public:
       baseCandidate = candidate;
       return true;
     };
+    // The address must have had at least one non-constant term. A pure-constant
+    // offset has no base to match against and would otherwise pass every later
+    // check vacuously.
     if (!collectTerms(collectTerms, loadOffset) || !baseCandidate) {
       return false;
     }
+    // Whitelist, not a range. See the note at
+    // kSupportedGeneralizedControlFieldOffsets -- these three offsets are what
+    // this sample's control field used, and a fourth offset that happened to
+    // work would not mean the layout is understood.
     const bool supportedOffset = llvm::is_contained(
         kSupportedGeneralizedControlFieldOffsets, constantOffset);
     if (!supportedOffset) {
       return false;
     }
+    // Must be an i64 load. A narrower load of the same qword covers fewer bytes
+    // than the control field, and building a phi over a partial read produces a
+    // value that is right in its low bits and silently wrong above them.
     auto* loadInst = llvm::dyn_cast<llvm::LoadInst>(baseCandidate);
     if (!loadInst || !loadInst->getType()->isIntegerTy(64)) {
       return false;
     }
+    // Tracked-buffer GEP specifically. A load through any other pointer is
+    // reading something else -- image-backed, or another region -- and matching
+    // it on address alone would bind the control field to unrelated memory.
     auto* gep =
         llvm::dyn_cast<llvm::GetElementPtrInst>(loadInst->getPointerOperand());
     if (!gep || gep->getPointerOperand() != this->memoryAlloc) {
       return false;
     }
+    // The slot has to be the one this loop actually designated. Comparing
+    // against the live state (rather than a constant) is what lets the same
+    // matcher work once slot discovery replaces the Themida seed.
     auto* offsetCI = llvm::dyn_cast<llvm::ConstantInt>(gep->getOperand(1));
     if (!offsetCI ||
         offsetCI->getZExtValue() !=
@@ -872,6 +888,15 @@ public:
   }
 
 
+  // The stack portion of a buffer snapshot.
+  //
+  // Filtering rather than copying the whole map because the restore path only
+  // ever needs the local stack: image-backed bytes come from the file and
+  // bytecode bytes from the VMP model, so including them would let a stale
+  // snapshot entry shadow the authoritative source.
+  //
+  // isTrackedLocalStackAddress rather than isTrackedStackAddress: only the
+  // frame below the initial SP is real stack state. See the note there.
   llvm::DenseMap<uint64_t, ValueByteReference> extractLocalStackBuffer(
       const llvm::DenseMap<uint64_t, ValueByteReference>& sourceBuffer) {
     llvm::DenseMap<uint64_t, ValueByteReference> localBuffer;
@@ -927,6 +952,20 @@ public:
     return false;
   }
 
+  // Build the snapshot that describes a generalized loop's entry state.
+  //
+  // `sources` are the backedges; `canonical` is the first (non-backedge)
+  // arrival. The result is a single coherent view, because the restore path
+  // takes one snapshot rather than reconstructing from several.
+  //
+  // NOTE on the buffer filter below: it KEEPS non-local-stack addresses and
+  // DROPS local-stack ones -- the inverse of extractLocalStackBuffer, which
+  // extracts exactly those. That is not an inconsistency. The generalized
+  // snapshot models the VM's own memory (bytecode, control slots, tracked
+  // slots); the local stack frame is restored separately by
+  // load_generalized_backup_impl, and carrying it in both places would let the
+  // two disagree. The two filters look like a bug side by side and are not;
+  // worth knowing before "fixing" one to match the other.
   backup_point make_generalized_loop_backup(BasicBlock* bb,
                                             const backup_point& canonical,
                                             llvm::ArrayRef<backup_point> sources,
@@ -935,6 +974,15 @@ public:
     // (buffer, counter, etc.). For 2-way loops this matches the original
     // single-source behavior exactly; for N-way we pick sources[0] as the
     // representative snapshot since the caller must restore a coherent view.
+    //
+    // The cache and assumptions are reset in BOTH branches below, and
+    // identically. That is not redundancy -- it is the point. A generalized
+    // snapshot represents a *merged* state that no single path ever held, so
+    // carrying over one path's instruction cache would let the restored block
+    // reuse IR built under the other path's assumptions. Same for branch
+    // assumptions: they are per-edge facts and have no meaning for a merged
+    // entry.
+    //
     // No backedges: canonical-only path. Return canonical with local-stack
     // addresses filtered, matching the pre-N-way fallback where
     // make_generalized_loop_backup was called with canonical as both args.
@@ -970,6 +1018,11 @@ public:
     // Filter backedges: drop any that duplicate canonicalSource. This
     // preserves the existing 2-way "canonicalSource == backedgeSource"
     // bailout for the trivial degenerate case.
+    //
+    // Without this filter a phi would get an incoming value from a block that
+    // is also the canonical entry -- the same block twice, with the same value
+    // -- which is legal IR but means the phi never varies, so the loop body
+    // loses the variation it was generalized to represent.
     llvm::SmallVector<const backup_point*, 2> effectiveSources;
     effectiveSources.reserve(sources.size());
     for (const auto& src : sources) {
@@ -981,8 +1034,14 @@ public:
       return generalized;
     }
 
+    // Phi arrays zero-initialised, so a null entry means "does not vary" and no
+    // phi is built. Building phis for invariant registers would add nodes that
+    // only forward, and would hide the register's loop-invariance from LLVM.
     std::array<llvm::PHINode*, REGISTER_COUNT> registerPhis{};
     std::array<llvm::PHINode*, FLAGS_END> flagPhis{};
+    // Insertion at bb->begin(): phis must precede every non-phi instruction in
+    // a block or LLVM rejects the module. Inserting at the builder's current
+    // point would place them after whatever was already lifted into the header.
     llvm::IRBuilder<> phiBuilder(bb, bb->begin());
     auto mergeValue = [&](llvm::Value* canonicalValue,
                           llvm::ArrayRef<llvm::Value*> backedgeValues,
@@ -991,6 +1050,14 @@ public:
       // Require canonical + all backedges present and type-matched. Any
       // type mismatch or nullptr falls back to the first backedge value,
       // preserving the pre-N-way single-backedge semantics.
+      //
+      // The degradation is to ONE backedge's value, not to undef and not to a
+      // phi. Picking a real value keeps the block concrete, which matters
+      // because this is inside path solving -- a value that folds gives the
+      // solver something to work with, while undef sends it down an unknown
+      // path immediately. The cost is that the loop loses the variation for
+      // this particular value, which is a coverage loss rather than a
+      // correctness one.
       if (!canonicalValue || backedgeValues.empty()) {
         return backedgeValues.empty() ? nullptr : backedgeValues.front();
       }
