@@ -597,20 +597,67 @@ public:
   Disassembler dis;
   MemoryPolicy memoryPolicy;
   uint64_t stackReserve = 0x1000; // clamped reserve, set by configureDefaultMemoryPolicy
+  // Re-derived from stackReserve on every call rather than cached as fields.
+  //
+  // That is deliberate. configureDefaultMemoryPolicy clamps stackReserve, and
+  // three separate consumers -- here, PromotePseudoStackPass, and
+  // prepareRuntimePagedMemory -- must agree on the window exactly. Computing it
+  // from the single source each time makes a divergence impossible; caching it
+  // in members would need all three to be invalidated together, and a miss
+  // would produce a stack address that is paged but not promotable.
+  //
+  // The window is centred on STACKP_VALUE because that is where the emulated
+  // stack pointer starts, and the underflow guard mirrors the one in
+  // MemoryPolicySetup.
   bool isTrackedStackAddress(uint64_t address) const {
     const uint64_t stackLower =
         stackReserve <= STACKP_VALUE ? STACKP_VALUE - stackReserve : 0;
     const uint64_t stackUpper = STACKP_VALUE + stackReserve;
     return address >= stackLower && address <= stackUpper;
   }
+  // The half of the stack below the initial SP.
+  //
+  // This is a genuine frame, not an area a push can reach: RSP only grows
+  // downward. Addresses at or above STACKP_VALUE are not reachable through
+  // normal stack traffic, so anything the lifter sees there came from a
+  // computed address and needs different treatment -- the RSP-drift checks
+  // depend on the distinction.
   bool isTrackedLocalStackAddress(uint64_t address) const {
     return isTrackedStackAddress(address) && address < STACKP_VALUE;
   }
 
+  // Which restore path a block needs on entry.
+  //
+  //   Normal           the ordinary backup_point restore
+  //   GeneralizedLoop  loop-carried state arrived through the generalized path
+  //                     and needs the variable-width restore, not the narrow one
+  //
+  // Getting this wrong does not crash. Restoring a generalized-loop block
+  // through the ordinary path yields a block whose loop-carried memory state is
+  // the previous iteration's, producing a walk that is self-consistent and
+  // wrong.
   enum class BlockRestoreMode {
     Normal,
     GeneralizedLoop,
   };
+
+  // Why solvePath is being called. This is the second dimension of path-solve
+  // behaviour and it is not cosmetic -- each context enables different recovery
+  // strategies:
+  //
+  //   Ret              a return address is popped from the stack, not computed;
+  //                     the load path and the dispatch tricks do not apply, and
+  //                     a wide possible-value set is discarded rather than
+  //                     turned into a switch
+  //   IndirectJump     the VM dispatch case; the two-candidate viability filter
+  //                     and the VMP transfer rules apply
+  //   DirectJump       a resolved RIP-relative target, simplest case
+  //   ConditionalBranch  a select between a target and a fallthrough
+  //
+  // It is scoped rather than a plain field because the answer must be restored
+  // on every exit from a solve, including early returns -- see
+  // ScopedPathSolveContext. One missed restore misattributes every later
+  // diagnostic and enables the wrong recovery strategies.
   enum class PathSolveContext {
     Unknown,
     ConditionalBranch,
@@ -3079,11 +3126,34 @@ public:
   std::set<llvm::APInt, APIntComparator>
   getPossibleValues(const llvm::KnownBits& known, unsigned max_unknown);
 
+  // Read a multi-byte value as a single known constant.
+  //
+  // This is the function that makes unaligned and cross-slot reads work. A VM
+  // commonly computes an address one byte at a time and reads the result as a
+  // qword; nothing folds unless the lifter can compose bytes it knows
+  // individually into the wider value actually being loaded.
+  //
+  // `orgLoad` is the fallback for bytes it does not know. Passing a LazyValue
+  // rather than a Value keeps the caller from having to perform -- and
+  // materialise IR for -- a read that may not be needed: an entirely-known span
+  // never calls it.
+  //
+  // Returns null when any byte is unknown, which is the honest answer. The
+  // caller then leaves the load symbolic rather than folding to a partial
+  // value.
   Value* retrieveCombinedValue(const uint64_t startAddress,
                                const uint8_t byteCount, LazyValue orgLoad);
+  // The same, with the implementation's extra state. Split so the outer can
+  // avoid re-entering for an address already composed in this call chain.
   Value* retrieveCombinedValueImpl(const uint64_t startAddress,
                                    const uint8_t byteCount, LazyValue orgLoad);
 
+  // Record that `value` is known to live at `address`, byte by byte.
+  //
+  // The inverse of retrieveCombinedValue and the only writer of the tracked
+  // buffer besides writeBufferQwordFromConstant. Both write bytes rather than
+  // whole values, because reads against the buffer are routinely narrower than
+  // the write -- see the comment there.
   void addValueReference(Value* value, const uint64_t address);
 
   // x86 segment-relative addressing (gs:/fs:) is TEB-relative. The lifter has
@@ -3109,6 +3179,27 @@ public:
   // VM key came out wrong and devirtualisation stopped reproducing.
   static constexpr uint64_t tebBase = 0x7FFD0000ULL;
   static constexpr uint64_t pebBase = 0x7FFD1000ULL;
+  // Three tiers, in strict precedence order. The order is the whole point:
+  //
+  //   1. MERGEN_OS_BUILD_NUMBER   escape hatch for a sample protected on a
+  //                               different machine or a different Windows
+  //                               release than the host running the lifter
+  //   2. the live host value      correct whenever the sample was protected on
+  //                               this host, which is the common case
+  //   3. a hardcoded 26200        last resort
+  //
+  // Tier 3 fires only off Windows, or if ntdll would not hand over
+  // RtlGetVersion. A wrong-but-concrete value is still far more useful than an
+  // unknown one here: an unknown build number makes the VM key symbolic, the
+  // key propagates into the RFLAGS that selects the next handler, and the
+  // concrete walk stops. Never let this return 0.
+  //
+  // The env value is parsed with base 0 and validated as fully consumed.
+  // `end != env` rejects an empty or non-numeric string (strtoull would
+  // otherwise silently report 0, which would then be used as a build number);
+  // `*end == '\0'` rejects trailing garbage such as "26200abc". A malformed
+  // value is ignored rather than fatal, so a stale env var falls through to the
+  // live host instead of aborting the run.
   static uint64_t hostOsBuildNumber() {
     if (const char* env = std::getenv("MERGEN_OS_BUILD_NUMBER")) {
       char* end = nullptr;
@@ -3125,6 +3216,20 @@ public:
     // an unknown one here: see the symbolic-RFLAGS note above.
     return 26200ULL;
   }
+  // Seed the minimal TEB/PEB the lifter pretends to run on.
+  //
+  // These are not arbitrary constants: they are the few fields an x64 program
+  // actually reads on startup, and each one exists because some common
+  // prologue or anti-debug check dereferences it. Seeding them as *known bytes*
+  // rather than allocating backing memory is what lets the reads fold to
+  // constants, so the code that consumes them stays on the concrete path
+  // instead of going symbolic on the very first instruction.
+  //
+  // Both self-pointers are seeded because the two views are genuinely
+  // inconsistent by construction -- PEB base + 0x120 cannot really hold
+  // TEB+0x120 -- but a protector that walks gs:[0x30] and then reads +0x120
+  // must still see the build number. Modelling one real TEB would break that
+  // read.
   void modelProcessEnvironment() {
     llvm::LLVMContext& ctx = builder->getContext();
     auto put = [&](uint64_t addr, uint64_t value, unsigned bits) {
@@ -3143,21 +3248,77 @@ public:
     put(pebBase + 0x120, build, 16);
   }
 
+  // Decide whether an address resolves into a paged region.
+  //
+  // This is the query, not the load. Paging is what lets an unknown read
+  // succeed with real file-backed bytes instead of poisoning the path, so the
+  // answer has to be available *before* the load is built -- building the load
+  // first and checking after would mean tearing it down again.
+  //
+  // ctxI is the instruction requesting the read. It is needed because the
+  // decision can depend on where in the lift we are: a dispatch read during
+  // path solving is treated differently from the same read in straight-line
+  // code, since one feeds the solver and the other does not.
   isPaged isValuePaged(Value* address, Instruction* ctxI);
 
+  // Assert that an address is paged, or record why it is not.
+  //
+  // The naming asymmetry with isValuePaged is deliberate: one answers, the
+  // other commits. A caller that has already decided the address must be
+  // paged calls this so the failure is attributable to that decision rather
+  // than surfacing later as an unexplained symbolic load.
   void pagedCheck(Value* address, Instruction* ctxI);
 
+  // Process one decoded memory instruction into IR.
+  //
+  // Routed through the normal memory path rather than handled inline by the
+  // operand helpers so that VM byte-assembly reads -- the case where the
+  // address is built one byte at a time -- get the same constant-folding and
+  // page-map treatment as any other read.
   void loadMemoryOp(Value* inst);
 
+  // The write counterpart.
+  //
+  // Stores are inserted rather than folded here on purpose: folding a store to
+  // a tracked-buffer byte requires knowing the address is tracked, and that
+  // decision is made by the same policy that decides reads. Diverging the two
+  // is how a write ends up invisible to a later read of the same address.
   void insertMemoryOp(llvm::StoreInst* inst);
+
+  // The concrete value set for V, if it is small enough to enumerate.
+  //
+  // This is what turns an indirect jump into a finite case analysis. The set is
+  // not "all values" -- it is the set the lifter can actually prove reachable,
+  // which is why Depth exists: going deeper costs and can blow up, so callers
+  // budget it.
   std::set<llvm::APInt, APIntComparator>
   computePossibleValues(Value* V, const uint8_t Depth = 0);
 
+  // Take the byte range [startOffset, endOffset) out of a wider value.
+  //
+  // Inclusive start, exclusive end, matching LLVM's own convention, so this
+  // composes directly with the extractvalue-style GEP arithmetic used around
+  // it. Getting that convention wrong silently drops or duplicates a byte
+  // rather than failing.
   Value* extractBytes(Value* value, const uint8_t startOffset,
                       const uint8_t endOffset);
   // end analysis
 
-  // folders
+  // Folders.
+  //
+  // Every IR instruction the lifter creates goes through one of these, never
+  // straight to IRBuilder. The indirection buys one thing that matters for
+  // devirtualisation: constant folding at the point of creation.
+  //
+  // It has to happen there. Folding later -- even in the O2 fixpoint pass --
+  // is too late for the lifter's own logic, because the path solver decides
+  // what to explore from the *IR* it is looking at, and an unfolded add is not
+  // a constant to it. VM dispatch keys off arithmetic the lifter has already
+  // computed, so the fold must be visible to the solver, not just to the
+  // optimiser.
+  //
+  // Every folder also emits its own diagnostic-free name, because an IR that
+  // cannot be read back is not deobfuscated output.
   Value* createSelectFolder(Value* C, Value* True, Value* False,
                             const Twine& Name = "");
 
@@ -3187,6 +3348,20 @@ public:
 
   Value* createTruncFolder(Value* V, Type* DestTy, const Twine& Name = "");
 
+  // zext/sext are three separate functions rather than one with a flag.
+  //
+  // They are semantically different operations -- zero fill versus sign fill --
+  // and the lifter uses that difference to decide whether a fold is legal. A
+  // single `createExt(V, ty, isSigned)` cannot fold when one input is
+  // constant without also committing to the fill, and picking the wrong one
+  // yields IR that is well-typed and numerically wrong. Keeping them apart
+  // makes the caller state which it meant.
+  //
+  // The *OrTrunc variants exist because x86 partial-width writes are ambiguous
+  // at the type level: the handler knows the register was 8 or 16 bits and that
+  // x86 zero-extends those, but it does not always know the *source* width. The
+  // combined form handles both cases without the caller branching on a detail
+  // that does not affect the result.
   Value* createZExtFolder(Value* V, Type* DestTy, const Twine& Name = "");
 
   Value* createZExtOrTruncFolder(Value* V, Type* DestTy,
@@ -3197,6 +3372,22 @@ public:
   Value* createSExtOrTruncFolder(Value* V, Type* DestTy,
                                  const Twine& Name = "");
 
+  // Three overloads per shift, not one.
+  //
+  // The split exists because a shift amount is almost always a concrete value
+  // the lifter already knows, and materialising it as an IR instruction first
+  // means the shift is emitted unfused and only folds in a later pass. Taking
+  // the constant directly lets the folder fold on the spot, which is what the
+  // path solver needs in order to see a resolved address.
+  //
+  // uint64_t and APInt are both provided because the callers genuinely differ:
+  // x86 mask instructions hand over a register-derived count that is only known
+  // as an APInt, while immediate-count instructions hand over a literal.
+  // Routing both through the Value* overload would lose the distinction and
+  // with it the early fold.
+  //
+  // The APInt overload takes by value: APInt copying is cheap and callers pass
+  // temporaries constantly.
   Value* createLShrFolder(Value* LHS, Value* RHS, const Twine& Name = "");
 
   Value* createLShrFolder(Value* LHS, const uint64_t RHS,
@@ -3212,18 +3403,57 @@ public:
 
   Value* createShlFolder(Value* LHS, const llvm::APInt RHS,
                          const Twine& Name = "");
+
+  // The shared body behind every arithmetic folder.
+  //
+  // `opcode` rather than a function pointer so this stays a single switch. The
+  // per-opcode folders above exist for naming and for the constant-argument
+  // overloads, not to customise semantics.
   Value* folderBinOps(Value* LHS, Value* RHS, const Twine& Name,
                       Instruction::BinaryOps opcode);
   Value* folderBinOpsImpl(Value* LHS, Value* RHS, const Twine& Name,
                           Instruction::BinaryOps opcode);
+
+  // Build an instruction from an x86 opcode number.
+  //
+  // The opcode number rather than an already-decoded BinaryOp is what lets the
+  // folder consult the encoding: some x86 opcodes have several valid forms
+  // (shift-by-one vs shift-by-cl are both shr) and only the encoding
+  // distinguishes them. Routing through the opcode keeps that information
+  // instead of discarding it in the semantics handler.
   Value* createInstruction(const unsigned opcode, Value* operand1,
                            Value* operand2, Type* destType, const Twine& Name);
 
+  // Cached construction: return the existing instruction for this operand pair
+  // and opcode, or build it.
+  //
+  // This is a common-subexpression cache, and it exists mainly to keep the IR
+  // readable. Two handlers computing the same comparison independently
+  // otherwise produce two instructions and no reviewer can see they are the
+  // same test.
+  //
+  // The key is (operand1, operand2-or-destType) as a union, not three separate
+  // fields: for a comparison the second operand is a value, for a conversion it
+  // is a type, and a single slot keeps the key small enough that hashing does
+  // not dominate.
   Value* getOrCreate(const InstructionKey& key, uint8_t opcode,
                      const Twine& Name);
+
+  // Reassociate matching pairs before folding.
+  //
+  // Without this, `(a ^ b) ^ c` and `a ^ (b ^ c)` fold to two different
+  // constants when all three operands are known, because the lifter sees them
+  // as different expression trees. Reassociation to a canonical form first is
+  // what lets an obfuscated handler that reorders its own arithmetic still
+  // resolve to one constant.
   Value* doPatternMatching(Instruction::BinaryOps const I, Value* const op0,
                            Value* const op1);
 
+  // The optimisation fixpoint: run passes to stability, not a fixed count.
+  //
+  // Stops when a full round changes nothing. A fixed iteration count would
+  // either under-run (leaving unfolded chains) or over-run (wasted time), and
+  // under-running silently produces IR that looks finished but is not.
   void run_opts();
   // Folds just the module-backed loads (GEPLoadPass) once, without the
   // pseudo-stack/pseudo-memory rewrites: those change memory addressing and
