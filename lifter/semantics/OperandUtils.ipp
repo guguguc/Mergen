@@ -2232,6 +2232,17 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::SetValueToSubRegister_8b(
   return updatedReg;
 }
 
+// Write a 16-bit sub-register, preserving the upper 48 bits.
+//
+// Unlike the 8-bit case there is no high/low family split -- every 16-bit
+// spelling names bits [15:0] -- so the mask is constant and there is no family
+// test to get wrong. The input is zero-extended (not truncated) to the slot
+// width so the OR cannot set bits above 15: a wider input value keeps only its
+// low 16 bits by construction of the zext-then-mask-then-or sequence.
+//
+// Note the asymmetry with 32-bit writes (documented at SetRegisterValue): a
+// 16-bit write PRESERVES the upper bits while a 32-bit write CLEARS them. The
+// two functions look near-identical and do opposite things to bits [63:16].
 MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::SetValueToSubRegister_16b(
     const Register reg, Value* value) {
 
@@ -2378,6 +2389,18 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::GetEffectiveAddress() {
   return effectiveAddress;
 }
 
+// Integer address -> GEP pointer into the pseudo-memory base.
+//
+// The single-integer index over i8 is what makes every memory access a byte
+// offset into one flat model: no scaled indices, no struct GEPs, so
+// PromotePseudoMemory can pattern-match every access uniformly. A
+// multi-index or typed GEP here would be invisible to that pass and never
+// promote.
+//
+// The commented-out GS/TEB split is the road not taken: segment handling
+// happens earlier, at GetEffectiveAddress (folded into tebBase), so by the
+// time an address reaches here it is already flat. Re-introducing a separate
+// TEB base here would double-count the segment offset.
 MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::getPointer(Value* address) {
 
   LLVMContext& context = builder->getContext();
@@ -2692,6 +2715,19 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::SetMemoryValue(llvm::Value* address,
   insertMemoryOp(cast<StoreInst>(store));
 }
 
+// Read the instruction's `index`-th operand as a value.
+//
+// The position-to-operand resolution lives here, not in the semantics
+// handlers, which is what lets those files stay backend-agnostic: `index` is
+// an operand POSITION, and mapping it to a register, an immediate, or a memory
+// address requires the operand-type model that differs per disassembler
+// backend. See the matching note at the declaration in LifterClass.hpp.
+//
+// Register reads narrow through zext-or-trunc to the operand's width: the slot
+// is always 64-bit, and the handler must see the width the instruction
+// encoded. Immediates are materialised directly (no folder: a literal needs no
+// folding), and memory operands go through GetMemoryValue, which is where the
+// solveLoad tier chain runs.
 MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::GetIndexValue(uint8_t index) {
 
   auto type = instruction.types[index];
@@ -2782,6 +2818,20 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::GetIndexValue(uint8_t index) {
   }
 }
 
+// Write the instruction's `index`-th operand. The write half of GetIndexValue,
+// and the same backend-agnosticism argument applies: handlers name a position,
+// this resolves it.
+//
+// Partial-width narrowing is the CALLER's job, not this function's: the value
+// arrives at whatever width the handler computed, and SetRegisterValue applies
+// the architectural write semantics (preserve vs zero-extend). The commented
+// sext is the standing question of whether a sign-extending narrowing belongs
+// here instead -- left open because no handler has needed it, and adding it
+// would change every register write's width contract at once.
+//
+// Writing an immediate is UNREACHABLE rather than ignored: an instruction that
+// claims to write its immediate is a decode error, and silently dropping the
+// write would produce IR that verifies while missing the operation's effect.
 MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::SetIndexValue(uint8_t index,
                                                         Value* value) {
 
@@ -2854,6 +2904,10 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::SetIndexValue(uint8_t index,
 }
 
 
+// Snapshot all flags as a vector, in Flag-enum order.
+//
+// Positional, not keyed: index i IS flag i, which is what lets pushFlags pack
+// them bit by bit below. A map would lose the ordering the packing depends on.
 MERGEN_LIFTER_DEFINITION_TEMPLATES(std::vector<Value*>)::GetRFLAGS() {
   std::vector<Value*> rflags;
   for (int flag = FLAG_CF; flag < FLAGS_END; flag++) {
@@ -2862,6 +2916,24 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(std::vector<Value*>)::GetRFLAGS() {
   return rflags;
 }
 
+// Push a flag snapshot onto the emulated stack, eight flags per byte.
+//
+// Currently UNCALLED: the only reference is a commented-out call in
+// lift_pushfq (Semantics_Bitwise.ipp), which instead does sub-rsp + a single
+// SetMemoryValue. Documented anyway because the packing order (flag[i+j] into
+// bit j) is a wire format with no header or tag -- whoever re-enables this
+// must match it exactly on the unpacking side, or flags permute silently
+// across the round-trip.
+//
+// NOTE the stack direction disagrees with the live push lowering: this
+// increments RSP per byte (upward), while lift_pushfq subs RSP (downward,
+// the real x86 direction). Re-enabling requires reconciling that first; as
+// written, a push-pop pair through this function grows the stack instead of
+// restoring it.
+//
+// Each store goes through insertMemoryOp rather than only emitting IR, so the
+// pushed bytes enter the tracked buffer immediately. Without that, a pop right
+// after the push would miss the buffer and read stale stack contents.
 MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::pushFlags(
     const std::vector<Value*>& value, const std::string& address) {
   LLVMContext& context = builder->getContext();
