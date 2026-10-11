@@ -120,3 +120,15 @@ namespace timer {
   void suspendTimer();
   void resumeTimer();
 } // namespace timer
+
+// Live OS build number of the host (e.g. 19045 on Win10 22H2, 26200 on Win11
+// 25H2), or 0 when it cannot be determined.
+//
+// Separate translation unit because the query needs <windows.h>, and this
+// header (via LifterClass.hpp) reaches nearly every .cpp in the project.
+//
+// RtlGetVersion rather than GetVersion/GetVersionEx: those two are subject to
+// the application-compatibility shim and report 6.2 for any binary that does
+// not carry a compatibility manifest, which this lifter does not. ntdll is
+// resolved dynamically so it stays off the link line. Defined in Utils.cpp.
+uint64_t queryHostOsBuildNumber();

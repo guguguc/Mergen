@@ -10,6 +10,17 @@
 #include <utility>
 // #include <z3++.h>
 
+#ifdef _WIN32
+// winternl.h, for RTL_OSVERSIONINFOW. It does not declare RtlGetVersion itself,
+// and it is not safe to include from a header this widely included, so the
+// signature is spelled out here. It is a documented, stable ntdll export
+// (the unversioned alternative to the shimmed GetVersionEx).
+#include <windows.h>
+#include <winternl.h>
+
+using RtlGetVersionFn = LONG(WINAPI*)(PRTL_OSVERSIONINFOW);
+#endif
+
 /*
 
 
@@ -355,4 +366,31 @@ namespace {
 
 unsigned long long nextMemEventSeq() {
   return ++g_memEventSeq;
+}
+
+uint64_t queryHostOsBuildNumber() {
+#ifdef _WIN32
+  // Cached: the answer cannot change under a running process, and this sits on
+  // the lifter setup path.
+  static const uint64_t cached = []() -> uint64_t {
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (ntdll == nullptr) {
+      return uint64_t{0};
+    }
+    auto rtlGetVersion = reinterpret_cast<RtlGetVersionFn>(
+        GetProcAddress(ntdll, "RtlGetVersion"));
+    if (rtlGetVersion == nullptr) {
+      return uint64_t{0};
+    }
+    RTL_OSVERSIONINFOW info{};
+    info.dwOSVersionInfoSize = sizeof(info);
+    if (rtlGetVersion(&info) != 0 /* STATUS_SUCCESS */) {
+      return uint64_t{0};
+    }
+    return static_cast<uint64_t>(info.dwBuildNumber);
+  }();
+  return cached;
+#else
+  return 0;
+#endif
 }

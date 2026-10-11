@@ -2634,6 +2634,13 @@ public:
   // number, and the sample was protected on the analysis host, seeding the host's
   // value reproduces the key. Override with MERGEN_OS_BUILD_NUMBER when analysing
   // a sample protected elsewhere.
+  //
+  // The seed is read from the live host rather than pinned to a constant. A
+  // frozen build number silently only worked on the machine the sample was
+  // protected on: moving to another host, or upgrading across a Windows release
+  // (19045 Win10 22H2 -> 26100/26200 Win11 24H2/25H2), changed the real TEB word
+  // the protector reads while the lifter kept seeding the old constant, so the
+  // VM key came out wrong and devirtualisation stopped reproducing.
   static constexpr uint64_t tebBase = 0x7FFD0000ULL;
   static constexpr uint64_t pebBase = 0x7FFD1000ULL;
   static uint64_t hostOsBuildNumber() {
@@ -2644,7 +2651,13 @@ public:
         return parsed;
       }
     }
-    return 26200ULL; // build this sample was protected with (Win10 25H2 host)
+    if (const uint64_t live = queryHostOsBuildNumber()) {
+      return live;
+    }
+    // Only reachable off Windows, or if ntdll refused to hand over
+    // RtlGetVersion. A wrong-but-concrete value is still far more useful than
+    // an unknown one here: see the symbolic-RFLAGS note above.
+    return 26200ULL;
   }
   void modelProcessEnvironment() {
     llvm::LLVMContext& ctx = builder->getContext();
