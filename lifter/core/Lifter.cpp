@@ -4,6 +4,11 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 
+// magic_enum's range is a compile-time contract that must be fixed before the
+// header is seen, hence these defines ahead of every include. The -1000..1000
+// window exists because the lift synthesises magic_enum values (folders,
+// diagnostics kinds) that are not real enum members but still need name
+// conversion.
 #define MAGIC_ENUM_RANGE_MIN -1000
 #define MAGIC_ENUM_RANGE_MAX 1000
 
@@ -44,10 +49,34 @@
 
 // #define TEST
 
+// Windows-only crash reporting, installed before anything else runs.
+//
+// A lift can take minutes on a VM-protected sample and can fault deep inside
+// an LLVM pass or a backend instruction decoder. Without this, a fault is an
+// anonymous dialog and the run is lost. The handler writes crash.txt (a
+// symbolised stack trace) and crash.dmp (a full minidump) before letting the
+// crash propagate.
+//
+// Everything here is _WIN32-guarded because the lifter's primary build lane is
+// windows-latest; there is no equivalent path for other hosts, which do not
+// install this at all rather than installing a stub.
+
 #ifdef _WIN32
 namespace {
 
+// Reentrancy guard. The handler itself allocates (ostringstream, std::string,
+// ofstream), so a fault *inside* the handler would re-enter it and recurse
+// until the stack overflowed -- replacing one useful crash report with a
+// useless one. The interlocked exchange makes the second entry a no-op.
+//
+// volatile LONG with InterlockedExchange rather than std::atomic: this runs
+// from an exception filter where the C++ runtime's guarantees do not
+// obviously hold, and the Win32 primitive is the honest choice.
 volatile LONG g_crashHandlerActive = 0;
+
+// Bound on stack-walk depth. StackWalk64 can walk a long way on a recursive
+// or corrupted stack; the cap keeps the handler itself from running out of
+// stack while trying to report that the stack was the problem.
 constexpr int kMaxCrashFrames = 96;
 
 std::string hexAddr(uint64_t value) {
@@ -73,6 +102,9 @@ bool writeMinidump(EXCEPTION_POINTERS* exceptionInfo) {
   return ok == TRUE;
 }
 
+// Interpret the first ExceptionInformation word of an access violation.
+// These are the documented IMAGE_*_FAULTING / EXCEPTION_*_FAULTING values;
+// the default arm covers the codes that are not memory faults at all.
 const char* accessKind(ULONG_PTR kind) {
   switch (kind) {
     case 0:
@@ -86,6 +118,9 @@ const char* accessKind(ULONG_PTR kind) {
   }
 }
 
+// Dump every GPR. A lift fault is nearly always about one register holding a
+// bad pointer, and having all sixteen on one line is what makes the report
+// worth reading without re-running under a debugger.
 void logRegistryState(std::ofstream& out, PCONTEXT ctx) {
   out << "  RIP=" << hexAddr(ctx->Rip) << " RSP=" << hexAddr(ctx->Rsp)
       << " RBP=" << hexAddr(ctx->Rbp) << "\n";
@@ -98,6 +133,13 @@ void logRegistryState(std::ofstream& out, PCONTEXT ctx) {
   out << "  R14=" << hexAddr(ctx->R14) << " R15=" << hexAddr(ctx->R15) << "\n";
 }
 
+// Symbolised stack trace via dbghelp.
+//
+// UNDNAME expands decorated C++ names, DEFERRED_LOADS avoids paying symbol
+// load cost for modules that are never touched, LOAD_LINES adds file:line.
+// The SYMBOL_INFO buffer is over-allocated by 512 because SYMBOL_INFO requires
+// MaxNameLen bytes of name storage to follow the fixed header, and MaxNameLen
+// excludes the terminator.
 void logStackTrace(std::ofstream& out, HANDLE process, HANDLE thread,
                    PCONTEXT ctx) {
   STACKFRAME64 frame{};
@@ -154,6 +196,7 @@ void logStackTrace(std::ofstream& out, HANDLE process, HANDLE thread,
 
 }  // namespace
 
+// Install the unhandled-exception filter. Windows-only; a no-op elsewhere.
 void installCrashHandler() {
   SetUnhandledExceptionFilter([](EXCEPTION_POINTERS* exceptionInfo) -> LONG {
     if (InterlockedExchange(&g_crashHandlerActive, 1) != 0) {
@@ -195,6 +238,18 @@ void installCrashHandler() {
 
 
 
+// Apply --reg overrides after InitRegisters.
+//
+// The register name type is backend-dependent, so which enum to parse against
+// depends on whether the iced lane or the Zydis fallback lane was built. The
+// conditional alias is the only place the two backends are distinguished at
+// this level; everything below is backend-agnostic.
+//
+// Parsing by name through magic_enum rather than by index means the CLI
+// surface stays stable when the backend's register enum is reordered, which
+// both backends do freely between releases. An unknown name is a hard failure
+// rather than a skipped line: silently ignoring it would lift from the wrong
+// initial state and produce confidently wrong IR.
 bool applyEntryRegisterSeeds(
     lifterConcolic<>* lifter,
     const std::vector<std::pair<std::string, uint64_t>>& entryRegs) {
@@ -217,6 +272,13 @@ bool applyEntryRegisterSeeds(
   return true;
 }
 
+// Run the full pipeline for one start address. Returns whether the lift
+// produced no errors.
+//
+// Note what "success" means: the pipeline returning diagnostics with errors is
+// treated as failure even though output.ll was written. That is deliberate --
+// a partial lift that mislifted a block must not be reported as a clean run
+// to an automated regression gate.
 bool InitFunction_and_LiftInstructions(const uint64_t runtime_address,
                                        std::vector<uint8_t>&& fileData,
                                        const std::vector<uint64_t>& outlineAddresses,
@@ -247,10 +309,14 @@ bool InitFunction_and_LiftInstructions(const uint64_t runtime_address,
 // #define TEST
 int main(int argc, char* argv[]) {
 #ifdef _WIN32
+  // Before anything else: if argument parsing itself faults, there is still a
+  // handler to report it.
   installCrashHandler();
 #endif
   std::vector<std::string> rawArgs(argv, argv + argc);
 #ifdef MERGEN_TEST
+  // The test binary accepts options the production binary rejects, so that
+  // harnesses can pass through flags meant for the in-process test runner.
   constexpr bool allowUnknownOptions = true;
 #else
   constexpr bool allowUnknownOptions = false;
@@ -274,6 +340,10 @@ int main(int argc, char* argv[]) {
     debugging::enableDebug("debug.txt");
   }
 
+  // Declared-but-unimplemented options are rejected explicitly rather than
+  // accepted and ignored. Silently ignoring --concretize-unsafe-reads would
+  // produce IR that is wrong in exactly the way the flag was meant to fix,
+  // and the user would have no reason to look.
   if (parseResult.concretizeUnsafeReads) {
     std::cerr << "Option '--concretize-unsafe-reads' is recognized but "
                  "not implemented yet."
@@ -282,6 +352,8 @@ int main(int argc, char* argv[]) {
   }
 
   std::vector<std::string> args = std::move(parseResult.positionalArgs);
+  // Started after argument parsing and option validation, so the reported
+  // elapsed time reflects lifting work rather than startup.
   timer::startTimer();
 
 #ifdef MERGEN_TEST
@@ -308,17 +380,28 @@ int main(int argc, char* argv[]) {
                                 maxAttempts, randomSeed);
   }
 
+  // MERGEN_TEST builds a *different* binary: same sources, but main dispatches
+  // to the in-process instruction/oracle harness instead of lifting a file.
+  // The two modes are mutually exclusive below, which is why this return path
+  // does not fall through to the production flow.
   const std::string suiteFilter = args.size() > 1 ? args[1] : "";
   return testInit(suiteFilter);
 #endif
   const auto& outlineAddrs = parseResult.outlineAddresses;
   const auto& entryRegs = parseResult.entryRegs;
+
+  // --mem-dump path, falling back to the environment variable so CI and
+  // scripts do not have to thread the flag through every invocation.
   std::string memDumpPath = parseResult.memDumpPath;
   if (memDumpPath.empty()) {
     if (const char* env = std::getenv("MERGEN_MEM_DUMP")) {
       memDumpPath = env;
     }
   }
+
+  // The lambda captures by reference on purpose: outlineAddrs and entryRegs
+  // are views into parseResult, which outlives this call, so copying them
+  // would only duplicate potentially large vectors.
   return runLifterApplication(args,
       [&outlineAddrs, &entryRegs, memDumpPath](uint64_t runtime_address,
                                    std::vector<uint8_t>&& fileData) {

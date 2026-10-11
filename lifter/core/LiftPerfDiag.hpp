@@ -1,5 +1,25 @@
 #pragma once
 
+// Optional lift-time performance instrumentation.
+//
+// Off unless MERGEN_DIAG_PERF is set to 1/true/TRUE (see envEnabled). Every
+// accounting path below checks `enabled` before touching anything, so the
+// default cost is one predictable branch per probe site, not a data race and
+// not a lock.
+//
+// Intended use: find out *where* a slow lift is spending its time, and more
+// usefully, which of the lifter's internal strategies is dominating. The
+// counters that matter most for that are not the timers but the histograms:
+// `cpvResult*` (how wide the possible-value set is at each constant-propagation
+// query) and `solvePathSiteCalls` (which call sites enter the path solver)
+// together identify the specific instruction that is making the solver
+// expensive, which a total-ms figure cannot.
+//
+// Naming shorthand used throughout:
+//   cpv   computePossibleValues
+//   gcv   getConstraintVal
+//   RVA   the site counters are keyed by call-site address
+
 #include <algorithm>
 #include <array>
 #include <cstdlib>
@@ -15,6 +35,11 @@
 struct LiftPerfDiag {
   bool enabled = false;
 
+  // A timing bucket: call count plus accumulated milliseconds.
+  //
+  // count and totalMs are kept separately rather than only an average, because
+  // a single pathological call and a broad cheap cost can produce the same
+  // average and need completely different fixes.
   struct Acc {
     uint64_t count = 0;
     double totalMs = 0.0;
@@ -24,9 +49,16 @@ struct LiftPerfDiag {
       totalMs += ms;
     }
 
+    // Guards the division rather than returning NaN, so an unprobed bucket
+    // prints as 0.0 in the dump instead of poisoning a column of averages.
     double avgMs() const { return count ? totalMs / static_cast<double>(count) : 0.0; }
   };
 
+  // --- solvePath breakdown -----------------------------------------------
+  //
+  // solvePath is the total; the rest are nested inside it, not siblings. The
+  // constant-backup timers are separate from the constant-resolve timer
+  // because a backup can be taken without a resolve happening.
   Acc solvePath;
   Acc solvePathCpv;
   Acc solvePathGcv;
@@ -34,9 +66,16 @@ struct LiftPerfDiag {
   Acc solvePathConstBackup;
   Acc solvePathConstBr;
   Acc cpvTotal;
+  // Move-vs-copy split for the constant backup. Taken/skipped below records
+  // how often a backup happened at all.
   Acc backupMove;
   Acc backupCopy;
 
+  // --- folding / known-bits ----------------------------------------------
+  //
+  // folderPattern and folderCreate are mutually exclusive outcomes of one
+  // folder attempt: match an existing instruction pattern, or build a fresh
+  // instruction. folderKnownBits is the known-bits reasoning underneath both.
   Acc folderPattern;
   Acc folderCreate;
   Acc folderKnownBits;
@@ -45,6 +84,12 @@ struct LiftPerfDiag {
   Acc icmpKnownBits;
   Acc truncKnownBits;
 
+  // --- instruction construction ------------------------------------------
+  //
+  // createCacheInsert is the cost of recording a newly built instruction for
+  // pattern reuse; createComplexity is the complexity estimate that decides
+  // whether folding is worth attempting at all. If the latter dominates, the
+  // expensive part is deciding not to fold.
   Acc createLookup;
   Acc createSelectDist;
   Acc createBinOp;
@@ -53,6 +98,7 @@ struct LiftPerfDiag {
   Acc createComplexity;
   Acc createFoldOrigin;
 
+  // --- register and flag access ------------------------------------------
   Acc regGet;
   Acc regSet;
   Acc flagGet;
@@ -61,6 +107,7 @@ struct LiftPerfDiag {
   Acc flagSetStore;
   Acc decode;
 
+  // --- outcome counters ---------------------------------------------------
   uint64_t constBackupSkipped = 0;
   uint64_t constBackupTaken = 0;
 
@@ -71,6 +118,9 @@ struct LiftPerfDiag {
   uint64_t folderExitKnownConst = 0;
   uint64_t folderExitKeepInst = 0;
 
+  // The reg/flag subtallies split the calls by the path taken. These exist
+  // because the totals alone cannot distinguish "one expensive high-byte
+  // access" from "many cheap ones", and those have different fixes.
   uint64_t regGetCalls = 0;
   uint64_t regSetCalls = 0;
   uint64_t regGetHighByte = 0;
@@ -84,6 +134,8 @@ struct LiftPerfDiag {
   uint64_t flagSetCalls = 0;
   uint64_t flagSetLazyCalls = 0;
   uint64_t flagSetEagerCalls = 0;
+  // Indexed by flag id; sized 32 to cover the x86 flag identifiers the
+  // semantics layer uses. Callers must bounds-check before indexing.
   std::array<uint64_t, 32> flagSetById{};
 
   uint64_t createCalls = 0;
@@ -93,8 +145,14 @@ struct LiftPerfDiag {
   uint64_t createSelectDistHit = 0;
   uint64_t createPlainBinOp = 0;
   uint64_t createCastPath = 0;
+  // Indexed by opcode; 256 covers the x86 opcode space the lifter dispatches
+  // on. Wider indices are dropped by noteCpvRootOpcode's bounds check rather
+  // than wrapped, so the histogram stays a valid count.
   std::array<uint64_t, 256> createOpcode{};
 
+  // cpvResult* is a width histogram: how many possible values came back from
+  // a constant-propagation query. A run dominated by cpvResultMany is where
+  // the path solver is spending its time on sets too wide to act on.
   uint64_t cpvCacheHits = 0;
   uint64_t cpvDepthCut = 0;
   uint64_t cpvResultEmpty = 0;
@@ -106,18 +164,35 @@ struct LiftPerfDiag {
 
   std::array<uint64_t, 256> cpvRootOpcode{};
 
+  // Indexed by call-site context: unknown/cond/direct/indirect-jump/ret,
+  // matching the labels printed in dump().
   std::array<uint64_t, 5> solvePathContext{};
 
   std::map<std::string, uint64_t> solvePathOutcomes;
 
+  // getConstraintVal resolution provenance: how often each strategy produced
+  // the answer. A rising `simplify` count relative to `const` and `fold` means
+  // the solver is increasingly relying on LLVM simplification rather than on
+  // its own analysis.
   uint64_t gcvCalls = 0;
   uint64_t gcvSolvedConst = 0;
   uint64_t gcvSolvedFold = 0;
   uint64_t gcvSolvedSimplify = 0;
   uint64_t gcvUnsolved = 0;
 
+  // Per-call-site solvePath entry counts. Keyed by VA so the top offenders can
+  // be mapped straight back to the instruction that caused them.
   std::map<uint64_t, uint64_t> solvePathSiteCalls;
 
+  // RAII timer for a timing bucket.
+  //
+  // The construction trick is the point: when diagnostics are off, `diag` and
+  // `bucket` are both nulled out and `start` is left default-constructed. The
+  // destructor then takes a single branch and returns without ever reading the
+  // clock. Call sites stay unconditional ("always construct a ScopedTimer")
+  // rather than being wrapped in `if (perf.enabled)` at every probe site,
+  // which keeps the instrumentation from drifting out of sync with the code it
+  // measures -- the usual way these decay.
   class ScopedTimer {
     LiftPerfDiag* diag;
     Acc* bucket;
@@ -141,6 +216,11 @@ struct LiftPerfDiag {
     }
   };
 
+  // Bounds-checked histogram updates. The `>= size()` guards are not defensive
+  // padding: an out-of-range index silently truncating to a nearby bucket would
+  // make the profile point at the wrong opcode, which is worse than losing the
+  // sample.
+
   void noteSolvePathContext(unsigned ctx) {
     if (!enabled || ctx >= solvePathContext.size()) {
       return;
@@ -162,6 +242,10 @@ struct LiftPerfDiag {
     ++solvePathSiteCalls[site];
   }
 
+  // Bucket a cpv result set by width. The breakpoints are 0/1/2/3-8/9+ because
+  // those are the cases with different remedies: 1 is the fast path, 2 is a
+  // diamond the solver can still resolve, and 9+ is where the set is too wide
+  // to act on and the work is largely wasted.
   void noteCpvResult(size_t n) {
     if (!enabled) {
       return;
@@ -195,6 +279,10 @@ struct LiftPerfDiag {
     }
   }
 
+  // Strict allowlist rather than "any value except 0/false/off". Being liberal
+  // here would mean a typo like MERGEN_DIAG_PERF=yes silently enabling
+  // instrumentation on every run, and the resulting slowdown would look like a
+  // regression in the lifter rather than in the environment.
   static bool envEnabled() {
     const char* env = std::getenv("MERGEN_DIAG_PERF");
     if (env == nullptr) {
@@ -204,6 +292,14 @@ struct LiftPerfDiag {
     return value == "1" || value == "true" || value == "TRUE";
   }
 
+  // Render the whole report to a stream. No-ops entirely when disabled, so
+  // callers can invoke this unconditionally.
+  //
+  // Ordered by subsystem rather than by declaration, because the report is
+  // read top-down: find the dominant subsystem, read its sub-breakdown, then
+  // jump to the site/opcode histograms at the end. The two "top N" opcode
+  // tables and the site table are printed last for the same reason -- they are
+  // the drill-down, not the overview.
   void dump(std::ostream& os) const {
     if (!enabled) {
       return;
@@ -313,6 +409,7 @@ struct LiftPerfDiag {
        << " total_ms=" << createFoldOrigin.totalMs
        << " avg_ms=" << createFoldOrigin.avgMs() << "\n";
     os << "[perf]   create_opcode top:";
+    // Ranked drill-down: the ten most frequent opcodes at create time.
     {
       std::vector<std::pair<unsigned, uint64_t>> createRank;
       for (unsigned op = 0; op < createOpcode.size(); ++op) {
@@ -373,6 +470,9 @@ struct LiftPerfDiag {
     }
     os << "\n";
 
+    // Ranked drill-down: the twelve call sites that entered solvePath most often.
+    // This is the table that turns a profile into a specific address to look
+    // at -- the site VA maps back to the instruction that caused the work.
     std::vector<std::pair<uint64_t, uint64_t>> siteRank;
     siteRank.reserve(solvePathSiteCalls.size());
     for (const auto& [site, count] : solvePathSiteCalls) {
