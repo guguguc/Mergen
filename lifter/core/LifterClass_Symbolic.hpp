@@ -1,6 +1,22 @@
 #ifndef LIFTERCLASS_SYMBOLIC_H
 #define LIFTERCLASS_SYMBOLIC_H
 
+// Fully-symbolic execution model: architectural state lives in an LLVM struct
+// in memory, not in SSA values.
+//
+// This is the foundation the whole lifter stands on. Making registers a
+// memory-resident struct means an instruction's reads and writes are ordinary
+// loads and stores, so:
+//   - the path solver can reason about register values without threading them
+//     through SSA dominance chains,
+//   - a symbolic value stays symbolic until something concretises it,
+//   - partial-register writes and flag updates are ordinary stores rather than
+//     special cases in a phi web.
+//
+// lifterConcolic inherits this and layers path solving on top; the
+// `_impl` suffix throughout marks the hooks lifterClassBase calls, and every
+// one of them is dispatched statically through the CRTP chain.
+
 #include "CommonDisassembler.hpp"
 #include "IcedDisassembler.hpp"
 #include "IcedDisassemblerMnemonics.h"
@@ -11,6 +27,10 @@
 #include <llvm/IR/Metadata.h>
 #include <magic_enum/magic_enum.hpp>
 
+// The disassembler lane is chosen at compile time. ICED is the default lane;
+// Zydis is the fallback. Everything below is backend-agnostic and refers to
+// Register/Mnemonic/DisassemblerBase abstractly, which is what lets both
+// builds share this file unchanged.
 template <
 #ifdef ICED_FOUND
     Registers Register = Mergen::IcedRegister,
@@ -26,6 +46,8 @@ template <
 #endif
     >
 
+  // Fails at the class definition rather than deep inside a semantics
+  // handler if a backend does not satisfy the normalised operand contract.
   requires Disassembler<DisassemblerBase<Mnemonic, Register>, Mnemonic,
                         Register>
 
@@ -36,6 +58,17 @@ public:
   // lifterConcolic constructor will be executed after lifterClassBase
   // https://godbolt.org/z/f986zK5j1
 
+  // Field offsets into the register struct.
+  //
+  // The trailing underscore avoids colliding with the Register enum members of
+  // the same name, which are in scope here.
+  //
+  // REGISTER_COUNT is set to RFLAGS_ rather than RFLAGS_ + 1. Note that this
+  // makes `vec` one element shorter than the struct's field count, which is
+  // harmless only because `vec` and `vecflag` are currently unused: all
+  // register state is reached through CreateStructGEP on the struct built in
+  // init_ctx below, not through these arrays. Do not start indexing `vec`
+  // with a RegisterIndex without fixing the bound first.
   enum RegisterIndex {
     RAX_ = 0,
     RCX_ = 1,
@@ -60,6 +93,16 @@ public:
   std::array<llvm::Value*, REGISTER_COUNT> vec;
   std::array<llvm::Value*, FLAGS_END> vecflag;
 
+  // Map a backend Register enum onto a struct field index.
+  //
+  // GPRs are contiguous in both enums, so the arithmetic identity works. That
+  // is an assumption about the backend enums, not something the normalised
+  // operand contract guarantees, which is why the assert re-states it: if a
+  // backend reorders or inserts a GPR, this silently indexes the wrong field
+  // otherwise, and the assert catches it in debug builds.
+  //
+  // RIP and RFLAGS are handled explicitly because they are not part of the
+  // GPR run in either enum.
   int getRegisterIndex(Register key) const {
 
     switch (key) {
@@ -81,6 +124,17 @@ public:
   llvm::Value* ctx;
   StructType* type;
 
+  // Read an architectural register out of the CTX struct.
+  //
+  // Always loaded as i64 regardless of the register's architectural width:
+  // the struct field is i64, and width narrowing happens at the semantics
+  // layer that asked for it. Keeping one width in the struct is what lets an
+  // 8-bit write to AL and a 64-bit read of RAX alias correctly -- the aliasing
+  // is handled by the load/store narrowing rather than by the layout.
+  //
+  // The value is named via magic_enum rather than the raw enum value so the
+  // emitted IR reads `reg_valRCX` instead of `reg_val3`. Debug runs are
+  // unreadable without it.
   llvm::Value* GetRegisterValue_impl(Register key) {
     int index = getRegisterIndex(key);
     // auto size = getRegisterSize(key);
