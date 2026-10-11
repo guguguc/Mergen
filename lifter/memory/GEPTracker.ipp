@@ -2214,6 +2214,19 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::solveLoad(LazyValue load,
       return std::nullopt;
     };
 
+    // Gate for answering an inferred address with file bytes.
+    //
+    // Two sufficient conditions, either of which admits the address. Paged
+    // means the memory model vouches for it. Otherwise every byte must be
+    // either tracked (the lifter knows it) or file-readable (the image has
+    // it) -- and the loop short-circuits on the FIRST untracked byte, so one
+    // file probe decides the whole span rather than one per byte.
+    //
+    // The asymmetry is deliberate: a fully-tracked span needs no file check at
+    // all, while a single untracked byte requires the file to cover the entire
+    // span, not just that byte. A span the file covers only partly is
+    // unanswerable -- composing half file bytes with half tracked bytes would
+    // produce a value neither source vouches for.
     auto canUseConcreteLoadAddress = [&](uint64_t address) {
       if (isMemPaged(address)) {
         return true;
@@ -2232,6 +2245,16 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::solveLoad(LazyValue load,
       std::set<APInt, APIntComparator> inferredOffsets;
 
       SmallVector<Value*, 8> addTerms;
+      // Flatten an address expression into additive terms, normalising `sub`
+      // into `add of negated constant`.
+      //
+      // Only a CONSTANT subtrahend is folded in. `a - b` with symbolic b is
+      // pushed as-is (the final push_back), because negating a symbolic value
+      // would create a new instruction -- materialising IR inside what is
+      // supposed to be a read-only decomposition. The caller handles the
+      // un-normalised term by failing to match it as a scaled index, which is
+      // the correct degradation: the address shape is genuinely not
+      // base + index*scale when the subtrahend is symbolic.
       auto collectAddTerms = [&](auto&& self, Value* expr,
                                  SmallVectorImpl<Value*>& terms) -> bool {
         if (auto* addInst = dyn_cast<BinaryOperator>(expr);
@@ -2303,6 +2326,13 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::solveLoad(LazyValue load,
         return true;
       };
 
+      // Partition the terms into one base constant and one scaled index.
+      //
+      // A second DISTINCT index (or a different scale) abandons the whole
+      // inference rather than picking one. `base + i*4 + j*4` with two live
+      // indices is a two-dimensional access, and enumerating it as if it were
+      // one-dimensional would produce addresses that are the sum of two
+      // independent variables -- most of which the guard never permits.
       for (Value* term : addTerms) {
         if (auto resolved = resolveSingleConcreteTerm(term)) {
           baseOffset += resolved->getZExtValue();
@@ -2326,6 +2356,11 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::solveLoad(LazyValue load,
         }
       }
 
+      // No index at all: the address is fully concrete. Still gated on
+      // canUseConcreteLoadAddress rather than answered unconditionally, because
+      // a concrete address outside both the paged set and the file is a
+      // computed value that merely LOOKS like an address -- answering it with
+      // file bytes would fabricate a read from unmapped memory.
       if (!indexValue || indexScale == 0) {
         if (canUseConcreteLoadAddress(baseOffset)) {
           inferredOffsets.insert(APInt(64, baseOffset));
@@ -2373,8 +2408,16 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::solveLoad(LazyValue load,
     };
 
 
+    // Unflatten-only: enumerate the offset and read each case. Under Basic
+    // there is one block per address, so a multi-valued offset cannot be
+    // split across blocks and enumeration would only multiply work.
     if (getControlFlow() == ControlFlow::Unflatten) {
       auto possibleValues = computePossibleValues(loadOffset, 0);
+      // Stack-only filter, in both address spellings. A multi-valued offset
+      // that includes image addresses would send this load after bytecode it
+      // cannot read; the image half is some other load's business (the module
+      // path), and keeping it here would mix the two provenances into one
+      // value set.
       pvalueset stackOnly;
       for (const auto& candidate : possibleValues) {
         const uint64_t addr = candidate.getZExtValue();
@@ -2440,6 +2483,12 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::solveLoad(LazyValue load,
           continue;
         }
 
+        // Fold the cases into a select chain as they resolve, rather than
+        // collecting values and building the chain afterwards. The first case
+        // needs no select -- it IS the default -- and each later case wraps
+        // the chain so far. Building it incrementally also means an
+        // unresolvable middle case is simply skipped without disturbing the
+        // cases already folded in.
         if (selectedValue == nullptr) {
           selectedValue = possible_values_from_mem;
         } else {
