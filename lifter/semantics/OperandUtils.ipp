@@ -1703,6 +1703,13 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::createTruncFolder(
   // we dont want to create %y2 = trunc %x
   // just use %y
   // so xor %y, %y2 => %y, %y => 0
+  //
+  // NOTE: this TODO is already satisfied by the InstructionCache behind
+  // getOrCreate (see LifterClass.hpp): a second `trunc %x` with the same key
+  // returns %y rather than building %y2. The TODO predates the layered cache
+  // and can be removed once someone confirms no caller bypasses getOrCreate
+  // for casts -- createTruncFolder itself routes through createInstruction,
+  // so it does not.
 
   return result;
 }
@@ -1721,6 +1728,18 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::createZExtFolder(
   return result;
 }
 
+// Width adaptor: zext when narrowing-up, trunc when narrowing-down,
+// identity when already exact.
+//
+// The equal-width `return V` is the point, not a shortcut: without it every
+// same-width "conversion" would build a no-op cast instruction, and the IR
+// would fill with self-casts that the O2 fixpoint must then remove -- after
+// the path solver has already had to reason about them. Identity here means
+// the solver never sees them.
+//
+// Scalar-size comparison rather than type equality: a 32-bit integer and a
+// 32-bit float-adjacent int type have the same width and need no conversion
+// for the lifter's purposes, since it reasons about bit patterns.
 MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::createZExtOrTruncFolder(
     Value* V, Type* DestTy, const Twine& Name) {
   auto folderSample = profiler.sample("sem_folder_zext_or_trunc");
@@ -1747,6 +1766,11 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::createSExtFolder(
   return result;
 }
 
+// The signed twin of createZExtOrTruncFolder. Same structure, opposite fill:
+// widening replicates the sign bit rather than zero-filling. The two exist
+// separately (rather than one function with a flag) because the choice encodes
+// whether the source is SIGNED -- movsx vs movzx -- and a wrong choice here is
+// well-typed IR with the wrong upper bits, which no later pass can detect.
 MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::createSExtOrTruncFolder(
     Value* V, Type* DestTy, const Twine& Name) {
   auto folderSample = profiler.sample("sem_folder_sext_or_trunc");
@@ -1983,6 +2007,19 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::GetRFLAGSValue() {
   return rflags;
 }
 
+// Print the full flag file plus two registers, for post-mortem traces.
+//
+// Three views of the same state, because each answers a different question:
+// the bits= list shows every flag (constant or not), the symbolic= list shows
+// only the non-constant ones (the ones that actually fork execution), and
+// rflags_ir shows the gathered register when the caller has one. A flags bug
+// usually shows up as a constant where a symbol should be or vice versa, and
+// that is exactly the split these two lists make visible.
+//
+// Non-constant registers print as "-": the point of the r9/rsp fields is
+// whether they are KNOWN, not what the expression is, since the full IR is
+// already in the module dump. Same reason flag non-constants use irText (short)
+// rather than a full print.
 MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::dumpRflagsDiag(const char* tag,
                                                          uint64_t rva,
                                                          llvm::Value* rflagsIr,
