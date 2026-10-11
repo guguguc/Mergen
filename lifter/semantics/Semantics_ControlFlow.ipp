@@ -1,4 +1,24 @@
 // Semantics_ControlFlow.ipp — mov, cmov, call, ret, jmp, conditional branches
+//
+// The register/memory model lives in LifterClass_Symbolic: registers and
+// pseudo-memory are an LLVM struct and an alloca, so an instruction's reads
+// and writes are ordinary loads and stores. Nothing here needs to maintain
+// shadow state.
+//
+// What this file does instead is decide, per control-flow shape, which *form*
+// the IR takes:
+//
+//   a direct branch        -> a plain br, queue the target for lifting
+//   an indirect branch     -> hand the address to solvePath and emit whatever
+//                             shape comes back (a br, a condbr, or a switch)
+//   a return               -> distinguish the outermost frame from a ROP or
+//                             ret-chain continuation
+//   a call                 -> decide inline vs outline, then apply ABI effects
+//
+// The returns are the subtle part. A `ret` is not a return unless RSP has come
+// back to STACKP_VALUE; anything else is a continuation, and treating it as a
+// return silently truncates the lifted function at the first ROP gadget.
+
 MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_mov() {
   LLVMContext& context = builder->getContext();
 
@@ -8,6 +28,13 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_mov() {
 
   printvalue(Rvalue);
 
+  // Mnemonic dispatch first: MOVSX/MOVZX/MOVSXD change the *width* of the move.
+  //
+  // These are checked by mnemonic rather than by operand type because the same
+  // `mov` family covers them, and only the mnemonic distinguishes how the high
+  // bits are meant to be filled: MOVZX zero-extends, MOVSX and MOVSXD
+  // sign-extend. Getting the wrong one here silently corrupts every 16-bit and
+  // 8-bit value the program touches, and the symptom appears far away.
   switch (instruction.mnemonic) {
   case Mnemonic::MOVSX: {
     Rvalue = createSExtFolder(
@@ -33,6 +60,13 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_mov() {
   }
   printvalue(Rvalue);
 
+  // Immediate source: narrower immediates are sign-extended to the destination
+  // width, which is what the ISA specifies.
+  //
+  // The destination width (types[0]) is used deliberately, not the source's:
+  // `mov rax, 0xFFFFFFFF` must sign-extend to 0xFFFFFFFFFFFFFFFF. Only the
+  // three signed immediate forms are listed; an unsigned immediate of the
+  // same width needs no adjustment and falls through to the default arm.
   switch (instruction.types[1]) {
   // case OperandType::Immediate64:
   case OperandType::Immediate8:
@@ -184,6 +218,10 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_call() {
 
   // Track whether we emitted an external CreateCall (not inlineable).
   // When true, skip the Unflatten inlining path below.
+  //
+  // The flag exists because the IAT fast path jumps to call_done with `goto`.
+  // An emitted call is final -- there is nothing left to inline -- so the
+  // dispatch below must not run and treat the import as an inlineable target.
   bool emittedExternalCall = false;
 
   // Fast path: detect `call [rip+disp]` (FF 15) direct IAT calls.
@@ -196,6 +234,11 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_call() {
       instruction.mem_index == Register::None) {
     // EA = RIP (post-instruction) + displacement.  current_address is already
     // advanced past the instruction, so it equals RIP at this point.
+    //
+    // The mem_index == None check is part of recognising the shape, not an
+    // optimisation: with an index register this is an indexed memory operand
+    // whose effective address is not statically known, and treating it as a
+    // direct IAT slot would resolve the wrong import.
     uint64_t ea = current_address + instruction.mem_disp;
     auto it = importMap.find(ea);
     if (it != importMap.end()) {
@@ -207,7 +250,9 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_call() {
       });
       emittedExternalCall = true;
 
-      // Skip the switch/Unflatten path entirely.
+      // Skip the switch/Unflatten path entirely. The goto rather than an early
+      // return, because the call_done label also has to run for the inline
+      // paths below (post-call block creation and queueing).
       goto call_done;
     }
     // Unresolved RIP-relative call: importMap has no entry for this IAT
@@ -437,6 +482,18 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_ret() { // fix
 
   uint64_t destination = 0;
 
+  // The decision that governs the whole handler.
+  //
+  // A `ret` is only a real return if RSP has come back to STACKP_VALUE -- the
+  // outermost frame. Anything else is a ROP or ret-chain continuation, where
+  // the instruction pops a target from the stack and jumps to it, consuming the
+  // frame rather than leaving it.
+  //
+  // Getting this wrong is silent and severe: treating a continuation as a real
+  // return truncates the lifted function at the first ROP gadget, and the IR
+  // still verifies and still looks plausible. This is also why the
+  // `finished = 1` in emitResolvedFunctionReturn is safe -- it only fires on
+  // the REAL_return path.
   uint8_t rop_result = REAL_return;
 
   if (llvm::ConstantInt* constInt =
@@ -747,6 +804,13 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_ret() { // fix
   }
 }
 
+// The unconditional transfer, direct or indirect.
+//
+// The two forms differ in exactly one way and it is load-bearing: a direct
+// jump's operand is a RIP-relative *displacement*, while an indirect jump's is
+// an already-absolute address. Adding RIP to an indirect target would corrupt
+// it. That is the whole reason isDirectJump is computed from the operand type
+// rather than assumed.
 MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_jmp() {
   LLVMContext& context = builder->getContext();
   // auto dest = operands[0];
@@ -773,6 +837,11 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_jmp() {
   // For direct jumps the immediate is RIP-relative, so add it to the
   // current RIP to get the absolute target. Indirect jumps already hold
   // an absolute address (or a computed pointer) in `trunc`.
+  //
+  // The Immediate64 case is included even though a 64-bit immediate displacement
+  // is not architecturally encodable in x64 `jmp`; it appears in the operand
+  // model for other instruction lengths and excluding it would send such a
+  // target through solvePath un-relocated.
   if (isDirectJump) {
     trunc = createAddFolder(trunc, ripval);
     printvalue(trunc);
@@ -926,6 +995,26 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_jmp() {
 }
 
 // jnz and jne
+// The conditional-branch family: JNZ, JS, JNS, JZ, JLE, JL, JNL, JNLE, JBE,
+// JB, JNB, JNBE, JO, JNO, JP, JNP.
+//
+// Sixteen near-identical handlers. They are spelled out individually for the
+// same reason the SETcc handlers are: each tests a different combination of
+// flags, and that combination is the entire content of the instruction. A
+// table would hide exactly the detail most likely to be wrong -- which flags,
+// which sense -- behind an index.
+//
+// Each one delegates to branchHelper, which emits the fallthrough-versus-target
+// select and hands it to the path solver. The per-condition work here is only
+// building the predicate; deciding whether the branch resolves is not this
+// handler's business.
+//
+// Note the naming asymmetry: JNZ tests ZF, JZ tests !ZF, and the Jcc variants
+// are spelled with the negation as a separate handler (JNBE rather than JA)
+// because that is how the opcode table in x86_64_opcodes.x maps them. The
+// condition *code* mnemonic and the Intel *mnemonic* differ; this file follows
+// the former.
+
 MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_jnz() {
 
   auto zf = getFlag(FLAG_ZF);
@@ -1197,6 +1286,19 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_jnp() {
 
   branchnumber++;
 }
+// LOOP / LOOPE / LOOPNE.
+//
+// The guard at the top rejects any encoding that is not exactly the bare
+// two-byte form. That matters because LOOP's behaviour is entirely determined
+// by RCX, and a prefixed or extended encoding of the same mnemonic does not
+// have that meaning -- accepting one would silently model it as the bare form.
+//
+// The decrement happens unconditionally, before the condition is built, which
+// is architecturally correct: LOOP always decrements and only the branch is
+// conditional. Building the condition from `decrementedCount` rather than
+// `counterValue` is what makes the counter-1 case behave right -- LOOP with
+// RCX == 1 falls through, and the pre-decrement form does that by
+// construction.
 MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_loopx() {
   if (instruction.length != 2 || instruction.attributes != InstructionPrefix::None) {
     Function* externFunc = cast<Function>(
