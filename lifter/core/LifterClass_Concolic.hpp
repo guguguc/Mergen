@@ -2356,6 +2356,13 @@ public:
   }
 
 
+  // Read the loop's output slot: the value this iteration hands to the next.
+  //
+  // Two-tier, and the order is the compatibility story. The legacy targetSlot is
+  // checked first so the reference Themida sample behaves exactly as before;
+  // the carriedSlots extension only fires when the legacy slot does not match.
+  // Reordering would change which slot wins on the reference sample, which is
+  // what the zero-regression guarantee forbids.
   llvm::Value* retrieve_generalized_loop_target_slot_value_impl(
       uint64_t startAddress, uint8_t byteCount) {
     if (!activeGeneralizedLoopControlFieldState.valid || byteCount == 0) {
@@ -2402,6 +2409,11 @@ public:
     // Check additional carried slots (multi-slot extension).
     for (const auto& slot : state.carriedSlots) {
       if (slot.address != startAddress) continue;
+      // Sizes must agree for the same reason as the discovery-time
+      // all-or-nothing rule: the phi below pairs backedgeValues[i] with
+      // backedgeSources[i], so a short vector silently mis-attributes values to
+      // edges. Skipping the slot here is the runtime counterpart of the
+      // discovery rule that drops a slot when any backedge lacks it.
       if (slot.backedgeValues.size() != state.backedgeSources.size()) continue;
 
       const uint64_t mask = llvm::maskTrailingOnes<uint64_t>(byteCount * 8);
@@ -2432,6 +2444,17 @@ public:
     return nullptr;
   }
 
+  // Read a *field* inside the control slot: control value + constant offset.
+  //
+  // The insert-block check is the part that looks redundant and is not. This
+  // helper answers from the loop's merged state, which is only meaningful while
+  // lifting the header itself. Called from inside the body, the same loadOffset
+  // would resolve against buffers that describe the loop entry rather than the
+  // current iteration -- producing the entry's control value mid-loop, which is
+  // stale by definition.
+  //
+  // orgLoad ignored for the same reason as the phi-address helpers: an
+  // uncertain address has no honest fallback load.
   llvm::Value* retrieve_generalized_loop_control_field_value_impl(
       llvm::Value* loadOffset, uint8_t byteCount, LazyValue orgLoad) {
     (void)orgLoad;
@@ -2482,6 +2505,27 @@ public:
     }
     return phi;
   }
+  // Re-home all per-header state when a generalized block is replaced.
+  //
+  // Called from replaceWithGeneralizedLoopBlock. Every one of the five maps is
+  // keyed by header block, so a replacement that left them behind would orphan
+  // the loop: the new header would re-discover (or worse, find no state) while
+  // the old maps still pointed at a block nothing branches to anymore.
+  //
+  // Copy, not move: the old block may still be referenced by queued path-solver
+  // predecessors, and replaceAllUsesWith repoints those -- but the maps are
+  // consulted by address-keyed lookups that outlive the replacement. Deleting
+  // the old entries would break a restore that is still in flight for the old
+  // block.
+  //
+  // The `!contains(newBlock)` guards make the migration first-writer-wins. A
+  // new block that already has its own entry was generalized independently, and
+  // overwriting it with the old block's phis would substitute one loop's
+  // variables for another's.
+  //
+  // headerBlock is re-pointed only in the control-field map because it is the
+  // only one that stores the header redundantly inside the value. The other
+  // four are keyed by it, so the key move is the whole update.
   void migrate_generalized_loop_block_impl(BasicBlock* oldBlock,
                                            BasicBlock* newBlock) {
     if (oldBlock == newBlock) {
@@ -2511,6 +2555,11 @@ public:
     }
   }
 
+  // Record that the current block flows back into generalized header `bb`.
+  //
+  // sourceBlock is the builder's insert block -- the block control is leaving --
+  // not `bb`. The backedge is the edge (source -> header), and recording the
+  // wrong end would make the phi's incoming blocks name the header itself.
   void record_generalized_loop_backedge_impl(BasicBlock* bb) {
     auto* sourceBlock = this->builder->GetInsertBlock();
     if (!bb || !sourceBlock) {
@@ -2557,13 +2606,26 @@ public:
       // current backedge into canonical and install the new body source
       // as the single backedge. This matches the reference Themida flow
       // where body exploration rolls the control cursor forward.
+      //
+      // Rotation rather than append, because a 2-way loop has exactly two
+      // arrivals and keeping both would turn it into a 3-way one. The old
+      // backedge becomes the new canonical: it is the arrival the loop most
+      // recently came through, so it is the right "first" value for the phis.
       auto* existingBackedgeSource = sources.front();
+      // Same source re-recorded: not a new backedge, just the same edge being
+      // walked again. Recording it would rotate the state onto itself --
+      // canonical and backedge swapping without any new value.
       if (!existingBackedgeSource || sourceBlock == existingBackedgeSource) {
         return;
       }
       auto* currentControlValue =
           retrieveContiguousBufferedValue(this->buffer, stateIt->second.controlSlot, 8);
       uint64_t rolledBackedgeControl = 0;
+      // Three ways to decline, and declining is the point: rotation is only
+      // valid when the cursor actually advanced. A missing value, an
+      // unresolvable expression, or an unchanged value all mean "the loop did
+      // not move forward", and rotating on any of them would install a backedge
+      // identical to the canonical -- a phi that claims to vary but does not.
       if (!currentControlValue ||
           !evaluateConcreteGeneralizedLoopInt(currentControlValue,
                                               existingBackedgeSource,
@@ -2640,6 +2702,9 @@ public:
             if (readConstantTrackedQword(this->buffer, carried.address, newVal)) {
               carried.backedgeValues[i] = newVal;
             }
+            // Unreadable slot left as-is: the previous value is a better answer
+            // than the canonical fallback used for NEW backedges below, because
+            // this edge previously produced a real value here.
           }
         }
         mutated = true;
@@ -2657,6 +2722,12 @@ public:
           carried.backedgeValues.push_back(newVal);
         } else {
           // Keep vectors aligned: push canonical as fallback.
+          //
+          // The fallback is canonical, not zero, so the new edge initially
+          // claims to agree with the first arrival -- which keeps the phi
+          // correct (one more identical incoming) rather than introducing a
+          // value no edge ever held. Alignment matters more than precision
+          // here: see the discovery all-or-nothing rule.
           carried.backedgeValues.push_back(carried.canonicalValue);
         }
       }
@@ -2674,6 +2745,20 @@ public:
     }
   }
 
+  // The lifted function's signature: 16 GPRs, EIP, memory, 16 XMMs.
+  //
+  // Fixed rather than derived from the binary because every consumer -- the ABI
+  // layer, InitRegisters_impl below, the test harness -- indexes arguments
+  // positionally. Changing the arity here silently renumbers all of those, so
+  // this is a cross-file contract, not a local choice.
+  //
+  // The two middle pointers are EIP-then-memory, in that order. InitRegisters
+  // consumes them positionally (eipArg, then memoryArg), so swapping the pushes
+  // binds the memory base to RIP and the entry address to the memory model --
+  // which verifies and mis-lifts everything.
+  //
+  // 16 XMMs as i128: the widest the lifter models. A narrower type would need a
+  // cast on every vector write; i128 holds any XMM value without one.
   void createFunction_impl() {
     std::vector<llvm::Type*> argTypes;
     for (size_t i = 0; i < 16; ++i) {
@@ -2696,6 +2781,17 @@ public:
                                function_name.c_str(), this->M);
   }
 
+  // Bind the function arguments to the register file, positionally.
+  //
+  // gprOrder must match createFunction_impl's push order exactly: the i-th GPR
+  // argument becomes the i-th register here. A mismatch binds the wrong argument
+  // to a register, which verifies, runs, and produces a lift where every
+  // register holds its neighbour's value.
+  //
+  // RSP is bound to whatever the caller passed, NOT to STACKP_VALUE. The
+  // emulated stack base is a lifter-side constant; the argument is the entry
+  // stack pointer the ABI promises. Conflating them would make the lifted
+  // function's first push write to a fixed address regardless of its caller.
   void InitRegisters_impl() {
     constexpr std::array<Register, 16> gprOrder = {
         Register::RAX, Register::RCX, Register::RDX, Register::RBX,
@@ -2721,6 +2817,10 @@ public:
     this->SetRegisterValue(Register::RIP, ripValue);
     auto* memoryArg = &*argIt++;
     memoryArg->setName("memory");
+    // The pseudo-memory base. Every GEP the lifter builds is rooted here, so
+    // this single assignment is what makes PromotePseudoMemory able to find
+    // them: a load through any other base is invisible to that pass and is
+    // never promoted.
     this->memoryAlloc = memoryArg;
 
     for (uint8_t i = 0; i < 16; ++i) {
@@ -2737,10 +2837,18 @@ public:
     auto one = ConstantInt::getSigned(Type::getInt1Ty(context), 1);
     auto two = ConstantInt::getSigned(Type::getInt1Ty(context), 2);
 
+    // All flags start cleared except the two the architecture defines as 1.
+    // FLAG_RESERVED1 is always 1 on real hardware; FLAG_IF (interrupts enabled)
+    // is the power-on state a user-mode program observes. Starting from any
+    // other combination makes the first conditional branch depend on a flag
+    // value no real execution could have produced.
     for (int flag = FLAG_CF; flag < FLAGS_END; ++flag)
       this->setFlag(static_cast<Flag>(flag), zero);
     this->setFlag(FLAG_RESERVED1, one);
     this->setFlag(FLAG_IF, one);
+    // RFLAGS as a whole reads 2: bit 1 set, everything else clear. That is the
+    // same state as the per-flag writes above expressed as one value, for
+    // consumers that read the register rather than individual flags.
     this->SetRegisterValue(Register::RFLAGS, two);
 
     // auto value =
@@ -2751,6 +2859,13 @@ public:
 
     // SetRegisterValue(Register::RIP, new_rip);
 
+    // RSP starts at the emulated stack base. This OVERWRITES the entry-stack
+    // argument bound above: the lifted function always runs on the lifter's own
+    // pseudo-stack, never on the caller's. That is what makes the stack window
+    // (isTrackedStackAddress) and the pseudo-stack promotion sound -- they both
+    // assume every stack access is within [STACKP_VALUE - reserve,
+    // STACKP_VALUE + reserve], which is only true because the entry value is
+    // discarded here.
     auto stackvalue = cast<Value>(
         ConstantInt::getSigned(Type::getInt64Ty(context), STACKP_VALUE));
 
