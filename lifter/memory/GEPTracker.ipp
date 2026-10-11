@@ -933,6 +933,18 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::extractBytes(Value* value,
 namespace SCCPSimplifier {
   std::unique_ptr<SCCPSolver> solver;
   uint64_t lastinstcount = 0;
+  // Lazily (re)build the sparse-conditional constant propagator for `function`.
+  //
+  // Cached by instruction count rather than rebuilt per query, because a solve
+  // asks for many values and the solver runs over the whole function each time.
+  // The count is a sufficient invalidation key here: the lifter only ever
+  // appends instructions during a lift, so a changed count means new code, and
+  // an unchanged count means the same function this solver already ran on.
+  //
+  // Every argument is marked overdefined up front. The lifter's function
+  // arguments are the entry machine state (registers, memory base), and their
+  // values genuinely differ per invocation -- treating any of them as constant
+  // would fold the entire lift around one imagined entry state.
   void init(Function* function) {
     if (function->getInstructionCount() == lastinstcount)
       return;
@@ -1017,6 +1029,16 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::pagedCheck(Value* address,
   }
 }
 
+// Record a memory READ through the tracked pseudo-memory base.
+//
+// Read-only with respect to the tracked buffer: this asserts the address is
+// paged (or records why not) but does not resolve the value. The resolution
+// happens at the operand helpers, which have the width and the fallback;
+// doing it here would answer without knowing either.
+//
+// The memoryAlloc gate is what scopes this to the lifter's own model. A GEP
+// through any other base is a real LLVM address computation, not a VM memory
+// access, and paging it would misclassify ordinary IR as image-backed.
 MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::loadMemoryOp(Value* ptr) {
   if (!isa<GetElementPtrInst>(ptr))
     return;
@@ -1033,6 +1055,13 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::loadMemoryOp(Value* ptr) {
 }
 
 // rename func name to indicate its only for store
+//
+// NOTE: the rename has not happened, and the comment above is the standing
+// request. loadMemoryOp/insertMemoryOp read symmetrically but the names do not
+// say so: one names the operation (load), the other the IR action (insert).
+// Renaming insertMemoryOp to storeMemoryOp would make the pair, but every
+// caller in OperandUtils.ipp uses the current name, so the rename is a
+// multi-file edit being deferred, not a one-line fix.
 MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::insertMemoryOp(StoreInst* inst) {
 
   auto ptr = inst->getPointerOperand();
@@ -1092,6 +1121,12 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::insertMemoryOp(StoreInst* inst) {
 
   auto gepOffsetCI = cast<ConstantInt>(gepOffset);
 
+  // Bypass drops the write entirely rather than recording it. This is correct
+  // only because the generalized-loop restore path owns these slots while the
+  // bypass is set: recording the write here as well would put a value in the
+  // tracked buffer that the loop's own state does not contain, so a later read
+  // would see this write instead of the loop-carried value. The 3000-line diag
+  // cap exists because a spinning dispatcher hits this on every iteration.
   if (bypassStackConcolicTracking &&
       isTrackedLocalStackAddress(gepOffsetCI->getZExtValue())) {
     if (liftProgressDiagEnabled) {
@@ -1158,6 +1193,18 @@ struct PairHash {
   }
 };
 
+// Drop every store shadowed by a later store to the same (offset, width).
+//
+// Reverse iteration is the mechanism, not an optimisation: walking back-to-front
+// means the first time a key is seen is its LAST occurrence, so emplace keeps
+// the latest store and drops the earlier ones. Forward iteration would keep the
+// first and drop the fix-up -- exactly backwards.
+//
+// Keyed by (offset Value*, width) rather than by resolved address, because at
+// this stage offsets are still SSA values and two textually different
+// expressions can name the same slot. That over-keeps (two different spellings
+// of one slot both survive), which is safe: a missed dedup costs a redundant
+// store, while an over-aggressive one would delete a store that matters.
 void removeDuplicateOffsets(std::vector<Instruction*>& vec) {
   if (vec.empty())
     return;
@@ -1187,8 +1234,24 @@ void removeDuplicateOffsets(std::vector<Instruction*>& vec) {
   vec.assign(uniqueInstructions.rbegin(), uniqueInstructions.rend());
 }
 
+// Leftover global, unused. `aea` is not referenced anywhere in the lifter;
+// kept rather than deleted because removing a global is a link-level change
+// only if something takes its address, and this documents that nothing does.
+// Harmless, but worth knowing before attributing meaning to the name.
 int aea = 10;
 
+// Enumerate every value consistent with `known`, capped at 2^max_unknown.
+//
+// The cap is load-bearing, not advisory. Each unknown bit doubles the set, so
+// max_unknown >= 10 already means 1024+ values -- and the caller turns this
+// set into a case split, so an uncapped enumeration is how an indirect jump
+// becomes a thousand-way switch. Returning empty on overflow is the contract:
+// the caller treats empty as PATH_unsolved and falls back, rather than
+// committing to a case analysis it cannot afford.
+//
+// A conflict (a bit known both 0 and 1) also returns empty, for a different
+// reason: the premise is contradictory, so no value is consistent with it, and
+// enumerating would fabricate cases from impossible state.
 using pvalueset = std::set<APInt, APIntComparator>;
 MERGEN_LIFTER_DEFINITION_TEMPLATES(pvalueset)::getPossibleValues(
     const llvm::KnownBits& known, unsigned max_unknown) {
