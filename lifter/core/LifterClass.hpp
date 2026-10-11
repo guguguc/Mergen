@@ -2194,6 +2194,21 @@ public:
               << " cursorBc=" << (isBytecodeAddress(fromCur) ? 1 : 0) << "\n"
               << std::flush;
   }
+  // A memory operand with no addressing complexity at all: `[reg]` and nothing
+  // else.
+  //
+  // This is the shape the lifter can fold without emitting a GEP, and the four
+  // exclusions are each load-bearing rather than stylistic:
+  //
+  //   mem_base != None   there has to be *some* base register
+  //   no index           an index means the address is a sum
+  //   no displacement     a displacement means the address is a sum
+  //   no GS/FS           a segment override means TEB-relative, which is a
+  //                      different addressing path entirely
+  //
+  // Callers use this to decide whether a read can be answered from the tracked
+  // buffer without building IR. Answering a scaled or displaced address that
+  // way would silently answer the wrong slot.
   bool isSimpleRegMemOp() const {
     return instruction.mem_base != Register::None &&
            instruction.mem_index == Register::None &&
@@ -2201,8 +2216,23 @@ public:
            instruction.mem_segment != Register::GS &&
            instruction.mem_segment != Register::FS;
   }
+  // The VIP decided for the current block, and whether it came from a real
+  // load.
+  //
+  // `exact` is tracked separately from the offset because a sticky-slot or
+  // cursor-derived offset can be a valid address and still not be the bytecode
+  // read itself. Downstream recovery treats an inexact VIP differently -- it
+  // may fall back to a wider possible-value set rather than committing to one
+  // handler -- so collapsing the two would make the lifter over-confident about
+  // guesses.
   uint64_t currentVipOffset = 0;
   bool currentVipIsExact = false;
+  // Every offset already dispatched to.
+  //
+  // Set rather than counter, and the difference matters: once an offset has
+  // been entered, re-entering it is what generalizes a loop, while entering a
+  // *new* offset at an address already lifted is what starts a new block. A
+  // count would conflate the two.
   llvm::DenseSet<uint64_t> seenVipOffsets;
   // Loop backedges are recognised by edge revisit, not by node revisit. The VM
   // dispatch trampoline is shared: many different handlers jump to the same
@@ -2284,6 +2314,16 @@ public:
     if (trace) std::cout << "[diag] shape reject=depth-exceeded\n";
     return false;
   }
+  // Forward reachability over the CFG.
+  //
+  // Forward, not backward, because the question is "will control arrive at the
+  // target from here" -- a block that cannot reach the header is not evidence
+  // of a loop, no matter how many predecessors it has.
+  //
+  // Unbounded by design, unlike the shape walk above. This has no depth budget
+  // because the CFG is finite and small relative to the IR: blocks are created
+  // by the lifter, not by LLVM folding, so the worst case is thousands of
+  // nodes rather than millions.
   bool blockCanReach(BasicBlock* source, BasicBlock* target) const {
     if (!source || !target) {
       return false;
@@ -2310,6 +2350,18 @@ public:
     return false;
   }
 
+  // The master loop-generalization gate.
+  //
+  // Every rejection path funnels through `reject` rather than returning false
+  // directly. That is what makes the gate debuggable: with the trace enabled,
+  // the reason string names which check fired, and without it the checks are
+  // indistinguishable from one another. Nine boolean tests with no diagnostics
+  // is exactly the kind of code that gets "fixed" by deleting a condition.
+  //
+  // `targetResolvedConcretely` widens the context test rather than replacing
+  // it. A backward branch the solver already resolved to a constant is a loop
+  // even if it arrived via an indirect jump -- the resolution is the thing that
+  // made the speculation disappear.
   bool canGeneralizeStructuredLoopHeader(uint64_t addr,
                                          bool targetResolvedConcretely = false) {
     const bool contextAllows =
