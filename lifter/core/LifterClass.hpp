@@ -928,6 +928,11 @@ public:
 
       {
         const uint64_t va = this->current_address;
+        // Every address appears twice: once at the 0x140000000 image base and
+        // once at 0x40000000. The lifter rebases to 0x40000000, so a list
+        // written for one lane would silently not fire in the other --
+        // producing traces that are half-empty rather than failing. Adding a
+        // new site means adding both forms.
         const bool vipSite =
             va == 0x140301D45ULL || va == 0x40301D45ULL ||
             va == 0x1402E6FF6ULL || va == 0x402E6FF6ULL ||
@@ -1072,6 +1077,12 @@ public:
       // dispatcher, and the handler read site).
       if (liftProgressDiagEnabled) {
         const uint64_t va = this->current_address;
+        // Only the 0x140000000 form is listed here, unlike the vipSite list
+        // above which pairs every address with its 0x40000000 counterpart.
+        // That is deliberate for this diagnostic and not an oversight: it
+        // fires only while lifting the sample these addresses came from, so
+        // there is no second base to cover. A 32-bit-rebased run of the same
+        // sample would simply not produce these traces.
         const bool watch =
             va == 0x140007210ULL || va == 0x140007215ULL || va == 0x140007216ULL ||
             va == 0x1401F0EFBULL || va == 0x1401F0F00ULL || va == 0x1401F0F05ULL ||
@@ -2105,6 +2116,19 @@ public:
   // first meaningful fold wins, so a uniqued constant is not overwritten by a
   // later identity fold such as `or C, C` - that overwrite is what turned the
   // reconstruction into a self-loop.
+  // Two guards, and both exist because LLVM uniques constants.
+  //
+  // The identity check rejects folds whose result *is* an operand -- a
+  // same-width sext, `or C, C`. They are real folds, but they carry no
+  // provenance: recording one would attach a trivial chain to a constant that
+  // a meaningful fold already explained.
+  //
+  // First-wins is then required, not optional. Because constants are uniqued, a
+  // second meaningful fold producing the same constant would overwrite the
+  // chain that reaches the original load, and the provenance walk below would
+  // reconstruct a path that does not exist. The comment in the file records
+  // that this exact overwrite previously turned the reconstruction into a
+  // self-loop.
   bool recordFoldOrigin(llvm::Value* result, unsigned opcode, llvm::Value* lhs,
                         llvm::Value* rhs) {
     if (!result || !llvm::isa<llvm::Constant>(result)) return false;
@@ -2778,6 +2802,30 @@ public:
     return file.readMemory(address, 1, ignored);
   }
 
+  // Re-home a truncated 32-bit target into a 64-bit image.
+  //
+  // Lifter-produced VM code frequently computes an address as a 32-bit value
+  // and stores it in a 64-bit slot. Zero-extension leaves the high half zero,
+  // which is a valid-looking address in no mapped region -- so a genuine
+  // dispatch target comes back unmapped and the concrete walk stops.
+  //
+  // Two candidate reconstructions, tried in this order:
+  //
+  //   highBits | target    the RVA was computed relative to the image base and
+  //                         the top 32 bits were simply lost. Restoring the
+  //                         base's high half is then exactly right.
+  //   imageBase + target   the target is a plain RVA and needs the base added.
+  //
+  // Both are validated with the caller's predicate rather than assumed --
+  // isMemPaged here, isFileBackedRuntimeAddress in the twin below. A widening
+  // that produced a mapped-but-wrong address would be worse than no widening.
+  //
+  // Gated on imageBase > 2^32: for a 32-bit image there is no high half to
+  // restore and the two candidates coincide with the original.
+  //
+  // Returns the target unchanged when neither candidate validates, so a
+  // genuinely unmapped address stays unmapped and produces a diagnostic rather
+  // than being forced into a plausible-looking one.
   uint64_t normalizeRuntimeTargetAddress(uint64_t target) {
     if (isMemPaged(target)) {
       return target;
@@ -2799,6 +2847,14 @@ public:
     return target;
   }
 
+  // Same widening as normalizeRuntimeTargetAddress, but the validation predicate
+  // is "is file-backed" rather than "is paged".
+  //
+  // The distinction matters and is the reason this is a separate function. A
+  // paged address may be a stack slot or a VM bookkeeping region -- valid as a
+  // *lift* target is the wrong question for some call sites, which need to know
+  // the address refers to real PE bytes. Using the looser predicate there would
+  // accept a stack address as a file-backed code target.
   uint64_t normalizeFileBackedRuntimeTargetAddress(uint64_t target) {
     if (isFileBackedRuntimeAddress(target)) {
       return target;
