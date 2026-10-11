@@ -1,5 +1,21 @@
 #ifndef FUNCSIGNATURES_H
 #define FUNCSIGNATURES_H
+
+// Recognises well-known library functions in a PE by their prologue bytes, so
+// the lifter can give them a real signature instead of guessing.
+//
+// Why bother: the lift loop is ABI-aware. When it hits a call it has to know
+// which registers are arguments, which are caller-saved, and what the return
+// convention is. For an unknown function it has to assume the worst and the
+// surrounding code stays symbolic. Matching a prologue such as
+// `swprintf_s`'s against the image converts an opaque call into a typed one,
+// and that difference propagates all the way into whether the caller's
+// concrete walk survives.
+//
+// Search is Aho-Corasick rather than a per-pattern scan: the signature table
+// grows with the number of recognised functions, and a single automaton pass
+// over the image stays O(1) per byte regardless of how many patterns exist.
+
 #include "AbiCallContract.hpp"
 #include "FileReader.hpp"
 #include <array>
@@ -11,14 +27,22 @@
 #include <unordered_map>
 #include <vector>
 
-// 8 << (arg.argtype.size - 1) => I8/I16/I32/I64/I128
+// Argument width. The values are small ordinals (not byte widths) because
+// they are stored in a 4-bit bitfield -- 8 << (size - 1) recovers the width,
+// so I8..I128 map to 1,2,4,8,16 bytes and stay representable in 4 bits.
 enum ArgType { NONE = 0, I8 = 1, I16 = 2, I32 = 3, I64 = 4, I128 = 5 };
 
 template <typename Register> class funcsignatures {
 public:
+  // One argument: which register it arrives in, how wide it is, and whether
+  // the value is a pointer (which the ABI layer needs in order to decide
+  // whether the callee may legally write through it).
   struct funcArgInfo {
     Register reg;
 
+    // Packed into a single byte: the arglist is built for every matched
+    // function during the image scan, so keeping funcArgInfo small keeps that
+    // scan's allocation down.
     struct argTypeInfo {
       uint8_t size : 4; // 4 bits for size
       uint8_t isPtr : 1;
@@ -40,6 +64,14 @@ public:
         : name(Name), args(Args) {}
     std::string name;
     //
+    // Default argument model: every GPR plus a memory pseudo-argument.
+    //
+    // This is deliberately the *union* of everything that could be an
+    // argument, not a guess at the real ABI. It is what an unknown function
+    // gets, so it is the widest set consistent with the Microsoft x64
+    // calling convention: RAX..R15 plus the stack shadow space. Narrowing this
+    // to a specific ABI is the job of AbiCallContract, which has the
+    // information this table does not.
     funcArgInfos args = {
         funcArgInfo(Register::RAX, I64, 0), funcArgInfo(Register::RCX, I64, 0),
         funcArgInfo(Register::RDX, I64, 0), funcArgInfo(Register::RBX, I64, 0),
@@ -64,6 +96,12 @@ public:
   };
 
 private:
+  // One entry in the signature table: a name, the bytes to search for, and the
+  // argument list to apply if it matches.
+  //
+  // `args` may be null with argCount 0, meaning "recognise this function but
+  // do not claim to know its signature". That distinction matters -- see
+  // buildFunctionInfo.
   struct SignatureSpec {
     const char*        name;
     const unsigned char* bytes;
@@ -72,6 +110,13 @@ private:
     size_t             argCount;
   };
 
+  // Aho-Corasick multi-pattern matcher over the raw image bytes.
+  //
+  // One pass, O(text length) independent of pattern count, and it reports
+  // overlapping matches. The alternatives both fail here: searching each
+  // pattern separately scales with pattern count, and hashing fixed-length
+  // windows would miss matches at unaligned offsets -- which is exactly where
+  // prologues sit.
   class AhoCorasick {
   public:
     template <size_t N>
@@ -123,6 +168,13 @@ private:
       return results;
     };
 
+    // Automaton state. `fail` is the longest proper suffix of this node's path
+    // that is also a prefix in the trie -- following it on a miss is what
+    // keeps the search linear instead of backtracking.
+    //
+    // `output` lists every pattern ending here, including ones that reached
+    // this node via a failure link. That inheritance is what makes shorter
+    // patterns contained within longer ones still get reported.
     struct Node {
       std::map<unsigned char, int> children;
       int fail = -1;
@@ -132,6 +184,13 @@ private:
     std::vector<Node> trie;
     std::vector<size_t> patternLengths;
 
+    // Build failure links breadth-first, propagating each node's output list
+    // down from its fail target.
+    //
+    // That propagation is what allows overlapping signatures to be reported
+    // without rescanning: a node inherits the patterns of its longest proper
+    // suffix, so a shorter signature nested inside a longer one fires from the
+    // same automaton state.
     void build() {
       std::queue<int> q;
       for (const auto& [c, next] : trie[0].children) {
@@ -163,6 +222,14 @@ private:
     };
   };
 
+  // Prologue bytes for a recognised function.
+  //
+  // These are the first N bytes of the prologue, chosen to be stable across
+  // builds: a push/sub-rsp/lea sequence for the iostream operator<<, and the
+  // register-save preamble for swprintf_s. Matching on prologue rather than on
+  // the exported name is deliberate -- at lift time the export table may not be
+  // present (the function may be internal), whereas the prologue bytes are
+  // always in the image.
   static inline constexpr std::array<unsigned char, 16> kOstreamBytes = {
       0x55, 0x48, 0x81, 0xEC, 0xA0, 0x00, 0x00, 0x00,
       0x48, 0x8D, 0xAC, 0x24, 0x80, 0x00, 0x00, 0x00};
@@ -171,6 +238,11 @@ private:
       0x4C, 0x8B, 0xDC, 0x4D, 0x89, 0x43, 0x18,
       0x4D, 0x89, 0x4B, 0x20, 0x48, 0x83, 0xEC, 0x38};
 
+  // swprintf_s takes four register arguments under the Microsoft x64
+  // convention. RCX (arg 0) and R8 (arg 2) are the wide-string buffer and its
+  // size and are therefore pointers; RDX (the format string, arg 1) and R9
+  // (the va_list, arg 3) are carried as plain i64 here because the variadic
+  // tail cannot be described positionally.
   static inline constexpr std::array<funcArgInfo, 4> kSwprintfArgs = {
       funcArgInfo(Register::RCX, I64, 1),
       funcArgInfo(Register::RDX, I64, 0),
@@ -185,6 +257,15 @@ private:
        kSwprintfArgs.data(), kSwprintfArgs.size()},
   }};
 
+  // Turn a matched spec into a functioninfo.
+  //
+  // preserveDefaultArgsWhenUnspecified is the interesting branch. A spec with
+  // no argument list is a weaker claim than one with: "this is ostream
+  // operator<<" is much weaker than "this is swprintf_s, here is its exact
+  // signature". A caller that has not yet established ABI context should ask
+  // for the defaults in the first case, because the default union-of-all-GPRs
+  // model is safer than a guessed specific list, whereas in the second case
+  // the spec's list is authoritative and the default would throw it away.
   static functioninfo buildFunctionInfo(
       const SignatureSpec& spec, bool preserveDefaultArgsWhenUnspecified = false) {
     if (spec.argCount == 0 && preserveDefaultArgsWhenUnspecified) {
