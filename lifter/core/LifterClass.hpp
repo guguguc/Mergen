@@ -75,6 +75,22 @@ enum class ControlFlow {
   Unflatten,
 };
 
+// The cache key: the two operands of the instruction being built.
+//
+// The union is the whole design. An instruction is keyed by two things that are
+// not the same kind of thing:
+//
+//   binary op / compare   operand1, operand2   -- both Values
+//   cast                  operand1, destType   -- a Value and a Type
+//
+// A struct with three fields would carry a null in whichever one is unused,
+// which is a wider key and, worse, invites comparing a Value against a Type.
+// The union makes that unrepresentable: there is exactly one second slot and
+// the caller has already decided what goes in it.
+//
+// That is safe because a given opcode never uses both forms. The opcode is the
+// *outer* cache dimension, so two keys in the same map always have the same
+// shape.
 struct InstructionKey {
   Value* operand1;
   union {
@@ -95,6 +111,13 @@ struct InstructionKey {
       return false;
     return operand2 == other.operand2;
   }
+  // DenseMap plumbing.
+  //
+  // Equality compares the union through operand2, which is the first member of
+  // the union and therefore always the one actually written for a binary op.
+  // A cast key is only ever compared against another cast key -- the opcode
+  // differs, so they are in different maps -- which is what makes reading
+  // operand2 unconditionally safe here.
   struct InstructionKeyInfo {
     // Custom hash function
     static inline unsigned getHashValue(const InstructionKey& key) {
@@ -107,7 +130,7 @@ struct InstructionKey {
       return lhs == rhs;
     }
 
-    // Define empty and tombstone keys �?MUST be distinct for DenseMap.
+    // Define empty and tombstone keys — MUST be distinct for DenseMap.
     static inline InstructionKey getEmptyKey() {
       return InstructionKey(
           reinterpret_cast<Value*>(static_cast<uintptr_t>(-1)),
@@ -162,6 +185,19 @@ private:
 
   // Heavy maps live behind a unique_ptr so backup move/steal is pointer-sized.
   // Lookup/insert/COW behavior is unchanged; empty (nullptr) == empty cache.
+  //
+  // Four parallel arrays, because the same 100 slots are indexed four different
+  // ways and keeping them together in one struct-of-arrays would cost an
+  // indirection on the hottest path (lookup) to save nothing:
+  //
+  //   opcodeCaches  the layer chain head; the authoritative recent writes
+  //   hot           a flat staging map for the current write-scope
+  //   index         a flattened prefix of the chain, consulted after the walk
+  //   indexAt       which layer `index` currently ends at -- the chain walk
+  //                 stops here so the two do not double-answer
+  //
+  // A nullptr in any of them means "nothing here yet", which is why every
+  // access is guarded rather than assumed.
   struct Impl {
     std::array<std::shared_ptr<Layer>, 100> opcodeCaches;
     std::array<CacheMap, 100> hot;
@@ -184,6 +220,11 @@ private:
     }
   }
 
+  // How many layers sit above the flattened index.
+  //
+  // Measured to `indexAt`, not to the root, because the layers below the index
+  // are already folded into it and cost nothing to re-scan. Only the delta can
+  // grow without bound, so only the delta decides when to flatten again.
   unsigned deltaDepth(uint8_t opcode) const {
     const Impl& s = *impl;
     unsigned depth = 0;
@@ -195,6 +236,18 @@ private:
     return depth;
   }
 
+  // Fold the delta chain into the flat index.
+  //
+  // The newest-wins ordering below is the load-bearing part. `newer` is
+  // collected head-first, so iterating it backwards visits oldest-first and
+  // lets each later merge overwrite the earlier one. Reversing that would make
+  // the *oldest* write shadow every subsequent one, which is silent: lookups
+  // still succeed, they just return a stale value from a path that has since
+  // been abandoned.
+  //
+  // The existing index is copied rather than mutated because it may be shared
+  // with another diverged path. Mutating it would leak this path's writes into
+  // that path -- exactly the failure the layering exists to prevent.
   void cowIndex(uint8_t opcode) {
     Impl& s = *impl;
     llvm::SmallVector<Layer*, 16> newer;
@@ -212,6 +265,18 @@ private:
     s.indexAt[opcode] = s.opcodeCaches[opcode];
   }
 
+  // Drain the staging maps into fresh layers.
+  //
+  // Called only from a const context, via const_cast in the copy ctor and copy
+  // assignment -- that is a deliberate, contained violation. The staging maps
+  // hold writes belonging to the *source* scope, and a copy must carry them
+  // across; making the copy constructor logically const is what allows it to be
+  // used from the const backup points, which hold the cache by const reference.
+  //
+  // The hazard the const_cast creates is real and is why it is confined here:
+  // a concurrent publish against the same object would be a data race. The
+  // lifter is single-threaded and backup points are taken sequentially, so it
+  // does not arise, but that is an invariant of the caller, not of this type.
   void publish() {
     if (!impl) {
       return;
@@ -228,10 +293,18 @@ private:
         s.index[op] = std::make_shared<CacheMap>(layer->map);
         s.indexAt[op] = layer;
       } else if (s.index[op].use_count() == 1) {
+        // use_count == 1 means nobody else holds the flattened index, so it can
+        // be merged into in place. If a diverged path still holds it, merging
+        // would be visible to that path -- so the copy branch above is taken
+        // instead and the shared map is left alone.
         mergeInto(*s.index[op], layer->map);
         s.indexAt[op] = layer;
       }
       s.opcodeCaches[op] = std::move(layer);
+      // Re-flatten only when the index is *shared*. If it is unshared the
+      // merge above kept it current in place, so its depth is not the thing
+      // bounding lookup cost -- the delta chain above it is. Flattening an
+      // unshared index would allocate a fresh map every 32 layers for no gain.
       if (s.index[op] && s.index[op].use_count() > 1 &&
           deltaDepth(static_cast<uint8_t>(op)) >= kCowDeltaLayers) {
         cowIndex(static_cast<uint8_t>(op));
@@ -242,6 +315,13 @@ private:
 public:
   InstructionCache() = default;
 
+  // The copy is shallow by design: it shares every layer with the source.
+  //
+  // That is what makes a backup cheap. Sharing is safe only because a Layer is
+  // never mutated after publish() hands it to a chain -- writes always go to a
+  // newly allocated `hot` map, which becomes a new layer at the next publish.
+  // The copy constructor's own `hot` maps start empty, so a copy cannot
+  // retroactively change what the source already committed.
   InstructionCache(const InstructionCache& other) {
     if (!other.impl) {
       return;
@@ -271,6 +351,9 @@ public:
     impl->index = other.impl->index;
     impl->indexAt = other.impl->indexAt;
     for (auto& h : impl->hot) {
+      // Clear rather than adopt. This object's own staging map belongs to
+      // whichever write-scope is active *here*; inheriting the source's would
+      // mean those entries later become a layer that answers for both.
       h.clear();
     }
     return *this;
@@ -278,6 +361,17 @@ public:
 
   InstructionCache& operator=(InstructionCache&& other) noexcept = default;
 
+  // Writes go to `hot`, never straight into a layer.
+  //
+  // Staging rather than direct insertion is what preserves path isolation: a
+  // layer, once published, is shared with every diverged path that copied the
+  // cache, and mutating one in place would retroactively change their answers.
+  // A layer is immutable once linked; `hot` is the only mutable map.
+  //
+  // The eager index write is an optimisation for the unshared case, not a
+  // correctness requirement: if the index is shared, the entry is still found
+  // when the layer is eventually published. Writing it now when it is safe to
+  // do so just avoids the delta walk for the common in-scope lookup.
   void insert(uint8_t opcode, const InstructionKey& key, Value* value) {
     Impl& s = ensure();
     s.hot[opcode][key] = value;
@@ -286,6 +380,19 @@ public:
     }
   }
 
+  // Lookup order is newest-first and is not arbitrary:
+  //
+  //   1. hot       writes from this scope, not yet published
+  //   2. layers    the delta chain, newest to oldest -- stop at indexAt,
+  //                because everything below is already folded into `index`
+  //   3. index     the flattened prefix
+  //
+  // Newest-first is required, not just faster. An abandoned path can leave
+  // entries in the chain that a later path must not see, and the only ordering
+  // that gets that right is the one matching the write order.
+  //
+  // Null means "not cached", which callers must distinguish from a cached null.
+  // The lifter never stores null, so a single null return is sufficient.
   Value* lookup(uint8_t opcode, const InstructionKey& key) const {
     if (!impl) {
       return nullptr;
@@ -315,6 +422,16 @@ public:
 };
 
 
+// Key for the VM cursor multiplexer: which condition, at which slot.
+//
+// Two fields rather than the condition alone because one branch can need more
+// than one dispatch slot -- a VM handler that selects between several targets
+// reuses the same branch across slots, and keying on the condition alone would
+// make the second slot return the first slot's mux.
+//
+// `cond` is the llvm::Instruction, not the BasicBlock, deliberately. Two
+// conditions can sit in the same block (an obfuscator merges unrelated
+// branches), so the block is not a sufficient discriminator.
 struct CursorMuxForkKey {
   llvm::Instruction* cond = nullptr;
   uint64_t slot = 0;
@@ -326,6 +443,11 @@ struct CursorMuxForkKey {
 
 template <>
 struct llvm::DenseMapInfo<CursorMuxForkKey> {
+  // The sentinels differ in the slot field as well as the condition. LLVM's
+  // DenseMap probes with these and needs them distinct, and reusing
+  // DenseMapInfo<Instruction*>'s sentinels unchanged would make the slot
+  // field read as an uninitialised value if either were ever produced by
+  // accident -- producing a key that looks real and is not.
   static inline CursorMuxForkKey getEmptyKey() {
     return {llvm::DenseMapInfo<llvm::Instruction*>::getEmptyKey(), 0};
   }
@@ -1997,7 +2119,7 @@ public:
         if (speculativeCall.active && speculativeCallBudget > 0) {
           speculativeCallBudget--;
           if (speculativeCallBudget == 0) {
-            // Budget exhausted �?abandon speculative inline.
+            // Budget exhausted — abandon speculative inline.
             if (!builder->GetInsertBlock()->getTerminator()) {
               builder->CreateUnreachable();
             }
