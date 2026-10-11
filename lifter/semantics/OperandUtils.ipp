@@ -475,6 +475,26 @@ case Instruction::Xor: {
   return nullptr;
 }
 
+// KnownBits for `value`, with the lifter's branch assumptions applied first.
+//
+// Three early-outs before LLVM's computeKnownBits, each for a distinct reason:
+//
+//   >64-bit / undef   computeKnownBits works, but the callers (paging checks,
+//                     possible-value enumeration) only reason about ≤64-bit
+//                     addresses. Returning all-unknown is the honest answer,
+//                     not a failure to analyse.
+//   assumptions hit   a branch assumption is a fact the IR does not contain:
+//                     on this path the condition IS that constant, even though
+//                     the instruction could produce either. Checking the map
+//                     first is what makes path-sensitive knowledge visible to
+//                     analyses that only read IR.
+//   i128              the XMM-width values the lifter threads through but never
+//                     interprets as addresses; analysing them would be cost
+//                     without a consumer.
+//
+// The final trunc matters: computeKnownBits runs at 64 bits, and without the
+// trunc a 32-bit value would carry 32 upper bits of "known" that are an
+// artefact of the analysis width rather than facts about the value.
 MERGEN_LIFTER_DEFINITION_TEMPLATES(KnownBits)::analyzeValueKnownBits(
     Value* value, Instruction* ctxI) {
   KnownBits knownBits(64);
@@ -509,6 +529,20 @@ inline bool isCast(uint8_t opcode) {
   return Instruction::Trunc <= opcode && opcode <= Instruction::AddrSpaceCast;
 };
 
+// Cached construction behind every folder: return the existing instruction
+// for this (opcode, operand pair), or build it.
+//
+// The cache lookup is by (opcode, InstructionKey), so two handlers computing
+// the same comparison share one instruction -- which is what keeps the IR
+// readable AND what lets the path solver see one test instead of two
+// textually identical ones. See InstructionCache in LifterClass.hpp for why
+// the cache is layered rather than flat.
+//
+// The select-distribution below (maybeSelectBinop gate) exists because
+// CreateBinOp alone skips Mergen's folder: distributing the binop over select
+// arms first is what lets constant folding and the select folder run on each
+// arm, which is what resolves VIP masks that would otherwise stay symbolic.
+// The isa pre-check keeps that machinery off the common non-select path.
 MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::getOrCreate(
     const InstructionKey& key, uint8_t opcode, const Twine& Name) {
   const bool perf = perfDiag.enabled;
@@ -799,6 +833,23 @@ static bool isCommutative(const unsigned Opcode) {
   }
 }
 
+// Build an instruction from an x86 opcode number, canonicalising first.
+//
+// The opcode number (rather than a decoded BinaryOp) is what lets the folder
+// consult the encoding: some x86 opcodes have several valid forms
+// (shift-by-one vs shift-by-cl are both shr) and only the encoding
+// distinguishes them.
+//
+// Canonicalisation (less-complex operand to the RHS, for commutative ops) is
+// what makes the cache hit: without it, `add(RAX, 0x10)` and `add(0x10, RAX)`
+// key differently and each builds its own instruction. Complexity-ordered
+// rather than type-ordered because the folder's pattern matches expect the
+// simpler operand on the right.
+//
+// recordFoldOrigin runs on every creation, not just folds, because a later
+// provenance walk (vipFromFoldChain) needs the pre-fold chain for exactly the
+// values that folded -- and at creation time it is not yet known which those
+// are.
 MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::createInstruction(
     unsigned opcode, Value* operand1, Value* operand2, Type* destType,
     const Twine& Name) {
@@ -1406,10 +1457,30 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::folderBinOpsImpl(
   return inst;
 }
 
+// The per-opcode folder family.
+//
+// Every function below except createGEPFolder is a one-line route into
+// folderBinOps with its opcode -- the per-opcode names exist so call sites read
+// as the operation they mean, and so the shift folders can carry their
+// constant-amount overloads, not to customise semantics. Documented once here
+// rather than per function because there is nothing per-function to say: the
+// folding, the select distribution, and the KnownBits early-out all live in
+// folderBinOps/folderBinOpsImpl above.
+//
+// createGEPFolder is the exception: it has its own GEPcache rather than going
+// through the instruction cache, because its key includes the element type and
+// the TEB flag, which InstructionKey cannot express.
 MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::createGEPFolder(Type* Type,
                                                             Value* Base,
                                                             Value* Address,
                                                             const Twine& Name) {
+  // TEB=true unconditionally, and this is the only insert/lookup site, so the
+  // TEB component of the key is currently constant. It neither splits nor
+  // merges anything today -- it is reserved key space for a TEB-vs-plain
+  // distinction no caller makes. Left as-is because dropping it from the key
+  // would silently merge the two cases the day a caller does distinguish them,
+  // and a redundant GEP from over-splitting costs less than a wrong fold from
+  // over-sharing.
   GEPinfo key = {Address, (uint8_t)(Type->getScalarSizeInBits()), 1};
   auto it = GEPcache.lookup(key);
   if (it) {
