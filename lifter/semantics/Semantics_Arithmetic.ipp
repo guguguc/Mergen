@@ -1,4 +1,27 @@
 // Semantics_Arithmetic.ipp — Arithmetic, shift, rotate, multiply, divide
+//
+// Two conventions hold throughout:
+//
+//   - The flags are computed from the *pre-modification* operands and written
+//     after the destination is set. Order matters: SetRegisterValue on the
+//     destination does not disturb the saved operand values, so the flags can
+//     reference Lvalue/Rvalue freely, but a handler that recomputed an operand
+//     after writing the destination would get a different answer.
+//
+//   - The carry-in flag is widened to the operand type before use
+//     (createZExtOrTruncFolder on getFlag(FLAG_CF)). The flags live as i1 in
+//     the CTX struct while the operands are full width, and adding a bare i1
+//     to an i64 is not something LLVM will do for us.
+//
+// Each handler writes the full architectural flag set. Omitting a flag
+// silently leaves whatever the previous instruction wrote, which is worse
+// than being wrong: it looks plausible and is undetectable.
+
+// SBB: subtract with borrow.
+//
+// Computed as two subtractions rather than one, because the borrow-in must
+// participate in the borrow-out computation. tmpResult is L-R without the
+// borrow; result is that minus the incoming CF.
 MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_sbb() {
   /*
   auto dest = operands[0];
@@ -17,7 +40,14 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_sbb() {
 
   SetIndexValue(0, result);
 
-  // 0, 0 (cf = 1), NEW CF = 1
+  // The outgoing CF is a borrow: either the subtraction of the operands
+  // borrowed on its own, or subtracting the borrow-in borrowed again.
+  //
+  // The second term compares tmpResult against cf rather than comparing
+  // against the full result, because the borrow-out of "result =
+  // tmpResult - cf" depends on tmpResult - cf going negative, which is
+  // exactly tmpResult < cf. Comparing result against something else here is
+  // the classic off-by-one-borrow bug.
   Value* newCF = createOrFolder(
       createICMPFolder(CmpInst::ICMP_ULT, Lvalue, Rvalue, "newCF"),
       createICMPFolder(CmpInst::ICMP_ULT, tmpResult, cf, "newCF2"));
@@ -72,6 +102,19 @@ IF (COUNT & COUNTMASK) = 1
         ELSE OF is undefined;
 FI;
 */
+// RCL: rotate through the carry, i.e. the value and CF together form one
+// (width+1)-bit ring.
+//
+// That ring is why the implementation doubles the width. The operand and the
+// flag cannot be rotated independently: the bit leaving the top must reappear
+// at the bottom together with what was in CF. Widening to 2*width makes the
+// operation an ordinary rotation on a value that already has the CF attached
+// in its spare bit.
+//
+// The double width needs to be 2*(width+1) in the general case for the shift
+// amounts to stay in range; the code uses 2*width, which is sufficient for
+// the shift amounts it actually forms because combinedValue occupies only
+// width+1 bits and the wrap shift is (width+1 - count).
 MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_rcl() {
   LLVMContext& context = builder->getContext();
   /*
@@ -86,7 +129,10 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_rcl() {
 
   auto carryFlag = getFlag(FLAG_CF);
   auto destsize = GetTypeSize(instruction.types[0]);
-  // Create count mask based on operand size
+  // Count mask, then modulo (width+1). Both steps are required and they are
+  // not redundant: the mask implements the ISA's COUNTMASK, the modulo is the
+  // MOD SIZE from the SDM pseudocode. Reducing only modulo (width+1) would
+  // mis-handle a raw count of exactly width+1, which must rotate by 0.
   auto countmask =
       ConstantInt::get(countValue->getType(), destsize == 64 ? 0x3f : 0x1f);
   auto actualCount = createAndFolder(countValue, countmask, "maskCount");
@@ -104,11 +150,15 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_rcl() {
   auto wideLvalue = createZExtFolder(Lvalue, wideType);
   auto wideCF = createZExtFolder(carryFlag, wideType);
 
-  // Position CF at bit position 0
+  // The ring, laid out least-significant-first: CF in bit 0, the operand above
+  // it. Shifting left by one makes bit 0 of the widened value the low bit of
+  // the operand, so the rotation below is a plain rotate over width+1 bits.
   auto combinedValue = createOrFolder(
       createShlFolder(wideLvalue, ConstantInt::get(wideType, 1)), wideCF);
 
-  // Perform rotation
+  // Standard left-rotate expressed as two shifts OR'd together. The wrap
+  // shift is (width+1 - count), which is why bitWidthplusone rather than
+  // destsize appears here -- the ring is one bit wider than the operand.
   auto leftShifted =
       createShlFolder(combinedValue, createZExtFolder(actualCount, wideType));
   auto rightShifted = createLShrFolder(
@@ -117,7 +167,8 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_rcl() {
                       createZExtFolder(actualCount, wideType)));
   auto rotated = createOrFolder(leftShifted, rightShifted);
 
-  // Extract result and new CF
+  // Split the ring back apart: everything above bit 0 is the new destination,
+  // bit 0 is the bit rotated out, i.e. the new CF.
   auto result = createTruncFolder(
       createLShrFolder(rotated, ConstantInt::get(wideType, 1)),
       Lvalue->getType());
@@ -1370,11 +1421,23 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_div() {
     printvalue(dividend);
     Value* ZExtdivisor = createZExtFolder(divisor, dividend->getType());
 
-    if (isa<ConstantInt>(ZExtdivisor) && isa<ConstantInt>(dividend)) {
+    // Both-constant fast path.
+      //
+      // APInt::udiv is called unconditionally even though division by zero is
+      // a fault architecturally. That is a real exposure, not a comment to
+      // "fix": the surrounding comment ("stop divide by 0") reads like an
+      // abandoned guard rather than a satisfied one. APInt's behaviour on a
+      // zero divisor is not obviously defined here, and a lifted sample that
+      // divides by a constant zero would take this branch.
+      //
+      // Left as-is because the correct behaviour depends on a policy decision
+      // the lifter has not made: either emit the fault (#DE), or fold to
+      // poison/undef, or keep symbolic so the fault surfaces later. Guessing
+      // here would change lifted IR for samples that currently work.
+      if (isa<ConstantInt>(ZExtdivisor) && isa<ConstantInt>(dividend)) {
 
       APInt divideCI = cast<ConstantInt>(ZExtdivisor)->getValue();
       APInt dividendCI = cast<ConstantInt>(dividend)->getValue();
-      // stop divide by 0
       APInt quotientCI = dividendCI.udiv(divideCI);
       APInt remainderCI = dividendCI.urem(divideCI);
 
@@ -1457,8 +1520,13 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_idiv() {
 
   dividend = createOrFolder(dividendHigh, dividendLow);
   printvalue(dividend);
+  // Sign-extend the divisor to the full double-width dividend. This is what
+  // makes a negative divisor behave correctly across the widened range.
   Value* divide = createSExtFolder(Rvalue, dividend->getType());
   Value *quotient, *remainder;
+  // Same unguarded-divisor exposure as lift_div, and the same reasoning about
+  // why it is left alone: the fix requires an architecture decision (emit #DE,
+  // fold to poison, or stay symbolic) that the lifter has not made.
   if (isa<ConstantInt>(divide) && isa<ConstantInt>(dividend)) {
 
     APInt divideCI = cast<ConstantInt>(divide)->getValue();
