@@ -2066,6 +2066,15 @@ public:
       out = std::move(unvisitedBlocks.back());
       unvisitedBlocks.pop_back();
 
+      // Re-home the entry before anything keys off it.
+      //
+      // This must happen before the visited-addresses insert below and before
+      // the addrToBB lookup by the path solver. Doing it later would mean two
+      // spellings of the same block -- one truncated, one widened -- and the
+      // solver would create a duplicate block for an address already lifted.
+      // Normalising once, here, at the single point every block enters the
+      // worklist, is what makes the rest of the lifter able to assume the
+      // address is in its final form.
       const uint64_t normalizedAddr =
           normalizeFileBackedRuntimeTargetAddress(out.block_address);
       if (normalizedAddr != out.block_address) {
@@ -2086,6 +2095,13 @@ public:
       const bool bypassesStackTracking =
           pendingLoopGeneralizationAddresses.contains(out.block_address) &&
           stackBypassGeneralizedLoopAddresses.contains(out.block_address);
+      // Both sets must be consulted, not either. pendingLoop... says this
+      // block was identified as a loop header needing generalization;
+      // stackBypass... says the *stack* state for it is being carried through
+      // the generalized path rather than the ordinary backup. A block with
+      // only the first still needs the generalized block handling, and
+      // restoring it through the ordinary path would lose loop-carried stack
+      // state -- producing a walk that silently diverges from the real one.
       bypassStackConcolicTracking = bypassesStackTracking;
       currentBlockRestoreMode = bypassesStackTracking
                                     ? BlockRestoreMode::GeneralizedLoop
@@ -2113,7 +2129,13 @@ public:
     return false;
   }
 
-  void writeFunctionToFile(const std::string filename) {
+  // Write the current module to a file.
+//
+// Called twice by emitLiftOutputs: once before run_opts and once after. The
+// error code is deliberately ignored -- a failed write costs a missing
+// diagnostic artifact, not a wrong lift, and failing the whole run over it
+// would make the lifter unusable when the output directory is read-only.
+void writeFunctionToFile(const std::string filename) {
 
     std::error_code EC_noopt;
     llvm::raw_fd_ostream OS_noopt(filename, EC_noopt);
@@ -2126,6 +2148,18 @@ public:
   // Memoization cache for computePossibleValues, cleared per solvePath call.
   llvm::DenseMap<llvm::Value*, std::set<llvm::APInt, APIntComparator>> pv_cache;
   llvm::DenseMap<uint64_t, ValueByteReference> buffer;
+  // The flag array is an array of LazyValue, and both choices are deliberate.
+  //
+  // LazyValue: a flag set by an instruction the lift never queries should cost
+  // nothing. Since flag computation is not always cheap -- parity involves a
+  // multiply-and-reduce bit hack -- eagerly evaluating every flag on every
+  // arithmetic instruction would dominate the lift on VM code where most flags
+  // are never read.
+  //
+  // Array rather than map: flag identities are dense small integers bounded by
+  // FLAGS_END, so a hash lookup would be pure overhead on the hottest
+  // non-memory path in the lifter. The commented-out flagbuffer below records
+  // an earlier map-based design keyed by Value*.
   using flagManager = std::array<LazyValue, FLAGS_END>;
   // llvm::DenseMap<Value*, flagManager> flagbuffer;
 
