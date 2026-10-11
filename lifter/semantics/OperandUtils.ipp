@@ -683,6 +683,20 @@ if (hit != SelectArm::None && sel != nullptr) {
   return newInstruction;
 }
 
+// Cost model used to order operands canonically.
+//
+// Four buckets, deliberately coarse. The point is not a precise score -- it is
+// to get the *shape* of a canonical form so that two textually different but
+// semantically identical expressions hash to the same instruction-cache key.
+//
+//   0  UndefValue       least work
+//   1  any constant
+//   2  single-op wrapper (cast, neg, not, fneg)
+//   3  everything else
+//
+// Keeping it this coarse matters. A finer score would differentiate two
+// operands that the cache cannot tell apart anyway, which would reduce hits
+// without improving anything.
 static unsigned getComplexity(const Value* V) {
 
   if (isa<ConstantInt>(V))
@@ -696,6 +710,14 @@ static unsigned getComplexity(const Value* V) {
   return 3;
 }
 
+// Whether the operands can be swapped without changing meaning.
+//
+// Only the genuinely commutative operations. This list is *not* derived from
+// LLVM's own commutativity facts and must not be widened casually: the
+// canonicalisation below is applied to emitted IR, and adding an operation
+// that only happens to be commutative under some operand combination (or whose
+// result the lifter models with extra side conditions, such as the flags)
+// would silently reorder something the flag model depends on.
 static bool isCommutative(const unsigned Opcode) {
   switch (Opcode) {
   case Instruction::Add:
@@ -714,8 +736,16 @@ static bool isCommutative(const unsigned Opcode) {
 MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::createInstruction(
     unsigned opcode, Value* operand1, Value* operand2, Type* destType,
     const Twine& Name) {
-  {
-    LiftPerfDiag::ScopedTimer complexityTimer(&perfDiag,
+  // Canonicalise operand order, then create.
+//
+// Ordering the less complex operand into the RHS is what makes the cache hit.
+// Without it, `add(RAX, 0x10)` and `add(0x10, RAX)` -- which lift to
+// identical IR -- would key differently and each build its own instruction.
+//
+// Timed separately from the creation below so the profile distinguishes
+// "spending all the time deciding how to build" from "spending it building".
+{
+  LiftPerfDiag::ScopedTimer complexityTimer(&perfDiag,
                                               &perfDiag.createComplexity);
     if (isCommutative(opcode)) {
       if (getComplexity(operand1) < getComplexity(operand2)) {
@@ -774,6 +804,16 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::createSelectFolder(
   return inst;
 }
 
+// Combine two known-bit sets through a binary operation.
+//
+// This is the engine behind "even though neither operand is constant, I know
+// something about the result" -- the thing that lets the lifter fold
+// `(x & 0xFF) | 0x100` style arithmetic without ever knowing x.
+//
+// Widths are normalised first because KnownBits requires equal widths and
+// LLVM's helpers are width-agnostic. The two steps are sequential rather than
+// a single max() because the second compares against the value the first may
+// have just changed.
 KnownBits computeKnownBitsFromOperation(KnownBits& vv1, KnownBits& vv2,
                                         Instruction::BinaryOps opcode) {
   if (vv1.getBitWidth() > vv2.getBitWidth()) {
@@ -782,9 +822,18 @@ KnownBits computeKnownBitsFromOperation(KnownBits& vv1, KnownBits& vv2,
   if (vv2.getBitWidth() > vv1.getBitWidth()) {
     vv1 = vv1.zext(vv2.getBitWidth());
   }
+  // A shift by more than the operand width yields zero.
+  //
+  // This has to be checked *before* delegating to LLVM's shl/lshr/ashr,
+  // because those are defined on an infinite-precision reading and will not
+  // report the all-zero result themselves. Note the comment already in the
+  // code: AShr by an over-wide amount yields all-sign-bits, not zero, so the
+  // Shl/LShr range deliberately stops short of it and the AShr case is left
+  // to LLVM's helper.
   if (opcode >= Instruction::Shl &&
       opcode <= Instruction::LShr) { // AShr might not make it 0, it also could
                                      // make it -1
+    // "shift amount >= bit width"
     auto ugt_result = KnownBits::ugt(
         vv2,
         KnownBits::makeConstant(APInt(vv1.getBitWidth(), vv1.getBitWidth())));
@@ -795,6 +844,15 @@ KnownBits computeKnownBitsFromOperation(KnownBits& vv1, KnownBits& vv2,
     }
   }
 
+  // ADD and SUB share LLVM's helper. The leading booleans are (isAdd,
+// hasNoUnsignedWrap, hasNoSignedWrap) on 18 and gain a carry parameter on 19.
+  //
+  // Both wrap flags are false on purpose: the lifter does not model wrapping as
+  // impossible, because wrapped values are legitimate results here. Claiming
+  // no-wrap would make the known bits unsound and cause bad folds.
+  //
+  // Both spellings are kept so the file compiles across the LLVM 18/19
+  // boundary; CI currently pins 18.1.8.
   switch (opcode) {
   case Instruction::Add: {
 #if LLVM_VERSION_MAJOR > 18
