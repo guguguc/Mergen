@@ -1802,14 +1802,31 @@ public:
         std::cout << "\n";
       }
       restore_backup_point(snapshot);
+
+      // Stored state wins over a fresh discovery.
+      //
+      // This is the single most important ordering in the function. A loop is
+      // entered many times; on the second and later entries the phis already
+      // exist and are keyed by header, so the loop's structure is fixed. If
+      // discovery ran again and happened to pick a different slot -- which it
+      // can, since the candidate set grows as more backedges are recorded -- the
+      // restore would publish slots the existing phis were not built from, and
+      // every control-field helper would read a slot no phi covers.
+      //
+      // So: look first, and only fall back to discovery when there is nothing
+      // stored. That also makes the first entry cheap and every later one free.
       auto storedStateIt = generalizedLoopControlFieldStates.find(bb);
       if (storedStateIt != generalizedLoopControlFieldStates.end() &&
           storedStateIt->second.valid) {
         activeGeneralizedLoopControlFieldState = storedStateIt->second;
+        // The entry source becomes the FIRST backedge, not the canonical source.
+        // The loop is now past its first iteration, so the edge that led back in
+        // is the one that explains the state being restored.
         activeGeneralizedLoopEntrySourceBlock =
             activeGeneralizedLoopControlFieldState.backedgeSources.empty()
                 ? nullptr
                 : activeGeneralizedLoopControlFieldState.backedgeSources.front();
+        // Local stack comes from the same first backedge, for the same reason.
         if (!activeGeneralizedLoopControlFieldState.backedgeBuffers.empty()) {
           activeGeneralizedLoopLocalBuffer = extractLocalStackBuffer(
               activeGeneralizedLoopControlFieldState.backedgeBuffers.front());
@@ -1817,6 +1834,10 @@ public:
           activeGeneralizedLoopLocalBuffer.clear();
         }
       } else {
+        // First entry (or a discovery that previously failed). The entry source
+        // is the canonical source -- backedges.front() is only a fallback for the
+        // case where no canonical source exists, which the branch below also
+        // checks.
         activeGeneralizedLoopEntrySourceBlock =
             backedges.empty() ? nullptr : backedges.front().sourceBlock;
         activeGeneralizedLoopLocalBuffer =
@@ -1875,11 +1896,28 @@ public:
         }
         std::cout << "\n";
       }
+      // Seed the local-stack qwords that every path agrees on, so the loop body
+      // reads constants for them rather than phis.
+      //
+      // This is the complement of the carried-slot discovery: that finds slots
+      // that VARY and gives them phis, this finds slots that do NOT vary and
+      // pins them. Seeding is what lets LLVM fold the stack traffic inside the
+      // loop, which is most of what makes a generalized loop readable.
       auto seedInvariantLocalQwords = [&](const backup_point& canonicalSnapshot,
                                           llvm::ArrayRef<backup_point> backedgeSnapshots) {
+        // Set, not just a dedupe check: the tracked buffer is byte-keyed, so a
+        // single qword appears as up to eight entries and without this it would
+        // be seeded eight times.
         std::set<uint64_t> seededQwordStarts;
         for (const auto& entry : activeGeneralizedLoopLocalBuffer) {
+          // Align down to the qword containing this byte, which is the unit the
+          // seed writes and the unit the retrieve helpers read.
           uint64_t qwordStart = entry.first & ~0x7ULL;
+          // The 0x100 exclusion band below STACKP_VALUE. This is NOT the same
+          // as isTrackedLocalStackAddress: the intent is to leave the deepest
+          // part of the frame alone, where return addresses and saved frames
+          // live. Seeding one of those to a constant would pin the loop's exit
+          // to a single address and make it unrollable.
           if (qwordStart > STACKP_VALUE - 0x100) {
             continue;
           }
@@ -1917,6 +1955,13 @@ public:
       seedInvariantLocalQwords(BBbackup[bb], backedges);
       return;
     }
+    // No backedges: treat it as an ordinary restore.
+    //
+    // make_generalized_loop_backup is called with an empty ArrayRef rather than
+    // being bypassed, so this path goes through the same buffer filtering and
+    // cache/assumption reset as the generalized path. Calling restore_backup_point
+    // directly with BBbackup[bb] would skip both and leave the restored state
+    // carrying a cache built under the previous path's assumptions.
     if (BBbackup.contains(bb)) {
       printvalue2("loading generalized backup");
       auto snapshot = make_generalized_loop_backup(
@@ -1927,6 +1972,17 @@ public:
 
 
 
+  // The active loop's state, falling back to any recorded one.
+  //
+  // The fallback is a guess: DenseMap iteration order is unspecified, so
+  // begin()->second is whichever header was inserted first in bucket order, not
+  // chronologically. It exists because a helper can legitimately be reached
+  // before any loop has been entered -- in which case the caller wants *a* loop's
+  // shape to reason about rather than nothing.
+  //
+  // Callers that care which loop they are in must use
+  // getGeneralizedLoopStateForHeader instead. The active state is preferred when
+  // valid, so within an entered loop this is exact.
   GeneralizedLoopControlFieldState* getMostRecentGeneralizedLoopState() {
     if (activeGeneralizedLoopControlFieldState.valid) {
       return &activeGeneralizedLoopControlFieldState;
@@ -1937,6 +1993,8 @@ public:
     return &generalizedLoopControlFieldStates.begin()->second;
   }
 
+  // The state for one specific header. This is the precise lookup; prefer it
+  // whenever the header is known.
   GeneralizedLoopControlFieldState* getGeneralizedLoopStateForHeader(
       llvm::BasicBlock* headerBlock) {
     if (!headerBlock) {
