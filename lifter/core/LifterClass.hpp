@@ -1859,9 +1859,24 @@ public:
               // VIP candidates are bytecode-range loads only. Handler RX /
               // table module addresses in the transfer DAG must not become
               // exact VIP (that fabricated confirm=1 on 0x403c48fc).
+              //
+              // The bytecode-range restriction is the load-bearing part. The
+              // transfer DAG mixes the bytecode read with ordinary reads of the
+              // handler's own code and of the dispatch table, and a VIP is by
+              // definition a *bytecode* offset. Admitting a module address makes
+              // the lifter jump to what it thinks is the next handler but is
+              // actually a code address -- and that shows up as a fabricated
+              // confirm flag rather than as an obvious failure, which is why
+              // the restriction was worth the range lookup on every load.
               if (isBytecodeAddress(gepOff)) {
                 fromLoad = gepOff;
               } else if (fromLoad == 0) {
+                // The sticky-slot fallback resolves a slot to the bytecode
+                // address it was last written with, for the case where the
+                // dispatch read has already been folded and no load remains to
+                // read. Guarded on fromLoad == 0 so a real load found earlier
+                // in the walk always wins: a direct observation should not be
+                // overridden by an inference.
                 auto stickyIt = stickyNonArgSlot.find(gepOff);
                 if (stickyIt != stickyNonArgSlot.end() &&
                     isBytecodeAddress(stickyIt->second)) {
@@ -1890,16 +1905,56 @@ public:
     // load appended to a handler, intel.cc:27836).
     return fromLoad;
   }
+  // The transfer target currently under analysis, set by the control-flow
+  // handlers and read by the VMP model. A field rather than a parameter because
+  // the answer is needed deep inside memory-model code that has no access to
+  // the handler's locals.
   llvm::Value* currentTransferValue = nullptr;
+
+  // Bytecode offset attributed to each folded load.
+  //
+  // Retained but NOT consulted by vipModuleOffset -- see the note at that
+  // function. LLVM uniques constants, so this map's entries overwrite each
+  // other across distinct bytecode reads and a lookup would fabricate a VIP.
+  // Left in place because it is still populated and is useful when reading a
+  // lift trace; its presence next to the function that must not use it is a
+  // standing trap for the next reader.
   llvm::DenseMap<llvm::Value*, uint64_t> loadProvenance;
   // Address of the most recent module-backed load that was lifted. VMProtect's
   // codegen appends the bytecode read as the final module load of a handler
   // (AddEndHandlerCommands, intel.cc:27836), so at a transfer this is the VIP.
   VmpModel<Register> vmp;
+
+  // Last-module-load bookkeeping, in service of that "final load" rule.
   std::set<uint64_t> lmlSeen;
   uint64_t lmlLast = 0;
+  // Bounded on purpose. An unbounded history would grow for the whole lift and
+  // make isRecentModuleFetch a linear scan over every module load ever seen --
+  // on the hot path, for every memory access.
   std::deque<uint64_t> recentModuleLoads;
+  // Slot address -> the bytecode address last stored there.
+  //
+  // "Non-arg" because argument-derived slots are excluded: a value that flows
+  // from an incoming register is not the dispatcher choosing a handler, and
+  // treating its store slot as sticky would pin it to one bytecode address
+  // across paths where the real value differs.
   std::unordered_map<uint64_t, uint64_t> stickyNonArgSlot;
+
+  // Normalise a lifted address to an RVA.
+  //
+  // Both lanes must be handled: addresses come from three places that disagree
+  // about the base -- the PE's own imageBase, the 0x140000000 form the PE
+  // reports, and the 0x40000000 form the lifter rebases to. Comparing raw
+  // addresses across lanes silently fails to match, which reads as "not a
+  // recent module fetch" rather than as a base mismatch.
+  //
+  // The 0xFF000000 mask rather than an equality test on 0x40000000 is what lets
+  // the whole 0x40xxxxxx..0x4Fxxxxxx range through; the rebased lane is not
+  // confined to one 16MB prefix.
+  //
+  // An address in neither lane is returned unchanged, on the assumption that it
+  // is already an RVA. That assumption is safe because every caller either
+  // compares RVAs to RVAs or range-checks the result.
   static uint64_t fetchRva(uint64_t addr) {
     if (addr >= 0x140000000ULL) {
       return addr - 0x140000000ULL;
@@ -1912,7 +1967,17 @@ public:
   // Memory policy ranges are registered at imageBase+RVA. Lifted GEP/load
   // addresses may still be in the rebased 0x40000000 lane; map those back
   // before consulting MemoryPolicy or isImmutableImageAddress.
+  //
+  // Distinct from fetchRva above, and the difference matters: this maps *to*
+  // the policy's absolute-address space, fetchRva maps to a base-relative one.
+  // Using the wrong one either misses the policy range entirely -- so an
+  // immutable-image check silently passes on an address it should have
+  // rejected -- or shifts the address into a neighbouring range.
   uint64_t memoryPolicyAddress(uint64_t addr) const {
+    // No image base means no policy ranges were registered, so there is nothing
+    // to translate to. Returning the input keeps the caller querying with an
+    // address that simply will not match, rather than with a fabricated one
+    // that might.
     if (file.imageBase == 0) {
       return addr;
     }
@@ -1924,20 +1989,41 @@ public:
     }
     return addr;
   }
+  // Was this address read as module-backed bytecode recently?
+  //
+  // Three sources, checked in order of directness: the VMP model's own VIP, the
+  // lifter's current-VIP offset, then the bounded recent-load history. The
+  // first two are exact; the third is a heuristic that lets a load just before
+  // the modelled transfer be recognised as part of the same dispatch read.
+  //
+  // The `addr == 0` rejection is not defensive padding. Offset 0 is the PE
+  // header, it is a perfectly mappable address, and the comparators below treat
+  // 0 as "no VIP recorded" -- so letting it through would make a header read
+  // match an empty VIP field.
   bool isRecentModuleFetch(uint64_t addr) {
     if (addr == 0) {
       return false;
     }
+    // Both categories accepted, not just bytecode. Handler code and dispatch
+    // table reads are part of the same transfer sequence, and rejecting them
+    // here would make a handler's own instruction load look like an unrelated
+    // access.
     if (!isBytecodeAddress(addr) && !isModuleAddress(addr)) {
       return false;
     }
     const uint64_t rva = fetchRva(addr);
+    // Compare in RVA space so an address recorded in one base lane still
+    // matches one recorded in the other. The raw `other == addr` shortcut comes
+    // first because it is exact and free.
     auto matches = [&](uint64_t other) {
       return other != 0 && (other == addr || fetchRva(other) == rva);
     };
     if (matches(vmp.vipOffset()) || matches(currentVipOffset)) {
       return true;
     }
+    // Linear scan, which is why recentModuleLoads is a bounded deque rather
+    // than an unordered set: the order matters only for the first match, and a
+    // set would lose the ordering that makes early exit meaningful.
     for (uint64_t recent : recentModuleLoads) {
       if (matches(recent)) {
         return true;
@@ -1945,6 +2031,17 @@ public:
     }
     return false;
   }
+  // Does this value derive from an incoming argument?
+  //
+  // Walks operands, not users, and stops at constants -- a constant's operands
+  // are meaningless to walk and a ConstantExpr can reach surprising places.
+  // Stopping there is also what keeps this cheap: the walk terminates at every
+  // literal, and obfuscated dispatch expressions are built from literals.
+  //
+  // The answer decides whether a store slot is "sticky". An argument-derived
+  // slot holds a value the caller supplied, so pinning it to a bytecode
+  // address across paths would freeze something that legitimately differs
+  // between invocations.
   bool isArgumentDerived(llvm::Value* v) {
     if (v == nullptr) {
       return false;
@@ -1952,6 +2049,10 @@ public:
     std::set<llvm::Value*> seen;
     std::vector<llvm::Value*> work{v};
     unsigned visited = 0;
+    // 4000, lower than the two walks above, because this one is called for every
+    // candidate store rather than only at transfers. Exhausting it answers
+    // "not argument-derived", which makes the slot sticky -- see above for why
+    // that direction is the mild one.
     while (!work.empty() && visited < 4000) {
       llvm::Value* x = work.back();
       work.pop_back();
@@ -1962,6 +2063,7 @@ public:
       if (llvm::isa<llvm::Argument>(x)) {
         return true;
       }
+      // Terminal: a literal has no provenance to trace.
       if (llvm::isa<llvm::Constant>(x)) {
         continue;
       }
@@ -1973,14 +2075,32 @@ public:
     }
     return false;
   }
+  // Can this address be a sticky dispatch predicate?
+  //
+  // The 0xFFF ceiling is the whole test. A sticky slot holds a value the
+  // dispatcher compares against -- a small integer constant -- so anything at
+  // or above the first page cannot be one. Rejecting on size first is a cheap
+  // filter that avoids two address-resolution calls for the overwhelming
+  // majority of candidates.
   bool isStickyPredicate(uint64_t v) {
     if (v > 0xFFFULL) {
       return false;
     }
+    // Must be neither code nor bytecode. Code is not a predicate, and bytecode
+    // is the thing the dispatcher is pointing *at* -- pinning it would freeze
+    // the cursor instead of the condition.
     return !isModuleAddress(v) && !isBytecodeAddress(v);
   }
+  // Record that a module-backed load happened, and let the VMP model see it.
+  //
+  // Order matters here: the VMP model is told first, so `prevCursor` is the
+  // cursor as it stood *before* this load, and the diagnostic below can say
+  // whether the load clobbered a live bytecode VIP.
   void noteModuleLoad(uint64_t addr) {
     const uint64_t prevCursor = vmp.vipOffset();
+    // Repetition is only interesting when it is not consecutive: the same
+    // address twice in a row is an ordinary re-read, the same address after a
+    // different one is a handler being re-entered.
     if (!lmlSeen.insert(addr).second && addr != lmlLast) {
       std::cout << "[lmlrep] addr=0x" << std::hex << addr << " cur=0x"
                 << lmlLast << std::dec << "\n"
@@ -1988,6 +2108,10 @@ public:
     }
     lmlLast = addr;
     vmp.onModuleLoad(addr);
+    // The 64-entry window is a heuristic, not a bound on correctness: it is
+    // sized to span one handler's worth of loads. A handler that reads more
+    // than 64 module locations before transferring is outside what this was
+    // tuned for.
     recentModuleLoads.push_back(addr);
     while (recentModuleLoads.size() > 64) {
       recentModuleLoads.pop_front();
@@ -2002,6 +2126,10 @@ public:
       const bool nowBc = isBytecodeAddress(now);
       const bool clobber = prevBc && !loadBc && now == addr;
       const bool skip = prevBc && !loadBc && now == prevCursor && now != addr;
+      // Three ways the cursor can be interesting, and the disjunction is the
+      // filter: any change, a skip, or a clobber. A cursor that did not move
+      // and involved no skipped or clobbering load is an ordinary redundant
+      // read and says nothing.
       if (now != prevCursor || skip || clobber) {
         std::cout << "[vipcur] insn=0x" << std::hex
                   << (current_address - instruction.length) << " load=0x" << addr
@@ -2014,6 +2142,18 @@ public:
       }
     }
   }
+  // Trace which of the three VIP sources actually won at a transfer.
+  //
+  // This exists because the three sources disagree in practice, and which one
+  // won is the single most useful fact when a lift stops resolving. "mod" means
+  // the VMP model's tracking was right; "chain" means the pre-fold SSA chain
+  // was; "cursor" means it fell back to the running cursor, which is the case
+  // that usually indicates the first two failed; "other" means the offset came
+  // from somewhere none of the three offered, which is itself a finding.
+  //
+  // transferVal is unnamed: it was used to print the IR of the target, and
+  // keeping it out of the line avoids dumping an expression on every transfer.
+  // The parameter is retained so the signature stays stable if that comes back.
   void logTransferVipPick(const char* kind, llvm::Value* /*transferVal*/,
                           uint64_t fromMod, uint64_t fromChain, uint64_t fromCur) {
     const char* env = std::getenv("MERGEN_DIAG_VIP");
@@ -2021,6 +2161,9 @@ public:
       return;
     }
     const bool verbose = env[0] == '2';
+    // The != 0 guards are required: 0 means "this source produced nothing",
+    // and without them a failed lookup would report as "mod" simply because
+    // currentVipOffset is also 0.
     const char* src = "none";
     if (fromMod != 0 && currentVipOffset == fromMod) {
       src = "mod";
@@ -2033,6 +2176,11 @@ public:
     }
     // =1: only suspicious picks (cursor fallback that is not bytecode).
     // =2: every transfer.
+    //
+    // "Suspicious" is narrowly defined: the cursor fallback produced a
+    // non-bytecode address. A cursor fallback that *did* land in bytecode is
+    // indistinguishable from a correct answer, so logging it would bury the
+    // cases worth seeing.
     const bool cursorBad =
         src[0] == 'c' && !isBytecodeAddress(currentVipOffset);
     if (!verbose && !cursorBad) {
