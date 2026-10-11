@@ -627,7 +627,12 @@ public:
 
   // Parse an FF 25 (jmp [rip+disp32]) import thunk at targetVA.
   // Returns the IAT slot VA on success, or 0 if not a thunk.
-  uint64_t parseImportThunk(uint64_t targetVA) {
+  // Read through file.readMemory rather than dereferencing a pointer into the
+    // file image. targetVA can be any address the lift reached, including one
+    // outside the mapped sections, so a raw pointer would be a read past the
+    // end of the buffer -- readMemory returns false instead, which is how the
+    // 0-on-failure contract below is maintained.
+    uint64_t parseImportThunk(uint64_t targetVA) {
     // Read opcode (2 bytes) and displacement (4 bytes) via readMemory
     // to avoid raw pointer access past section boundaries.
     uint64_t opcodeVal = 0;
@@ -643,7 +648,12 @@ public:
 
   // Detects `jmp [rip+disp32]` (FF 25) thunks that read from the IAT.
   // Returns true if targetVA is an import thunk pointing outside the PE.
-  bool isImportThunk(uint64_t targetVA) {
+  // "Pointing outside the PE" is the actual test, and it is what makes this
+    // safe: an FF 25 thunk whose IAT slot still holds a file-backed value is
+    // not an import thunk at all -- it is a jump into the image that merely
+    // looks like one, and inlining it is correct. Only a slot pointing
+    // unmapped means the target is outside what the lifter can lift.
+    bool isImportThunk(uint64_t targetVA) {
     uint64_t iatSlot = parseImportThunk(targetVA);
     if (iatSlot == 0) return false;
 
@@ -664,6 +674,14 @@ public:
   // write invalidates the binding.  Read by lift_call for register-indirect
   // calls so `mov rsi, [rip+iat]; call rsi` resolves to a named external
   // call instead of an opaque inttoptr.
+  // Cleared on *every* SetRegisterValue, not just the ones that write something
+  // else. That is conservative and deliberate: tracking which writes
+  // preserve the binding would require knowing every register-writing
+  // instruction, and a missed case would resolve a register-indirect call to
+  // the wrong import -- producing a named call to a function that is not
+  // being called. The cost is losing the binding when an unrelated
+  // instruction writes the same register, which merely falls back to an opaque
+  // inttoptr.
   std::unordered_map<Register, std::string> registerImportSource;
 
   // If targetVA is an import thunk, returns the import name.
@@ -699,7 +717,19 @@ public:
     size_t   worklistFloor  = 0;      // worklist size before inlining
     bool     bailedOut      = false;   // set when budget exhausted
   };
-  bool shouldInlineTinyOutlinedCall(uint64_t targetVA) {
+  // Override: retry inlining even for an address the outline policy rejected,
+    // provided it is tiny.
+    //
+    // The size test is deliberately crude -- it uses the *gap to the next
+    // outlined address* as a proxy for function size, because the inline
+    // policy set has no size information. 0x40 bytes covers the small leaf
+    // helpers (import thunks, jump stubs, tiny accessors) that are worth
+    // inlining despite being outlined.
+    //
+    // The next-iterator check is not optional: taking a span from the last
+    // outlined address would give a meaningless bound and let an unbounded
+    // function qualify as tiny.
+    bool shouldInlineTinyOutlinedCall(uint64_t targetVA) {
     if (!isMemPaged(targetVA) || !inlinePolicy.isOutline(targetVA)) {
       return false;
     }
@@ -716,6 +746,20 @@ public:
   }
 
   SpeculativeCallInfo speculativeCall;
+  // Budgets, and the distinction between "0" meanings.
+  //
+  //   speculativeCallBudget   instructions still allowed in the current
+  //                           speculative inline. 0 = no inline in progress.
+  //   maxCallInlineBudget     the limit speculativeCallBudget starts from.
+  //                           0 = the feature is off entirely -- a different
+  //                           meaning from a budget of zero, and conflating
+  //                           them would silently disable inlining.
+  //   maxBasicBlockBudget     blocks before LiftBlockBudgetExceeded.
+  //                           0 = disabled.
+  //
+  // 0-as-sentinel is consistent across all three, but it means none of them can
+  // express "allow nothing"; a caller wanting that gets the feature switched
+  // off, which is equivalent in effect but not in the perf counters.
   uint32_t speculativeCallBudget    = 0;   // instructions remaining (0 = inactive)
   uint32_t maxCallInlineBudget      = 0;   // 0 = disabled (no speculative limit)
   bool liftBudgetExceeded          = false;
@@ -724,6 +768,13 @@ public:
   // every createBudgetedBasicBlock made mix PathSolver ~O(n²) (~5s of
   // const_resolve). Keep this in sync with every BB we create on fnc.
   uint32_t basicBlockCount         = 0;
+  // The block every budget exhaustion and unrecoverable path routes to.
+  //
+  // Using one shared abort block rather than emitting a ret at each failure
+  // keeps the module well-formed without creating a distinct block per
+  // failure -- which on a badly-decompiling sample would be thousands of
+  // identical blocks. Every route here is also recorded as a diagnostic, so
+  // the block is a structural fallback, never a silent sink.
   llvm::BasicBlock* liftAbortBlock = nullptr;
   bool bypassStackConcolicTracking = false;
   BlockRestoreMode currentBlockRestoreMode = BlockRestoreMode::Normal;
@@ -741,9 +792,19 @@ public:
       lifter->currentPathSolveContext = next;
     }
   
+    // Restores on scope exit rather than at each solvePath call site. The
+    // context has to be correct for every path *out* of a solve, including
+    // early returns, and a manual restore would have to be repeated at each
+    // of them -- one missed restore and later path solving would attribute
+    // its diagnostics to the wrong call site.
     ~ScopedPathSolveContext() { lifter->currentPathSolveContext = previous; }
   };
 
+  // `size` is the window handed to the disassembler, not a request for that
+  // many bytes to be lifted. x86 is variable-length, so a 15-byte window is the
+  // architectural maximum instruction length and decoding succeeds on whatever
+  // the length ends up being. Passing less risks splitting an instruction and
+  // decoding garbage from its middle.
   void runDisassembler(const void* buffer, size_t size = 15) {
 
     instruction = dis.disassemble(buffer, size);
@@ -752,13 +813,23 @@ public:
   // handle the file here
   uint8_t* fileBase;
 
-  // lifts single instruction
+  // Lift one instruction.
+  //
+  // The three branch-state resets at the top are the load-bearing part. They
+  // describe the *previous* instruction, so they must not leak into the
+  // current one -- hadConditionalBranch in particular is read by the VMP
+  // transfer rules to decide whether a dispatch is fresh, and a stale true
+  // would make the model treat an ordinary instruction as a handler transfer.
   void liftBytes(const void* bytes, size_t size = 15) {
     // what about the basicblock?
     this->hadConditionalBranch = false;
     this->lastConditionalBranchResolved = false;
     this->lastBranchTaken = false;
     runDisassembler(bytes, size);
+    // Advance before the semantics run. This is why RIP-relative operands
+    // compute against current_address directly and why diagnostic sites are
+    // recorded as current_address - instruction.length: during the handler,
+    // current_address is the address of the *next* instruction, i.e. RIP.
     current_address += instruction.length;
     liftInstructionSemantics();
     this->counter++;
