@@ -1073,7 +1073,16 @@ public:
   // handle the file here
   uint8_t* fileBase;
 
-  // Lift one instruction.
+  // Lift one instruction from a caller-supplied byte buffer.
+  //
+  // This is the entry point for lifting bytes that are *not* at a file address
+  // -- instruction microtests, hand-assembled sequences, and the reconstructed
+  // handler bodies the VMP model feeds itself. It takes a raw pointer, so it
+  // cannot consult the PE for anything; the caller owns whatever those bytes
+  // mean.
+  //
+  // It also cannot advance current_address meaningfully, which is why the
+  // semantics below treat it as a one-instruction entry rather than a loop.
   //
   // The three branch-state resets at the top are the load-bearing part. They
   // describe the *previous* instruction, so they must not leak into the
@@ -1097,14 +1106,35 @@ public:
 
   x86_64FileReader file;
 
+  // Adopt a mapped PE image.
+  //
+  // Assigns file by value, which rebuilds the reader's section tables and page
+  // map from file_start. That is why this cannot be called twice on a reader
+  // that has already resolved addresses -- every cached offset would refer to
+  // the previous image. Reassigning rather than mutating in place is what makes
+  // that failure loud.
   void loadFile(uint8_t* file_start) {
     fileBase = file_start;
     file = x86_64FileReader(file_start);
   }
 
-  // also lifts single inst
+  // Lift one instruction at a runtime address in the mapped image.
+  //
+  // The primary lift entry, and the only one that can consult the PE. The
+  // `size` is how many bytes the disassembler may look at: x86 instructions
+  // reach 15 bytes, so anything less truncates the decode rather than
+  // shortening the instruction.
+  //
+  // The unmapped-target branch is a real exit, not an error path. A queued
+  // constant target can turn out not to be code at all -- a data pointer lifted
+  // as a branch, or a stale address from an abandoned path -- and the correct
+  // behaviour is to stop lifting with a diagnostic rather than to read past the
+  // end of a mapped section.
   void liftAddress(uint64_t addr, size_t size = 15) {
 
+    // Asserts the reader has an image. Called before any offset arithmetic so a
+    // missing loadFile surfaces here rather than as a null deref inside the
+    // reader.
     file.filebase_exists();
     this->hadConditionalBranch = false;
     this->lastConditionalBranchResolved = false;
@@ -1126,8 +1156,15 @@ public:
       }
       auto offset = file.address_to_mapped_address(addr);
       if (offset == 0) {
+        // Both flags, not just one: `run` ends this block, `finished` ends the
+        // whole lift. Setting only `run` would resume the worklist and lift
+        // whatever is next into a block whose control flow is already decided.
         this->run = 0;
         this->finished = 1;
+        // `unreachable` rather than a ret, because the block genuinely has no
+        // successor -- unlike sealIncompleteBlocks' case, where the block was
+        // merely never reached and the surrounding function should be left
+        // alone. Here the terminator is a real statement about the path.
         builder->CreateUnreachable();
         // Surface the bailout as a warning so callers can see that the
         // lift reached an unmapped address (typically the result of a
@@ -1252,6 +1289,11 @@ public:
             va == 0x1403D44FBULL || va == 0x403D44FBULL ||
             va == 0x140377013ULL || va == 0x40377013ULL;
         if (vipSite) {
+          // Truncating IR text at 140 chars is intentional: these sites sit on
+          // the hot path and an unfolded expression can run to thousands of
+          // characters, which would bury the constant fields this trace exists
+          // to show. A truncated expression is still recognisable; a wall of
+          // text is not.
           auto hexOrIr = [](llvm::Value* v) -> std::string {
             if (!v) {
               return "<null>";
@@ -1266,6 +1308,14 @@ public:
             v->print(os);
             return text.substr(0, 140);
           };
+          // Read through the file reader, not through IR, so this reports the
+          // bytes the image actually holds rather than what the lifter currently
+          // believes. That difference is the whole point -- a wrong belief shows
+          // up here as a mismatch.
+          //
+          // <nonconst> and <unreadable> are distinct markers because they mean
+          // opposite things: the first says the address is not known yet, the
+          // second says it is known but does not map.
           auto dumpMem = [&](const char* tag, llvm::Value* ptrV, unsigned nbytes) {
             auto* ci = llvm::dyn_cast_or_null<llvm::ConstantInt>(ptrV);
             if (!ci) {
@@ -1348,6 +1398,11 @@ public:
             va == 0x1401F0EFBULL || va == 0x1401F0F00ULL || va == 0x1401F0F05ULL ||
             va == 0x1403A5FF4ULL || va == 0x1403A6049ULL || va == 0x1402E17D5ULL;
         if (watch) {
+          // Printed, not resolved. The value of this trace is seeing how RSP is
+          // *expressed* -- whether it is still a tracked register value or has
+          // already been folded into an address expression -- because a wrong
+          // stack model shows up as an unexpected shape long before it shows up
+          // as wrong data.
           std::string rs;
           llvm::raw_string_ostream ros(rs);
           if (auto* sp = this->GetRegisterValue(Register::RSP)) {
@@ -1405,6 +1460,9 @@ public:
             this->current_address == 0x1400237EFULL ||
             this->current_address == 0x1400237F6ULL ||
             this->current_address == 0x1400237F9ULL) {
+          // Unlike the vipSite trace above, this one does not truncate: it is
+          // scoped to a narrow window and its whole purpose is to show operand
+          // shapes, which are exactly the part that gets cut off at 140 chars.
           auto valueText = [&](llvm::Value* value) {
             if (!value) return std::string("<null>");
             std::string text;
@@ -1412,6 +1470,11 @@ public:
             value->print(os);
             return text;
           };
+          // The normalised operand model is printed rather than the backend's
+          // raw form, deliberately. types[1] is the source and types[0] the
+          // destination, which is the opposite of the x86 encoding order -- and
+          // that inversion is a recurring source of "the handler is reading the
+          // wrong operand" confusion, so the trace states it explicitly.
           std::cout << " mnemonic="
                     << magic_enum::enum_name(this->instruction.mnemonic)
                     << " srcType="
@@ -1506,13 +1569,37 @@ public:
     static_cast<Derived*>(this)->record_generalized_loop_backedge_impl(bb);
   }
 
-  // useless in symbolic?
+  // Restore the narrow state snapshot for a block.
+  //
+  // "Narrow" is the point of the distinction with load_generalized_backup: this
+  // restores the fixed-width tracked state, which is right for ordinary
+  // straight-line re-entry but wrong for a loop whose state grows between
+  // iterations. Choosing this for a generalized loop yields state that is
+  // self-consistent and one iteration stale.
   void load_backup(BasicBlock* bb) {
     static_cast<Derived*>(this)->load_backup_impl(bb);
   }
   void load_generalized_backup(BasicBlock* bb) {
     static_cast<Derived*>(this)->load_generalized_backup_impl(bb);
   }
+  // The six retrieve_generalized_loop_* accessors below are one family, split by
+  // *what kind of loop variable* is being read rather than by convenience:
+  //
+  //   local_*            a value the loop body computed and carries forward.
+  //                     Fixed for the whole loop, so keyed by stack address.
+  //   control_slot_*     the dispatch slot the loop re-reads each iteration.
+  //                     The loop's control variable.
+  //   control_field_*    a field at an offset *inside* the control slot.
+  //   target_slot_*      the successor address for the current iteration.
+  //   phi_address_*      the loop variable, but read through an address that
+  //                     must be resolved first rather than a stack slot.
+  //
+  // The `_impl` suffix on all of them is the CRTP forwarding pattern used
+  // throughout this file, and exists so lifterClassBase stays independent of
+  // which concrete strategy is instantiated. Nothing here can be non-inline:
+  // these are called on the hottest path in generalized lifting, and the
+  // dispatch through Derived is what lets the compiler devirtualise at the
+  // call site.
   llvm::Value* retrieve_generalized_loop_local_value(uint64_t startAddress,
                                                      uint8_t byteCount) {
     return static_cast<Derived*>(this)->retrieve_generalized_loop_local_value_impl(
@@ -1547,9 +1634,23 @@ public:
     return static_cast<Derived*>(this)->retrieve_generalized_loop_phi_address_value_impl(
         loadOffset, byteCount, orgLoad);
   }
+  // Whether the block currently being entered carries generalized-loop state.
+  //
+  // A query rather than a parameter because the answer differs *within* one
+  // block: a loop header is entered generalized and its body is entered
+  // normally, and the body does not know which case it is in.
   bool currentBlockUsesGeneralizedLoopState() const {
     return currentBlockRestoreMode == BlockRestoreMode::GeneralizedLoop;
   }
+
+  // Whether the current solve is allowed to turn a backward branch into a
+  // structured loop.
+  //
+  // Restricted to conditional branches and direct jumps because those are the
+  // cases where the lifter can name both successors. An indirect jump's target
+  // is a computed value, and generalizing on it means guessing that the
+  // computation is stable across iterations -- which is exactly what a VM
+  // dispatcher is not.
   bool currentPathSolveAllowsStructuredLoopGeneralization() const {
     return currentPathSolveContext == PathSolveContext::ConditionalBranch ||
            currentPathSolveContext == PathSolveContext::DirectJump;
@@ -1572,6 +1673,17 @@ public:
     if (!target) {
       return nullptr;
     }
+    // Two stops, both required.
+    //
+    // `seen` breaks cycles. An expression DAG in LLVM is acyclic by
+    // construction, but a GEP chain through a phi can re-enter a value, and
+    // without this the walk does not terminate.
+    //
+    // The 20000 cap is a real limit, not a formality: obfuscated dispatch
+    // expressions can be enormous, and an unbounded backwards walk would hang
+    // the lifter on exactly the samples most worth lifting. Running out of
+    // budget yields the best load seen so far, which is usually still right
+    // because the walk is depth-first and reaches the load early.
     std::set<llvm::Value*> seen;
     std::vector<llvm::Value*> work{target};
     llvm::Value* best = nullptr;
@@ -1584,6 +1696,11 @@ public:
       }
       ++visited;
       if (auto* li = llvm::dyn_cast<llvm::LoadInst>(v)) {
+        // Last one wins, not first. The walk is depth-first over operands, so
+        // later visits are the *earlier* producers of the target expression --
+        // and the last load before the expression's base is the one the
+        // protector actually depends on. Taking the first would frequently
+        // return an unrelated load from the same expression.
         best = li;
       }
       if (auto* u = llvm::dyn_cast<llvm::User>(v)) {
@@ -1623,17 +1740,48 @@ public:
   // VMProtect keeps its VM stack on the native stack; in the flat memory model
   // that region overlaps the image's virtual range, so address_to_mapped_address
   // alone cannot separate a bytecode read from a VM-stack read.
+  //
+  // NOTE: the first two lines of this comment do not describe addBytecodeRange.
+  // They describe a bytecode-offset lookup over the SSA DAG -- which is what
+  // vipModuleOffset below implements. The text was left behind when that
+  // function moved or was removed. It is kept rather than relocated because
+  // which of the two it was written for cannot be determined from here, and
+  // the overlap caveat that follows genuinely belongs to the predicates below.
+  // Register a range of the bytecode region with the VMP model.
+  //
+  // Ranges rather than a single base/limit, because a protector can place the
+  // bytecode outside the PE image entirely and the region need not be
+  // contiguous.
   void addBytecodeRange(uint64_t start, uint64_t end) {
     vmp.addBytecodeRange(start, end);
   }
   bool isBytecodeAddress(uint64_t address) const {
     return vmp.isBytecodeAddress(address);
   }
+  // NOTE: the window here is a fixed 1MB, NOT the configured `stackReserve`.
+  //
+  // These two must not be confused. `stackReserve` is clamped to
+  // [0x1000, 0x100000] by configureDefaultMemoryPolicy and describes what the
+  // lifter will *allocate* and promote; kReserve here is a fixed generous
+  // bound used only to classify an address as stack-ish for the purposes of the
+  // bytecode/stack/module three-way split below.
+  //
+  // Deliberately larger than any real stack use: a false "stack" verdict makes
+  // isModuleAddress say no, which is the safe direction. The opposite
+  // misclassification -- calling a bytecode address a module address -- would
+  // send the lifter off to lift the protector's own data as code.
   bool isStackAddress(uint64_t address) {
     constexpr uint64_t kReserve = 0x100000;
     return address >= STACKP_VALUE - kReserve &&
            address <= STACKP_VALUE + kReserve;
   }
+  // The third of the three-way split, and defined negatively on purpose.
+  //
+  // "Mapped by the PE and not stack-ish" rather than "in a known section",
+  // because address_to_mapped_address is the same test the lift itself will
+  // apply. Defining the predicate differently from the consumer would let the
+  // two disagree -- isModuleAddress says yes, liftAddress then bails on an
+  // unmapped target, and the diagnostic blames the wrong thing.
   bool isModuleAddress(uint64_t address) {
     return !isStackAddress(address) &&
            file.address_to_mapped_address(address) != 0;
@@ -1644,6 +1792,18 @@ public:
   // carrier, which is frozen to keep the dispatch resolvable.
   bool feedsCondition(llvm::Value* v) {
     if (!v) return false;
+    // Walks *users*, the mirror image of findVipLoad's operand walk. Together
+    // the two directions answer the question the VMP model actually asks: is
+    // this value the dispatcher (whose data must be frozen so the dispatch
+    // stays resolvable) or the guard (which must stay symbolic so the loop
+    // condition survives as a real branch)?
+    //
+    // Budget of 6000 rather than findVipLoad's 20000 because the user direction
+    // fans out harder -- one value typically has many users -- and this runs on
+    // every candidate. Exhausting it returns false, which makes the value look
+    // like a pure carrier and therefore freezable. That is the wrong direction
+    // if the budget was simply too small, so the cap is set well above what a
+    // real dispatch expression needs rather than tuned down.
     std::set<llvm::Value*> seen;
     std::vector<llvm::Value*> work{v};
     unsigned visited = 0;
@@ -1654,9 +1814,15 @@ public:
       ++visited;
       for (auto* u : x->users()) {
         if (llvm::isa<llvm::CmpInst>(u)) return true;
+        // Only the *condition* operand of a select counts. A value that is the
+        // true/false arm is data flowing into a branch, not the test that
+        // chooses between them, and treating it as guard state would pin a
+        // result rather than a predicate.
         if (auto* sel = llvm::dyn_cast<llvm::SelectInst>(u)) {
           if (sel->getCondition() == x) return true;
         }
+        // Likewise an unconditional branch carries no predicate, so it is not
+        // a guard -- it is just control flow passing through.
         if (auto* br = llvm::dyn_cast<llvm::BranchInst>(u)) {
           if (br->isConditional()) return true;
         }
