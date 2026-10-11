@@ -1129,6 +1129,21 @@ public:
     return generalized;
   }
 
+  // Wholesale state restore.
+  //
+  // Every field is assigned, including cache and assumptions. Nothing is
+  // merged and nothing is preserved: this is the "go back to where we were"
+  // operation, and a partial restore would leave the current path's derived
+  // artefacts attached to a different architectural state.
+  //
+  // `counter` is restored too. It is not architectural state, but it feeds
+  // diagnostic labels and the instruction-stream trace, and letting it run
+  // backwards would make a trace ambiguous -- two instructions with the same
+  // counter at different points in the lift.
+  //
+  // Note this does NOT touch blockInfo, the worklist, or the current insert
+  // block. Those describe where the lift is, not what the machine state is, and
+  // the block-entry paths set them separately.
   void restore_backup_point(const backup_point& snapshot) {
     vec = snapshot.vec;
     vecflag = snapshot.vecflag;
@@ -1138,6 +1153,23 @@ public:
     this->counter = snapshot.ct;
   }
 
+  // Take a snapshot for `bb`.
+  //
+  // Three cases, and the choice between them is the whole function:
+  //
+  //   doMove              the caller is abandoning this path entirely; steal
+  //                       the state rather than copying it
+  //   generalized + copy  the snapshot goes into TWO containers, so it has to
+  //                       be a real copy
+  //   plain               ordinary copy into BBbackup
+  //
+  // `generalized` therefore disables the move even when moveState is set. See
+  // the note below -- that guard is correctness, not performance.
+  //
+  // sourceBlock is always the builder's current insert block, never the block
+  // being backed up. Those are different things: the snapshot records where the
+  // lift was when the backup was taken, which is what the restore path needs in
+  // order to know which block a backedge came from.
   void branch_backup_impl(BasicBlock* bb, bool generalized,
                           bool moveState = false) {
     printvalue2("backing up");
@@ -1189,12 +1221,21 @@ public:
                           this->assumptions, this->counter,
                           this->builder->GetInsertBlock());
     if (generalized) {
+      // First-writer-wins for the plain entry. A second backup of the same
+      // block must NOT overwrite it: the canonical entry is the non-backedge
+      // arrival that every phi takes as its first incoming value, and a later
+      // overwrite would silently substitute a backedge's state for it.
       if (!BBbackup.contains(bb)) {
         BBbackup[bb] = snapshot;
       }
       // Append per-source; a repeat call from the same sourceBlock replaces
       // that block's entry in place, preserving uniqueness without growing
       // the vector unboundedly on iterative lift passes.
+      //
+      // Replace-in-place rather than push-and-dedupe-later: on an iterative
+      // lift the same backedge block is re-backed-up on every pass, so the
+      // vector would grow without bound and the phi would gain duplicate
+      // incoming edges that all carry the same block.
       auto& backedges = generalizedLoopBackedgeBackup[bb];
       for (auto& existing : backedges) {
         if (existing.sourceBlock == snapshot.sourceBlock) {
