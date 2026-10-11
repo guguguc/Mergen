@@ -103,6 +103,17 @@ public:
     this->modelProcessEnvironment();
   }
 
+  // Map a Register enum onto a slot in `vec`.
+  //
+  // Written as explicit cases rather than a cast because the three register
+  // families are not contiguous in Register: RAX..R15 are contiguous but RIP
+  // and RFLAGS are special (each also spelled EIP/EFLAGS), and XMM0..XMM15 are
+  // contiguous but start much later. A single subtraction would be wrong for two
+  // of the three families.
+  //
+  // EIP/EFLAGS folding onto RIP/RFLAGS is deliberate and is what makes partial
+  // writes work: `mov eax, ...` and `mov rax, ...` address the same slot, so the
+  // 32-bit write and the 64-bit value cannot drift apart.
   int getRegisterIndex(Register key) const {
 
     switch (key) {
@@ -128,6 +139,14 @@ public:
       // the concrete execution never takes is worse than degrading; the
       // instruction is reported unsupported (Semantics.ipp) and its semantics
       // are not relied upon.
+      //
+      // RAX_ is the landing slot: a real register, so the read returns a valid
+      // Value rather than dereferencing out of bounds, and every unmodelled
+      // register shares it so the damage is confined to one aliased slot
+      // instead of corrupting an arbitrary one. The aliasing is a genuine
+      // mis-model, accepted because the alternative -- an out-of-range index
+      // into `vec` -- is undefined behaviour. This is the one place where the
+      // degradation is visible in the IR: an x87 operand appears to read RAX.
       return RAX_;
     }
     }
@@ -155,17 +174,48 @@ public:
       vec[index] = val;
     }
   }
+  // Read a flag.
+  //
+  // An unset flag reads as a concrete false, not null. This matters more than
+  // it looks: the path solver asks for flags constantly, and a null return would
+  // send it down a "unknown" path for every flag the code never wrote. Fabricating
+  // false makes those reads concrete, which is the same choice an uninitialised
+  // flag gets from real hardware -- x86 guarantees the reserved bits are 1, but
+  // the arithmetic flags after a `xor eax, eax` really are false, and by far
+  // the most common way a flag is "unset" here is that the preceding instruction
+  // zeroed it.
   llvm::Value* get_flag_impl(Flag key) {
     auto val = vecflag[static_cast<uint8_t>(key)];
     if (val)
       return val;
     return ConstantInt::getSigned(Type::getInt1Ty(this->context), 0);
   }
+  // Write a flag, narrowing to i1 first.
+  //
+  // The trunc is unconditional on width rather than type-checked. A caller
+  // passing a non-integer (a float comparison result, say) would hit an
+  // assertion inside LLVM rather than a clean diagnostic here; in practice every
+  // flag writer passes a comparison or an arithmetic result, which are integers.
   void set_flag_impl(Flag key, llvm::Value* val) {
     if (val->getType()->getIntegerBitWidth() > 1)
       val = this->builder->CreateTrunc(val, this->builder->getIntNTy(1));
     vecflag[static_cast<uint8_t>(key)] = val;
   }
+  // Bulk flag restore.
+  //
+  // WARNING: this writes `vec[...],` not `vecflag[...]`. The index is a Flag,
+  // so it stores flag values into the *register* array at register-sized slots.
+  // The two are different arrays with different lengths (vec is REGISTER_COUNT,
+  // vecflag is FLAGS_END), so this is also an out-of-range store for any Flag
+  // index at or beyond REGISTER_COUNT.
+  //
+  // Currently unreachable: RegisterManagerBase::init_flag is the only caller and
+  // nothing in lifter/ calls it, so no snapshot round-trips through here today.
+  // Flagged rather than fixed because fixing it is a behaviour change outside a
+  // comment-only pass -- but the moment someone wires init_flag up, flag restore
+  // becomes either a no-op or a corruption of the register file, depending on
+  // which array the snapshot was taken from. Fixing the index alone is not
+  // sufficient; the caller has to be checked too.
   void
   init_flag_impl(std::array<std::pair<Flag, llvm::Value*>, FLAGS_END> values) {
     for (auto& [reg, val] : values) {
@@ -173,7 +223,25 @@ public:
     }
   }
 
+  // The _impl family below is the CRTP forwarding surface: RegisterManagerBase
+  // calls these, and each is a one-line pass-through. They are separate
+  // functions rather than aliases because lifterSymbolic has to be able to
+  // override exactly one of them -- SetRegisterValue_impl is where the import
+  // provenance gets invalidated -- without reimplementing the rest.
   llvm::Value* GetRegisterValue_impl(Register key) { return get_impl(key); }
+  // NOTE: registerImportSource is NOT cleared here.
+  //
+  // LifterClass.hpp documents that member as "cleared on every
+  // SetRegisterValue". The clearing actually happens one layer down, in
+  // SetRegisterValue_internal (OperandUtils.ipp), which erases the binding after
+  // the write. So the documented invariant holds -- but only because every
+  // caller goes through that function, not because this one does it.
+  //
+  // Worth knowing when reading either file: adding a write path that bypasses
+  // SetRegisterValue_internal silently drops the invalidation, and the failure
+  // mode is a register-indirect call resolving to an import that is no longer
+  // the one being called -- a named call to the wrong function, which verifies
+  // and runs.
   void SetRegisterValue_impl(Register key, llvm::Value* val) {
 
     set_impl(key, val);
@@ -183,8 +251,20 @@ public:
 
   void SetFlagValue_impl(Flag key, llvm::Value* v) { set_flag_impl(key, v); }
 
+  // The block a generalized loop was entered from, or null outside one.
+  //
+  // Set by the generalization machinery and read by the restore paths to tell
+  // "re-entering the loop" from "entering for the first time". A raw pointer
+  // rather than an address because the source block may have been replaced --
+  // see replaceWithGeneralizedLoopBlock -- and an address-keyed lookup would
+  // then miss the block it is supposed to refer to.
   llvm::BasicBlock* activeGeneralizedLoopEntrySourceBlock = nullptr;
 
+  // Unflatten unconditionally.
+  //
+  // Not configurable on this class. lifterConcolic exists to explore multiple
+  // paths, and Basic mode cannot express that; a mode switch here would only
+  // produce a lift that cannot resolve its own branches.
   constexpr ControlFlow getControlFlow_impl() { return ControlFlow::Unflatten; }
 
   // A snapshot of everything needed to resume a block later under possibly
