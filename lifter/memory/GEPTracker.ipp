@@ -1908,11 +1908,20 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::solveLoad(LazyValue load,
       }
       std::cout << "\n";
     }
+    // Non-constant offset: the generalized helpers that take an address
+    // expression get first refusal, in field-then-phi order. The field helper
+    // is the narrower match (control slot + known offset), so it runs first;
+    // the phi helper is the general one. Reversing them would let the general
+    // match shadow the exact one on addresses both accept.
     if (auto* generalizedControlFieldValue =
             retrieve_generalized_loop_control_field_value(loadOffset, cloadsize,
                                                           load)) {
       return generalizedControlFieldValue;
     }
+    // Local duplicate of stripIntegerCastsForGeneralizedLoad. Kept inline
+    // rather than calling it because this lambda also strips through the
+    // binop operands below (lhs/rhs are stripped individually), and sharing
+    // the helper would hide that the strip applies at two levels here.
     auto stripIntegerCasts = [](Value* candidate) -> Value* {
       while (auto* castInst = dyn_cast<CastInst>(candidate)) {
         auto* srcTy = castInst->getOperand(0)->getType();
@@ -1950,6 +1959,10 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::solveLoad(LazyValue load,
         }
       }
       auto* phi = dyn_cast<PHINode>(phiCandidate);
+      // The phi must live in the block being lifted. A phi from another block
+      // names addresses valid on ITS incoming edges, not on this block's --
+      // resolving them here would read slots for paths that never reach this
+      // load.
       if (!phi || phi->getParent() != builder->GetInsertBlock()) {
         return nullptr;
       }
@@ -1994,6 +2007,11 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::solveLoad(LazyValue load,
       }
       return phiLoad;
     };
+    // The loop-aware phi resolver runs BEFORE the generic one. The generic
+    // lambda below resolves every incoming edge through the live tracked
+    // buffer; inside a generalized loop that buffer holds the entry state, so
+    // the generic path would answer with pre-loop values. The loop-aware
+    // helper resolves per-edge against each edge's own snapshot instead.
     if (auto* generalizedLocalPhiLoad =
             retrieve_generalized_loop_local_phi_address_value(loadOffset, cloadsize,
                                                               load)) {
@@ -2054,6 +2072,15 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::solveLoad(LazyValue load,
       return matchSubEqZero(lhs, rhs) || matchSubEqZero(rhs, lhs);
     };
 
+    // Match `index < bound` in either operand order, normalising to
+    // `index ON-LEFT` via getSwappedPredicate.
+    //
+    // The swap is predicate-aware, not a re-read: `5 > idx` means `idx < 5`,
+    // and getSwappedPredicate is what makes that transform exact rather than
+    // approximate. Without it the matcher would only fire when the index is
+    // already on the left, missing every comparison the folder happened to
+    // emit the other way round -- which is half of them, since folder operand
+    // order follows lift order rather than source order.
     auto matchIndexUpperBound =
         [&](auto&& self, Value* condValue, Value* expectedIndex,
             uint64_t& upperInclusiveOut) -> bool {
@@ -2126,6 +2153,12 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::solveLoad(LazyValue load,
       const bool hasRightEqual =
           matchIndexEqualsConst(binOp->getOperand(1), expectedIndex, rightEqual);
 
+      // Combine `idx <= upper` with `idx == value` into one bound, but ONLY
+      // when the two are adjacent or identical. `idx <= 5 || idx == 7` is not
+      // a single interval -- it excludes 6 -- and treating it as `idx <= 7`
+      // would admit an index the guard actually rejects. The adjacency test
+      // is what keeps the combination exact rather than an over-approximation
+      // that silently widens the jump-table range.
       auto combineUpperAndEqual = [&](uint64_t upper, uint64_t equalValue) -> bool {
         if (equalValue == upper || equalValue == upper + 1) {
           upperInclusiveOut = std::max(upper, equalValue);
