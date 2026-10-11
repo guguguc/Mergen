@@ -1,7 +1,55 @@
 // Semantics_Misc.ipp — BMI, SIMD basics, test/cmp, setcc, bit scan, system instructions
+//
+// Everything here is an "awkward instruction" that does not fit the
+// arithmetic/bitwise/control-flow split the other semantics files use. What
+// they have in common is that each needs the architecture's *edge-case*
+// behaviour handled explicitly rather than left to LLVM:
+//
+//   BMI1/2  BEXTR, PEXT, PDEP, BLSR, BLSI, BSR, LZCNT, TZCNT -- out-of-range
+//           shift amounts and zero-operand cases are defined behaviour, not
+//           undefined, so a plain llvm shift would be wrong
+//   SIMD    MOVDQA/MOVQ/MOVS_X -- 128/64-bit moves whose register and memory
+//           forms classify differently in Iced and Zydis (see ARCHITECTURE.md,
+//           "Operand-type quirks")
+//   TEST/CMP  flag-only instructions that write no destination
+//   SETcc    SETcc itself is flag-free; the flag predicate has to be computed
+//           here from scratch rather than read
+//   system  RDTSC, CPUID, XGETBV -- observable machine state the lifter must
+//           synthesise rather than read
+//
+// The recurring shape is a guard select: compute the "fast" form, then select
+// between it and a defined-but-degenerate result on an edge condition. Those
+// selects are what keep the lifter's output faithful rather than merely
+// non-crashing -- LLVM's own semantics for these instructions assume values
+// the emulated machine does not guarantee.
+//
+// Note setFlag is called with an already-computed Value here rather than a
+// lambda, unlike Semantics_Bitwise.ipp. Both are supported; these
+// instructions compute their flags unconditionally anyway.
+
 #ifdef _WIN32
 #include <intrin.h>
 #endif
+// BEXTR: extract the `len` bits of `source` starting at bit `start`.
+//
+// BMI1 packs two 8-bit fields into the second operand -- start in the low
+// byte, length in the next -- which is why both are masked with 0xFF.
+//
+// Three separate guards, each for a different architecture rule:
+//
+//   start out of range  -> result 0 (an out-of-range start cannot extract
+//                          anything; this is defined behaviour, not a fault)
+//   len == 0            -> result 0 *and* mask 0. Handled separately from
+//                          len > width because a shift of all-ones by the
+//                          full width would otherwise produce a non-zero
+//                          mask, and the select keeps the two cases from
+//                          interfering.
+//   len > width         -> clamp to width
+//
+// safeLen forces a minimum of 1 so the mask shift is well-defined; the
+// lenIsZero selects immediately afterwards undo it for the actual zero case.
+// That pairing is deliberate -- without it the mask computation would have to
+// special-case zero itself.
 MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_bextr() {
   auto info = GetIndexValue(2);
   auto source = GetIndexValue(1);
@@ -529,6 +577,21 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_rdtsc() {
   SetRegisterValue(Register::EDX,
                    ConstantInt::get(i32, static_cast<uint32_t>(tsc >> 32)));
 }
+// CPUID: synthesise the leaf the protected code is likely to query.
+//
+// This is host execution, not emulation. `regs` is seeded with a plausible
+// leaf-1 answer and then overwritten by the real __cpuidex when the leaf is a
+// constant and the build is Windows. Two consequences worth stating:
+//
+//   - The seeded values are a *default*, not a model. If a sample branches on
+//     a CPU feature bit, it branches on whatever the analysis host reported,
+//     which is not the machine the sample was built for.
+//   - Off Windows the host query is skipped entirely and the seed stands, so
+//     cross-platform lifts can differ.
+//
+// The reason to do this at all rather than returning zeros: VM and
+// anti-analysis code frequently gates on CPUID results, and a zeroed CPUID
+// makes those paths look dead when they are not.
 MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_cpuid() {
   LLVMContext& context = builder->getContext();
   auto* i32 = Type::getInt32Ty(context);
@@ -578,6 +641,15 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_xgetbv() {
   SetRegisterValue(Register::EDX, edxValue);
 }
 
+// Scalar reference implementation of PEXT, used to fold the both-constant case.
+//
+// Bit-at-a-time and O(64): fine for the constant path it serves, and being
+// obviously correct matters more than speed here. The masking trick is that
+// `bit_position` counts only *masked* bits, so each surviving source bit lands
+// at the next dense output position -- that is the whole definition of PEXT.
+//
+// This is the fallback, not the main path. The symbolic case below is emitted
+// as IR; this only runs when both operands already folded to constants.
 uint64_t alternative_pext(uint64_t source, uint64_t mask) {
   uint64_t result = 0;
   int bit_position = 0;
@@ -600,6 +672,10 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_pext() {
 
   const auto src1v = GetIndexValue(1);
   const auto src2v = GetIndexValue(2);
+  // Both-constant fast path: the scalar reference above is correct and far
+  // cheaper than emitting the peel loop into the IR. Falling back to an
+  // emitted loop here would produce a 64-iteration chain in output.ll for
+  // something that was already known.
   if (isa<ConstantInt>(src1v) && isa<ConstantInt>(src2v)) {
     const auto src1_c = cast<ConstantInt>(src1v);
     const auto src2_c = cast<ConstantInt>(src2v);
@@ -625,6 +701,23 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_pext() {
     // UNREACHABLE("lazy mf");
   }
 }
+// The SETcc family: roughly forty near-identical handlers, one per
+// condition code.
+//
+// SETcc does not read the flags directly -- it tests them -- and it writes no
+// flags itself. That is why each handler is so short: it reads one or two
+// flags, combines them, and zero-extends the i1 result to i8.
+//
+// The i8 destination is not an LLVM convenience. The architectural
+// destination is an 8-bit register whose upper bits are *preserved*, not
+// zeroed, so writing the full register with an i8 value would clobber the
+// upper half. SetIndexValue is what makes that correct; it routes the write
+// through the register's partial-width handling.
+//
+// Each condition code is spelled out rather than computed from a table. A
+// table would be shorter, but SETcc's forty variants differ in exactly the
+// details that are easy to get wrong (which pair of flags, which sense, which
+// comparison), and a table would hide those behind indexing.
 MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_setnz() {
   LLVMContext& context = builder->getContext();
 
@@ -661,6 +754,10 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_setno() {
 
   SetIndexValue(0, result);
 }
+// SETnb is "not below", i.e. CF == 0, i.e. the unsigned "above or equal"
+// condition. Note it reads CF and compares it to zero rather than inverting
+// the flag value -- equivalent, but comparing against 0 keeps the emitted
+// IR in the same shape as the multi-flag handlers below.
 MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_setnb() {
   LLVMContext& context = builder->getContext();
 
@@ -1032,6 +1129,13 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_btr() {
   printvalue(baseVal);
   printvalue(mask);
 }
+// LZCNT: count leading zeros, and -- unlike BSR's zero case -- it is
+// well-defined at zero, returning the full operand width.
+//
+// That difference is the entire reason this is not the same handler as BSR.
+// The is_zero_undef flag passed to @llvm.ctlz is therefore FALSE: LLVM may
+// assume the operand is nonzero for folding, but the architecture promises a
+// defined answer at zero, so ctlz(0) = width must survive.
 MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_lzcnt() {
   Value* source = GetIndexValue(1);
   auto zero = ConstantInt::get(source->getType(), 0);
@@ -1040,6 +1144,8 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_lzcnt() {
       builder->GetInsertBlock()->getModule(), Intrinsic::ctlz, source->getType());
   auto isZeroUndef = ConstantInt::getFalse(builder->getContext());
   Value* lzcntValue;
+  // Constant source folds to APInt::countl_zero directly; emitting the
+  // intrinsic call for a known value would leave an opaque call in output.ll.
   if (auto* CI = dyn_cast<ConstantInt>(source)) {
     unsigned lz = CI->getValue().countl_zero();
     lzcntValue = ConstantInt::get(source->getType(), lz);
@@ -1049,6 +1155,10 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_lzcnt() {
 
   SetIndexValue(0, lzcntValue);
 
+  // CF distinguishes input zero from output zero; ZF is set only when the
+  // result is zero, which -- since a zero input gives a nonzero count -- means
+  // exactly "input was nonzero". Reading CF rather than reusing isInputZero
+  // keeps the two flags stated in the architectural terms.
   auto isInputZero = createICMPFolder(CmpInst::ICMP_EQ, source, zero);
   auto isOutputZero = createICMPFolder(CmpInst::ICMP_EQ, lzcntValue, zero);
   setFlag(FLAG_CF, isInputZero);
@@ -1068,6 +1178,9 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::lift_bsr() {
 
   Value* bsrResult;
   if (auto* CI = dyn_cast<ConstantInt>(Rvalue)) {
+    // A zero source has no defined answer, so UndefValue rather than 0. Zero
+    // would be a stronger claim than the architecture supports and would
+    // make downstream code treat "BSR of zero" as a real index.
     if (CI->isZero()) {
       bsrResult = UndefValue::get(Rvalue->getType());
     } else {
