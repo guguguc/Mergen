@@ -1250,6 +1250,17 @@ public:
     BBbackup[bb] = std::move(snapshot);
   }
 
+  // Recognise the VM dispatcher's mux shape: a select between two constants,
+  // possibly behind casts.
+  //
+  // Both helpers peel casts first and only then test the shape, because the
+  // lift's own width normalisation routinely puts a trunc/zext on the select
+  // and a sext on each arm. Testing before peeling would miss every real mux.
+  //
+  // Constant arms are the requirement, not a convenience. A select with a
+  // symbolic arm is an ordinary conditional, which the path solver already
+  // handles; only the two-constant form is unambiguously a dispatcher choosing
+  // between two bytecode addresses.
   static llvm::SelectInst* peelPcodeCursorSelect(llvm::Value* v) {
     return llvm::dyn_cast<llvm::SelectInst>(
         VmpPcodeCursor<Register>::peelCasts(v));
@@ -1309,6 +1320,17 @@ public:
       return false;
     }
 
+    // The false arm is prepared as a *snapshot* before the true arm is taken.
+    //
+    // Order matters: branch_backup captures the current state, and only after
+    // that does the false arm's slot get overwritten with fArm and its
+    // assumption recorded. Doing it the other way round would back up state that
+    // already contains the true arm's value, so restoring bbFalse would produce
+    // the true arm's cursor with the false arm's assumption.
+    //
+    // The byte loop mirrors writeBufferQwordFromConstant rather than calling it,
+    // because this writes into the *snapshot's* buffer, not the live one. That
+    // is the whole reason the helper is not reusable here.
     this->branch_backup(bbFalse);
     auto& falseSnap = BBbackup[bbFalse];
     falseSnap.assumptions[condInst] = llvm::APInt(1, 0);
@@ -1317,12 +1339,18 @@ public:
       falseSnap.buffer[slot + i] = ValueByteReference(fArm, i);
     }
 
+    // The true arm is the one the lift *stays* on. Emitting it into the live
+    // state means the current block continues down the true path while bbFalse
+    // is queued, so the dispatcher is followed rather than abandoned at the
+    // first fork.
     this->assumptions[condInst] = llvm::APInt(1, 1);
     this->writeBufferQwordFromConstant(slot, tArm);
 
     llvm::Value* cond = sel->getCondition();
     auto* br = this->builder->CreateCondBr(cond, bbTrue, bbFalse);
     this->RegisterBranch(br);
+    // Only bbFalse is queued. bbTrue is entered immediately below via
+    // SetInsertPoint, so queueing it too would lift the same continuation twice.
     this->addUnvisitedAddr(BBInfo(contPC, bbFalse));
 
     this->builder->SetInsertPoint(bbTrue);
@@ -1330,6 +1358,20 @@ public:
     return true;
   }
 
+  // Resolve a VM cursor pop to a single bytecode address, forking if needed.
+  //
+  // Four outcomes, in order of preference:
+  //
+  //   nullopt (no constant)      not resolvable at all; caller falls back
+  //   nullopt (not bytecode)     a real constant that is not a handler address
+  //   nullopt (mux, fork failed) the shape was right but the mux could not be
+  //                              built -- budget, or a non-instruction condition
+  //   a concrete address          either already concrete, or one arm of a mux
+  //
+  // The bytecode check on both mux arms is stricter than the single-value case
+  // and deliberately so: a two-constant select where only one arm is bytecode
+  // is far more likely to be ordinary arithmetic than a dispatcher choosing
+  // between handlers. Forking on it would create a spurious path.
   std::optional<uint64_t> tryResolvePcodeCursorPop_impl(uint64_t slot,
                                                         LazyValue orgLoad) {
     LazyValue nested(orgLoad);
@@ -1364,13 +1406,25 @@ public:
     if (condInst == nullptr) {
       return std::nullopt;
     }
+    // No recorded assumption means the fork was just created and this call is
+    // the one that built it -- in which case the true arm is the one the lift is
+    // currently on, and it is the right answer to return.
     auto it = this->assumptions.find(condInst);
     if (it == this->assumptions.end()) {
       return tArm->getZExtValue();
     }
+    // Otherwise read the assumption and take the arm it names. This is the
+    // replay path: the second time the same mux is reached, the assumption
+    // recorded by the first fork says which side this lift is exploring.
     return (it->second.isOne() ? tArm : fArm)->getZExtValue();
   }
 
+  // Restore the ordinary (non-generalized) snapshot for `bb`.
+  //
+  // A missing entry is a no-op, not an error. The block may never have been
+  // backed up -- first arrival at an address, or a path that reached it without
+  // a branch -- and in that case the current state is already correct and
+  // restoring nothing is the right behaviour.
   void load_backup_impl(BasicBlock* bb) {
     activeGeneralizedLoopLocalBuffer.clear();
     if (BBbackup.contains(bb)) {
@@ -1392,11 +1446,22 @@ public:
   // motivate the choice. backedgeSources/Controls/Buffers are filled with
   // exactly the backedges whose tracked qword at controlSlot differs from
   // canonical (the activation precondition for the loop-control helpers).
+  //
+  // `valid` guards the rest for the same reason as in
+  // GeneralizedLoopControlFieldState: this is a plain value type that is always
+  // default-constructed, so without it a discovery that failed and a discovery
+  // that found slot 0 are indistinguishable.
   struct DiscoveredGeneralizedLoopSlots {
     bool valid = false;
     uint64_t controlSlot = 0;
     uint64_t targetSlot = 0;
     uint64_t canonicalControl = 0;
+    // Parallel vectors, index-aligned. Each holds exactly the backedges that
+    // activate the loop -- the ones whose control value differs -- so index i
+    // of all three describes the same edge. Keeping them parallel rather than in
+    // a struct-of-three is a readability tradeoff; the alternative would be a
+    // vector of small structs and an extra indirection on the phi-building
+    // path.
     llvm::SmallVector<llvm::BasicBlock*, 2> backedgeSources;
     llvm::SmallVector<uint64_t, 2> backedgeControls;
     llvm::SmallVector<llvm::DenseMap<uint64_t, ValueByteReference>, 2> backedgeBuffers;
@@ -1408,6 +1473,13 @@ public:
   // canonical has a tracked qword at slot AND at least one backedge has a
   // differing tracked qword at slot. Caller uses this both for the legacy
   // Themida-slot priority path and for the fallback scan.
+  //
+  // "Differs from canonical" is the activation test, and it is stricter than
+  // "differs from the previous backedge". A slot where every backedge agrees
+  // with the canonical arrival carries no loop-carried value, so building a
+  // phi for it would produce an invariant -- correct, but it would suppress the
+  // discovery of slots that actually do vary, since the scan stops at the first
+  // N hits.
   bool tryPopulateControlFromSlot(
       const backup_point& canonical,
       llvm::ArrayRef<backup_point> backedges, uint64_t slot,
