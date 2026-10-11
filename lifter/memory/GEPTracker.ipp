@@ -156,6 +156,25 @@ static llvm::ConstantInt* peelToConstantInt(llvm::Value* v, unsigned depth = 0) 
   return nullptr;
 }
 
+// Record that `value` is known to live at `address`, byte by byte.
+//
+// The buffer is byte-keyed but the entries are (Value*, byteOffset) pairs, so
+// a later read reassembles the value from however many bytes it needs. That is
+// what makes unaligned and cross-slot reads work -- and what makes the width
+// check below load-bearing rather than defensive.
+//
+// The peel substitutes a constant for a foldable expression, so the buffer
+// holds answers instead of questions. It is width-gated: a constant of a
+// different width than the stored value would mis-index every byte, since the
+// byteOffset of byte i assumes the value's own width. Only an exact-width
+// constant is substituted; anything else stays symbolic and is reassembled at
+// read time.
+//
+// The sticky-slot write below records the last concrete per stack slot even
+// when SSA would overwrite it, because the transfer logic needs to know what a
+// slot held independent of the current SSA naming. Argument-derived values are
+// excluded at the read site (isArgumentDerived), not here -- recording broadly
+// and filtering at use keeps the two decisions in one place each.
 MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::addValueReference(Value* value,
                                                             uint64_t address) {
   // The buffer records (value, byteOffset) pairs, so a wider/narrower constant
@@ -657,6 +676,15 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::retrieveCombinedValue(
   return result;
 }
 
+// The implementation behind retrieveCombinedValue, with the re-entry guard
+// stripped out. Split so the outer entry can avoid re-entering for an address
+// already being composed in this call chain: byte assembly recurses through
+// retrieveCombinedValue for nested spans, and without the split a span that
+// (transitively) contains itself would recurse until the stack gives out.
+//
+// Null orgLoad is legal here and means "no fallback": the caller wants the
+// tracked bytes or nothing. Issuing a fallback load the caller did not ask for
+// would materialise IR on a path that may not need it.
 MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::retrieveCombinedValueImpl(
     uint64_t startAddress, uint8_t byteCount, LazyValue orgLoad) {
   printvalue2(startAddress);
@@ -899,6 +927,16 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::retrieveCombinedValueImpl(
   return cxTag("composed", result);
 }
 
+// Take bytes [startOffset, endOffset) out of `value` as an integer.
+//
+// Null input yields zero, not null. The callers use this to reassemble tracked
+// spans, and a missing byte entry means "unknown byte" -- which composes as
+// zero in the assembled value rather than failing the whole read. Returning
+// null here would make one unknown byte unanswerable for the entire span.
+//
+// Shift-then-truncate rather than a single extract: the shift goes through the
+// folder, so a constant input folds here instead of emitting IR the O2 fixpoint
+// would have to clean up after the solver has already decided.
 MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::extractBytes(Value* value,
                                                          uint8_t startOffset,
                                                          uint8_t endOffset) {
@@ -1009,6 +1047,21 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(isPaged)::isValuePaged(Value* address,
   return MEMORY_NOT_PAGED;
 }
 
+// Commit the paging decision for `address`.
+//
+// Deliberately a no-op today: all three arms break without acting, and the
+// verdict is discarded -- isValuePaged's only caller is this function, and
+// this function's callers (loadMemoryOp/insertMemoryOp) do not read anything
+// back either. The whole chain is currently dormant: it computes the paging
+// verdict on every memory access and acts on none of it.
+//
+// Kept rather than deleted because it is the single place where a MAYBE or
+// PAGED verdict can later grow handling (a diagnostic, a counter, a policy
+// hook) without touching every memory access. The empty arms are extension
+// points, not missing code.
+//
+// NOTE: the MIGHT_BE_PAGED arm's stale "something something" comment is the
+// original author's placeholder for that handling.
 MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::pagedCheck(Value* address,
                                                      Instruction* ctxI) {
   isPaged paged = isValuePaged(address, ctxI);
@@ -1740,6 +1793,26 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(pvalueset)::computePossibleValues(
   return res;
 }
 
+// Resolve a load to a concrete value, or return null to keep the LoadInst.
+//
+// The tier order is the whole design, and each tier answers a narrower question
+// than the last:
+//
+//   1. generalized control/target slot  this address is the loop's cursor or
+//                                       output; the loop state is authoritative
+//   2. tracked buffer                   the lifter stored this itself
+//   3. generalized local value          inside a loop, the loop's stack view
+//   4. virtual stack / image            the file bytes underneath
+//
+// Earlier tiers shadow later ones rather than merging with them. A control
+// slot that is ALSO in the tracked buffer must answer from the loop state --
+// the buffer holds the entry value, the loop holds the current one, and
+// merging would answer with a stale iteration.
+//
+// `size` is in BITS (hence cloadsize = size / 8 below). Callers pass the
+// load's width, and a bits-vs-bytes confusion here would read eight times too
+// much -- which the buffer coverage check would then reject as uncovered,
+// failing closed rather than reading neighbours.
 MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::solveLoad(LazyValue load,
                                                       Value* ptr,
                                                       uint8_t size) {
@@ -1767,6 +1840,12 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::solveLoad(LazyValue load,
 
     auto loadOffsetCIval = loadOffsetCI->getZExtValue();
 
+    // Bypass short-circuits the ENTIRE tier chain, not just the buffer read.
+    // While set, the generalized restore owns these slots, and every tier
+    // below would answer from state that predates the loop -- including the
+    // generalized helpers themselves, whose active state is being rebuilt.
+    // Returning the raw load keeps the IR honest (a real load of the slot)
+    // instead of a confident answer from the wrong iteration.
     if (bypassStackConcolicTracking &&
         isTrackedLocalStackAddress(loadOffsetCIval)) {
       return load.get();
