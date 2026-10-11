@@ -2513,6 +2513,17 @@ public:
     return true;
   }
 
+  // Lift the basic block at `addr` into its existing BasicBlock.
+  //
+  // "From address" means the block already exists in addrToBB; this fills it in
+  // rather than creating it. getOrCreateBB is the creator, and the split is
+  // what lets a block be re-lifted under a different set of assumptions without
+  // losing the predecessors that already point at it.
+  //
+  // The attempt count is incremented first and unconditionally, before any
+  // early return. That is deliberate: the count feeds the emergency
+  // generalization threshold, and a path that returns early without counting
+  // would be invisible to the very mechanism meant to notice it is spinning.
   void liftBasicBlockFromAddress(uint64_t addr) {
     ++liftStats.blocks_attempted;
     ++liftAttemptCounts[addr];
@@ -2573,6 +2584,17 @@ public:
             unvisitedBlocks.resize(speculativeCall.worklistFloor);
 
             // Push the return continuation BB onto the worklist.
+            //
+            // Trimming is what makes this correct rather than merely tidy. The
+            // blocks discarded above are the ones the speculative inline
+            // created; leaving them queued would lift them after the bail-out
+            // and produce a walk that has both an inlined callee and an outlined
+            // one, with the callee's half-populated blocks still in the CFG.
+            //
+            // `it != end()` rather than creating the block: the continuation was
+            // pre-created before speculation began, and it is the only thing
+            // allowed to be missing -- if it is, the bail-out has nothing to
+            // resume at and the diagnostic above is the whole story.
             auto it = addrToBB.find(speculativeCall.returnAddr);
             if (it != addrToBB.end()) {
               BBInfo retInfo(speculativeCall.returnAddr, it->second);
@@ -2653,6 +2675,15 @@ public:
     uint64_t totalAttempts = 0;
     uint32_t maxCount = 0;
     // Histogram buckets: 1, 2, 3-4, 5-8, 9-16, 17-32, 33+
+    //
+    // Powers of two because the question is whether the distribution is flat
+    // (genuine exploration, many addresses visited once) or spiky (a dispatcher
+    // spinning on a handful). Linear buckets would make a handful of hot
+    // addresses and a genuine tail indistinguishable in the same bar.
+    //
+    // The 33+ bucket is open-ended on purpose: the interesting fact is "this
+    // one address is being re-lifted without bound", and an exact count is
+    // already available in the sorted listing above.
     std::array<uint32_t, 7> histogram{};
     auto bucket = [](uint32_t count) -> size_t {
       if (count <= 1) return 0;
@@ -2707,6 +2738,13 @@ public:
 
   void dumpPerfDiagReport(std::ostream& os) const { perfDiag.dump(os); }
 
+  // Enqueue a block for lifting.
+  //
+  // Always returns true. The bool is kept so existing call sites read as
+  // "enqueue, and tell me if it took" without having to be rewritten, but
+  // nothing can currently reject an enqueue -- there is no capacity check here.
+  // The block budget is enforced at creation time instead, because a block that
+  // was never created cannot be popped and lifted.
   bool addUnvisitedAddr(BBInfo bb) {
     printvalue2(bb.block_address);
     printvalue2("added");
@@ -2717,6 +2755,19 @@ public:
   /*
   filter : filter for empty blocks
   */
+  // Pop the next block to lift, or return false when the worklist is exhausted.
+  //
+  // The budget check comes first and clears the whole queue. Once the budget is
+  // exceeded there is no value in finishing the exploration: every block
+  // dequeued would create a new one, and the lifter would spend its remaining
+  // time producing blocks that immediately route to liftAbortBlock. Draining
+  // and sealing here means the abandoned blocks get terminators -- without the
+  // sealIncompleteBlocks() call the module would not even print.
+  //
+  // `filter` additionally skips already-populated blocks. Off by default, and
+  // only correct under ControlFlow::Basic; under Unflatten a populated block at
+  // a re-visited address is a legitimate re-lift under new assumptions, and
+  // filtering it would silently drop the second path.
   bool getUnvisitedAddr(BBInfo& out, bool filter = 0) {
     if (liftBudgetExceeded) {
       unvisitedBlocks.clear();
@@ -2767,6 +2818,13 @@ public:
       currentBlockRestoreMode = bypassesStackTracking
                                     ? BlockRestoreMode::GeneralizedLoop
                                     : BlockRestoreMode::Normal;
+      // Promote the pending marker to a permanent one, exactly once.
+      //
+      // Erasing from both sets is what makes this a one-way transition. If
+      // pendingLoop... were left in place, the next visit to this address would
+      // generalize again and produce a second generalized block for the same
+      // header -- two loop structures for one loop, with phi nodes that do not
+      // correspond to anything real.
       if (pendingLoopGeneralizationAddresses.contains(out.block_address)) {
         pendingLoopGeneralizationAddresses.erase(out.block_address);
         stackBypassGeneralizedLoopAddresses.erase(out.block_address);
@@ -2804,10 +2862,42 @@ void writeFunctionToFile(const std::string filename) {
   }
 
   // ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+  //
+  // Left commented out rather than removed: the instruction is held as a
+  // normalised struct now, but every operand access still goes through
+  // GetIndexValue/SetIndexValue, and this is the reminder that those were once
+  // direct array reads.
+
+  // Branch assumption attached to an IR condition.
+  //
+  // Keyed by the *Instruction, not the value it produces, because a condition's
+  // meaning is a property of the branch site: the same comparison reached from
+  // two blocks can carry two different assumptions, and keying by value would
+  // merge them.
   llvm::DenseMap<llvm::Instruction*, llvm::APInt> assumptions;
+
+  // VM cursor multiplexer forks already emitted.
+  //
+  // A set, not a counter, because the fork is emitted once per (condition,
+  // slot) pair regardless of how many times that pair is reached. Counting
+  // would re-fork on a re-lift and duplicate the dispatch logic.
   llvm::DenseSet<CursorMuxForkKey> cursorMuxForked;
+
   // Memoization cache for computePossibleValues, cleared per solvePath call.
+  //
+  // Cleared rather than reused across solves on purpose. The cache is only
+  // valid for the assumptions of the solve that populated it; carrying entries
+  // into the next solve would answer with a value set computed under
+  // constraints that no longer hold -- producing a plausible-looking but wrong
+  // case analysis.
   llvm::DenseMap<llvm::Value*, std::set<llvm::APInt, APIntComparator>> pv_cache;
+
+  // The tracked buffer: what the lifter believes each byte of known memory holds.
+  //
+  // A byte map rather than a value map, and see writeBufferQwordFromConstant for
+  // why. The entries are ValueByteReference rather than raw bytes so a read can
+  // be re-derived if the underlying value is replaced -- which it is, routinely,
+  // by the folders.
   llvm::DenseMap<uint64_t, ValueByteReference> buffer;
   // The flag array is an array of LazyValue, and both choices are deliberate.
   //
