@@ -55,6 +55,21 @@ using namespace llvm;
 #define DEFINE_FUNCTION(name) void lift_##name()
 #endif
 
+// The two control-flow strategies, and the distinction that explains most of
+// the branching in this file.
+//
+//   Basic      one block per address. The worklist visits each once and skips
+//              blocks that already have instructions. Simple and terminating,
+//              but an address reached under two different assumptions gets one
+//              block, so the second arrival reuses the first's state.
+//
+//   Unflatten  the default. One block per (address, assumption) pair. This is
+//              what makes concolic exploration possible at the cost of needing
+//              the generalized-loop machinery to keep loops from exploding.
+//
+// getControlFlow() is constexpr and returns Unflatten, so the Basic mode is
+// currently reached only by changing that one line. The branches remain
+// because removing them would mean the exploration logic is untested.
 enum class ControlFlow {
   Basic,
   Unflatten,
@@ -1768,6 +1783,24 @@ public:
     // regardless of path-solve context (except Ret, which has its own lifecycle).
     // This prevents vm_callret_loop and vm_bubblesort_loop style patterns from
     // exhausting the budget through concrete unrolling of what is clearly a loop.
+    // The emergency bypass exists because the normal gate is too conservative for
+    // one shape of input: a VM dispatch loop that repeatedly transfers back to
+    // an already-visited handler. Each transfer is concrete, so each re-lifts
+    // the handler into a fresh block, and the budget is exhausted by what is
+    // plainly a loop rather than by genuine exploration.
+    //
+    // Four thresholds, all required:
+    //
+    //   budget > 75%          only intervene when it is actually a problem
+    //   context != Ret         a return has its own lifecycle and must not be
+    //                          forced into a loop here
+    //   already visited        otherwise this is a first arrival, not a spin
+    //   addr <= current        must be backward, i.e. genuinely a backedge
+    //   attempts >= 4          one re-visit is normal; four in a row is a spin
+    //
+    // The attempt count rather than a raw visit count is deliberate: it is
+    // keyed per address, so a single hot handler does not trip the bypass for
+    // an unrelated block elsewhere in the function.
     bool emergencyBypass = false;
     {
       const bool budgetCritical =
@@ -1957,6 +1990,23 @@ public:
       ++liftStats.blocks_completed;
   }
 
+  // Give every terminator-less block a terminator.
+  //
+  // This is not cosmetic: LLVM refuses to print a module containing a block
+  // with no terminator, so without this the lifter could not emit output at
+  // all on any input that queued a block it never reached. Blocks are created
+  // and queued during exploration precisely so that some of them are never
+  // lifted, and those are exactly the ones needing a seal.
+  //
+  // ret undef rather than unreachable, deliberately. `unreachable` tells LLVM
+  // the block has no semantics, which lets O2 delete everything feeding it and
+  // then produce `unreachable` in the caller -- turning a local gap into a
+  // whole-function one. `ret undef` keeps the IR well-formed while leaving the
+  // surrounding code alone.
+  //
+  // Paired with a warning because a sealed block means the lifter gave up on a
+  // path. Silently emitting ret undef would produce a module that verifies and
+  // runs, with the gap invisible.
   void sealIncompleteBlocks() {
     for (auto& BB : *fnc) {
       if (BB.getTerminator())
