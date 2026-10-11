@@ -2039,6 +2039,19 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::dumpRflagsDiag(const char* tag,
   std::cout << std::endl;
 }
 
+// Read a register, handling the three names that are not slots.
+//
+// RIP/EIP reads current_address -- the address of the NEXT instruction, since
+// the lift loop advances before the semantics run. That is what makes
+// RIP-relative addressing work: the handler sees the RIP the hardware would.
+// The width follows the file mode, not the register spelling: EIP in a 64-bit
+// binary still denotes the low 32 bits of a 64-bit RIP, but the VALUE is the
+// full current_address and narrowing is the caller's job (via the sub-register
+// writes below).
+//
+// AH/CH/DH/BH are not slots either -- they are bits [15:8] of their parent --
+// so they route to GetValueFromHighByteRegister. RFLAGS/EFLAGS gather from the
+// individual flags. Everything else is a direct slot read.
 MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::GetRegisterValue(
     const Register key) {
   auto registerSample = profiler.sample("sem_registers");
@@ -2070,6 +2083,11 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::GetRegisterValue(
     return GetRFLAGSValue();
   }
 
+  // Segment bases are opaque calls, not slot reads. GS/DS have no
+  // representation in the register file -- the lifter models the TEB mapping
+  // at GetEffectiveAddress time, not as a register value -- so reading one
+  // emits a call to a helper the backend resolves, keeping the segment
+  // semantics out of the per-instruction IR.
   if (key == Register::GS) {
     typename funcsignatures<Register>::functioninfo funcInfo("loadGS", {});
     return callFunctionIR("loadGS", &funcInfo);
@@ -2084,6 +2102,13 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::GetRegisterValue(
   }
   */
 
+  // Narrowing is zext-or-trunc, unconditionally. A 32-bit read of a 64-bit
+  // slot zero-extends per the architecture, and a wider-than-slot read cannot
+  // occur (getRegisterSize is authoritative for the spelling). Signedness is
+  // not considered here on purpose -- extension semantics belong to the
+  // instruction being lifted (movsx vs movzx), not to the register read, and
+  // folding signedness in at this layer would make every reader pay for a
+  // distinction only conversions need.
   Register largestKey = getBiggestEncoding(key);
   // it is safe to zext&truncate here, because if size doesnt match, we DO need
   // to make it fit, we start caring about signedness once we are in the
@@ -2102,6 +2127,16 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::GetRegisterValue(
   return createZExtOrTruncFolder(reg, builder->getIntNTy(getRegisterSize(key)));
 }
 
+// Write bits [15:8] of a 16-bit register, preserving the rest.
+//
+// Read-modify-write on the full slot: clear bits 8-15, shift the low 8 bits of
+// the input into place, OR them in. The input is masked to 8 bits first, so a
+// wider value cannot leak into bits 16+ -- without the mask, `mov ah, eax`
+// would set bits the architecture leaves alone.
+//
+// The i64 mask constant relies on the slot being 64-bit. All full slots are,
+// so the constant type is correct by construction rather than by check; a
+// narrower slot here would truncate the mask and clear the wrong bits.
 MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::SetValueToHighByteRegister(
     const Register reg, Value* value) {
   LLVMContext& context = builder->getContext();
@@ -2128,6 +2163,18 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::SetValueToHighByteRegister(
   return newRegisterValue;
 }
 
+// Write an 8-bit sub-register (AL or AH family), preserving the other 56 bits.
+//
+// The mask is chosen by family, not by width: a high-byte write clears bits
+// 8-15 (0x...00FF) while a low-byte write clears bits 0-7 (0x...FF00). Same
+// function, two masks, because both go through the same read-modify-write and
+// only the cleared window differs. Getting the family test wrong writes the
+// byte to the wrong half -- well-typed IR with the value in bits the consumer
+// never reads.
+//
+// Both sides are normalised to i64 first so the AND/OR see matching types.
+// Mismatched widths here would make the folder insert its own conversions at
+// unpredictable points, and the mask constant is written for 64 bits.
 MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::SetValueToSubRegister_8b(
     const Register reg, Value* value) {
   LLVMContext& context = builder->getContext();
@@ -2202,6 +2249,26 @@ MERGEN_LIFTER_DEFINITION_TEMPLATES(Value*)::SetValueToSubRegister_16b(
   return updatedReg;
 }
 
+// Write a register in any width spelling.
+//
+// The width dispatch is the x86 partial-write semantics, and each arm differs
+// deliberately:
+//
+//   RIP/EIP      ignored: RIP is recomputed from current_address on every
+//                read, so storing to it would create a second source of truth
+//                that the next read ignores anyway.
+//   8-bit        read-modify-write, preserving the other 56 bits (x86 leaves
+//                them alone).
+//   16-bit       read-modify-write, preserving the upper 48.
+//   32-bit       ZERO-EXTEND: an x86 32-bit write clears the upper 32 bits,
+//                unlike the 8/16-bit cases. This asymmetry is architectural,
+//                and missing it is the classic lifter bug -- the upper half
+//                keeps a stale value no real execution could have.
+//   64-bit       direct slot write below.
+//
+// The enum-range tests assume contiguous Register numbering within each family
+// (AL..R15B, AX..R15W, EAX..R15D). Non-contiguous additions to the enum would
+// silently fall through to a full-width write.
 MERGEN_LIFTER_DEFINITION_TEMPLATES(void)::SetRegisterValue(const Register key,
                                                            Value* value) {
   auto registerSample = profiler.sample("sem_registers");
