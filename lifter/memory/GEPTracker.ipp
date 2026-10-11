@@ -1,5 +1,22 @@
 #pragma once
 
+// Value and memory tracking: the layer that decides what the lifter *knows*
+// about a value at a given point, as opposed to what the IR merely says.
+//
+// The distinction this file exists to maintain:
+//
+//   a load that reads a concrete byte      -> the value is a constant
+//   a load that reads a VM-computed slot  -> the value stays symbolic
+//
+// Everything here serves keeping those apart. The hard cases are all the
+// second kind wearing the first kind's clothes: a value that was written at
+// some earlier instruction, read back as part of a wider access, and whose
+// slot sits between two bytes the tracker does know.
+//
+// The include guard is load-bearing: this file and OperandUtils.ipp include
+// each other, so without it the mutual include resolves against a
+// half-defined class and the build fails pointing at the wrong file.
+
 #include "GEPTracker.h"
 #include "LifterDiagHelpers.hpp"
 #include "MemoryPolicy.hpp"
@@ -20,9 +37,17 @@ using namespace llvm;
 
 // Watched interval: the pseudo-stack slot whose read-back value (0x58) the
 // dispatcher later treats as data.
+//
+// A debugging aid for one specific investigation, not general machinery: it
+// reports the single store that puts 0x58 into this slot, because the
+// dispatcher treats that byte as data and a wrong value there sends the walk
+// to the wrong handler.
 static constexpr uint64_t kBufferWatchStart = 0x14FC90ULL;
 static constexpr uint64_t kBufferWatchEnd = 0x14FC98ULL;
 
+// Half-open overlap test against the watched window. Overlap rather than
+// containment, because a wider write straddling the slot is exactly the case
+// worth seeing.
 void noteBufferWriteDiag(const char* site, uint64_t start, uint64_t size,
                          llvm::Value* value, uint64_t insnAddr) {
   if (!(start < kBufferWatchEnd && start + size > kBufferWatchStart)) {
@@ -30,6 +55,9 @@ void noteBufferWriteDiag(const char* site, uint64_t start, uint64_t size,
   }
   // Only the write that puts the 58 pattern into the slot matters; logging
   // every overlapping write drowns it (56 hits, none of them the culprit).
+  // See the header comment above. Note the gate is on width as well as value: a
+  // 0x58 stored at 32 bits is a different fact from one stored at 64, and
+  // reporting both would reintroduce the noise this exists to filter out.
   bool is58 = false;
   if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(value)) {
     if (ci->getBitWidth() == 64 && ci->getZExtValue() == 0x58) {
@@ -68,8 +96,10 @@ void noteBufferWriteDiag(const char* site, uint64_t start, uint64_t size,
 // reason). Only casts and selects -- which cannot manufacture a value that their
 // (wholly constant) operands do not already imply -- are peeled.
 static llvm::ConstantInt* peelToConstantInt(llvm::Value* v, unsigned depth = 0) {
-  // 8 is far above any real chain here; it exists only to make a malformed or
-  // self-referential IR chain terminate.
+  // The depth bound is a termination guard, not a heuristic: a malformed or
+  // self-referential IR chain would otherwise recurse forever. Eight is far
+  // above any cast/select chain this lifter actually produces, so hitting the
+  // limit means something is already wrong and nullptr is the safe answer.
   if (v == nullptr || depth > 8) {
     return nullptr;
   }
@@ -82,6 +112,14 @@ static llvm::ConstantInt* peelToConstantInt(llvm::Value* v, unsigned depth = 0) 
   // left unaligned cross-slot loads unable to compose (work.md 7.12.9鈥?0).
   // Re-apply the cast to the peeled constant so the result matches `v`'s
   // width. Do not walk or/shl FLAGS chains 鈥?that is the 7.12.7 regression.
+  // Re-apply the cast to the peeled constant rather than returning the inner
+  // one. The width has to match `v`'s: returning a narrower ConstantInt made
+  // addValueReference reject the peel on a width mismatch, which silently
+  // left unaligned cross-slot loads unable to compose.
+//
+// The final `else if` is the guard for cast opcodes not listed above
+  // (fptrunc/fpext and friends): those must not be treated as integer casts
+  // just because the operand happened to peel successfully.
   if (auto* cast = llvm::dyn_cast<llvm::CastInst>(v)) {
     if (!cast->getType()->isIntegerTy()) {
       return nullptr;
