@@ -30,10 +30,28 @@
 class StraightLineRerollPass
     : public llvm::PassInfoMixin<StraightLineRerollPass> {
 public:
+  // Tuning bounds. These are cost guards, not correctness limits: exceeding
+  // any of them makes the pass decline to reroll rather than produce a wrong
+  // result.
+  //
+  //   MinRounds      2, because a single round is not a loop. Requiring two
+  //                  also means a match is evidence rather than coincidence.
+  //   MaxBodySize    bounds the backward slice. The slice is O(body) memory
+  //                  per candidate and candidates are every instruction in the
+  //                  block, so an unbounded slice is quadratic in practice.
+  //   MaxChainScan   bounds how far the chain search walks while looking for
+  //                  the next identical round. A run longer than this is not
+  //                  worth collapsing -- the emitted loop would be enormous
+  //                  and the win comes from many medium runs instead.
   static constexpr unsigned MinRounds = 2;
   static constexpr unsigned MaxBodySize = 64;
   static constexpr unsigned MaxChainScan = 4096;
 
+  // Re-runs until a pass makes no change. One sweep can expose new chains --
+  // rerolling one region can leave an adjacent region with a longer
+  // fingerprint run -- so a single pass would under-report. The loop is
+  // bounded in practice because each reroll strictly reduces instruction
+  // count in the rewritten region and the pass cannot invent instructions.
   llvm::PreservedAnalyses run(llvm::Module& M, llvm::ModuleAnalysisManager&) {
     bool changed = false;
     for (llvm::Function& F : M) {
@@ -50,6 +68,10 @@ public:
   }
 
 private:
+  // One "round" of the unrolled pattern: seed in, out, and the instructions
+  // computing out from seed. `body` is topologically ordered and does NOT
+  // include `out` itself. `fingerprint` is the structural identity used to
+  // match rounds against each other.
   struct Round {
     llvm::Value* seed = nullptr;
     llvm::Instruction* out = nullptr;
@@ -57,10 +79,16 @@ private:
     uint64_t fingerprint = 0;
   };
 
+  // A maximal run of rounds sharing one fingerprint -- i.e. the unrolled loop.
   struct Chain {
     llvm::SmallVector<Round, 8> rounds;
   };
 
+  // Whitelist rather than `!mayReadOrWriteMemory() && !mayHaveSideEffects()`.
+  // The negated form would admit anything LLVM later adds as pure by default,
+  // so a future instruction class would silently become eligible and could
+  // break the no-side-effects guarantee this pass relies on when it moves
+  // instructions into a loop body. An explicit list fails closed.
   static bool isPureOp(const llvm::Instruction* I) {
     if (!I)
       return false;
@@ -83,6 +111,20 @@ private:
   }
 
   // True if every use-path from V ends at llvm.assume (or is dead).
+  //
+  // This is what makes the pass work on VM-derived IR at all. Flag
+  // materialisation in lifted VM code leaves chains of pure arithmetic whose
+  // only real consumer is an llvm.assume carrying the flag semantics. Those
+  // chains are exactly the kind of side-chain the pass must exclude from a
+  // round body, but excluding them outright would reject most candidates. So
+  // they are allowed *here* (as consumers of slice intermediates) while
+  // sliceToSeed still keeps them out of the body itself.
+  //
+  // `seen` is threaded through rather than local to each call: without it,
+  // diamond-shaped use graphs (a feeds b and c, both feeding d) would
+  // re-explore shared subgraphs exponentially. A value already on the stack
+  // is by definition already being explored, so treating it as satisfied is
+  // correct for the fixed-point question being asked.
   static bool onlyFeedsAssumes(llvm::Value* V,
                                llvm::SmallPtrSetImpl<llvm::Value*>& seen) {
     if (!seen.insert(V).second)
@@ -108,11 +150,30 @@ private:
     return onlyFeedsAssumes(V, seen);
   }
 
+  // Boost-style hash combiner. The golden-ratio constant spreads consecutive
+  // integers across the whole word, which matters here because opcodes and
+  // type IDs are small dense values that would otherwise collide heavily.
   static uint64_t mixHash(uint64_t h, uint64_t v) {
     h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
     return h;
   }
 
+  // Structural identity of one round.
+  //
+  // Two rounds match iff they compute the same thing over the same shape,
+  // regardless of which SSA values they happen to mention. Values are
+  // canonicalised to positional ids (seed = 0, body instructions = 1..n in
+  // order), so the hash sees topology and opcodes, not names or allocation
+  // order.
+  //
+  // The type-id / bitwidth / cmp-predicate / cast-opcode terms are folded in
+  // because two instructions with the same opcode but different operand types
+  // are not interchangeable, and without them an i8 add would fingerprint the
+  // same as an i64 add.
+  //
+  // Returning 0 means "not isomorphic": an operand outside the slice (so the
+  // round's body is not closed) yields 0. The final `h == 0 ? 1 : h` keeps a
+  // legitimately-zero hash from being mistaken for that rejection.
   static uint64_t fingerprintRound(
       llvm::Value* seed, llvm::Instruction* out,
       const llvm::SmallVectorImpl<llvm::Instruction*>& body) {
@@ -155,6 +216,13 @@ private:
     return h == 0 ? 1 : h;
   }
 
+  // Whether every operand of I is a constant, the seed, or something already
+  // produced earlier in the scan.
+  //
+  // This is what confines a round body to a contiguous straight-line region.
+  // An instruction reading a value defined *after* it is not a candidate, so
+  // the scan can stop accumulating availability as soon as one is missed
+  // rather than having to track arbitrary def-use edges.
   static bool operandsAvailable(
       llvm::Instruction* I, llvm::Value* seed,
       const llvm::SmallPtrSetImpl<llvm::Value*>& avail) {
@@ -168,6 +236,27 @@ private:
     return true;
   }
 
+  // Extract the backward slice from `out` to `seed`, returning it in
+  // topological order, or nullopt if the round is not self-contained.
+  //
+  // Five independent rejection reasons, each of which alone disqualifies the
+  // candidate:
+  //
+  //   1. an operand is outside `pool`  -- the body depends on something not
+  //      between seed and out, so it is not a closed round
+  //   2. slice exceeds MaxBodySize    -- cost guard
+  //   3. an instruction escapes the slice -- the slice computes a value
+  //      somebody else consumes. Moving those instructions into a loop body
+  //      would change what happens outside the loop. The only tolerated
+  //      escape is a chain that ends at llvm.assume.
+  //   4. the slice never reads the seed -- then it is not a round, it is a
+  //      fixed subexpression that would be loop-invariant
+  //   5. the slice is not topologically sortable -- a cycle, which real IR
+  //      should not contain
+  //
+  // The Kahn-style sort at the end is what turns a set into an order the
+  // emitted loop can replay. `topo.size() != inSlice.size()` is the cycle
+  // detector.
   static std::optional<llvm::SmallVector<llvm::Instruction*, 8>>
   sliceToSeed(llvm::Instruction* out, llvm::Value* seed,
               const llvm::SmallPtrSetImpl<llvm::Value*>& pool) {
@@ -256,6 +345,15 @@ private:
     return topo;
   }
 
+  // Walk forward from the seed, keeping every pure instruction whose operands
+  // are already available, and record each same-typed result as a candidate
+  // round.
+  //
+  // `pool` and `avail` grow together on purpose: pool is what sliceToSeed is
+  // allowed to pull into a body, avail is what operands may reference. An
+  // instruction failing operandsAvailable is skipped but does not stop the
+  // scan, because an unrelated branchy or memory-touching instruction in the
+  // middle of the block should not hide a valid round after it.
   static void collectCandidateRounds(llvm::Value* seed, llvm::BasicBlock* BB,
                                      llvm::SmallVectorImpl<Round>& outRounds) {
     outRounds.clear();
@@ -303,6 +401,12 @@ private:
     }
   }
 
+  // Find the next round with a given fingerprint, searching from the seed.
+  //
+  // First match wins rather than "best" match: all candidates sharing a
+  // fingerprint are structurally identical by construction, so any of them
+  // replays the same body. The only reason to prefer one over another is
+  // position, and the scan is already forward from the seed.
   static std::optional<Round> findMatchingRound(llvm::Value* seed,
                                                 llvm::BasicBlock* BB,
                                                 uint64_t fp) {
@@ -315,6 +419,13 @@ private:
     return std::nullopt;
   }
 
+  // Search the whole function for the longest identical-fingerprint run.
+  //
+  // Longest wins rather than first, because that is what determines how much
+  // code the emitted loop replaces. A short chain found early is worth less
+  // than a longer one later, and picking the first would make the pass
+  // sensitive to instruction ordering in ways that are hard to reason about
+  // when comparing golden IR.
   static std::optional<Chain> findBestChain(llvm::Function& F) {
     std::optional<Chain> best;
     auto considerSeed = [&](llvm::Value* seed0, llvm::BasicBlock& BB) {
