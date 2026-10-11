@@ -152,12 +152,19 @@ public:
     }
   }
 
+  // Direct slot read. No null check and no fallback: every modelled register
+  // has a slot, and an empty WeakTrackingVH reads as null, which the caller
+  // already handles. Adding a default here would mask the unmodelled-register
+  // case that getRegisterIndex deliberately routes to RAX_.
   llvm::Value* get_impl(Register key) {
     int index = getRegisterIndex(key);
 
     return vec[index];
   }
 
+  // Direct slot write. No import-provenance invalidation here -- see the note
+  // at SetRegisterValue_impl; that lives one layer down in
+  // SetRegisterValue_internal.
   void set_impl(Register key, llvm::Value* val) {
     // printvalue2(int(key));
     // printvalue2(magic_enum::enum_name(key))
@@ -167,6 +174,8 @@ public:
     vec[keyindex] = val;
   }
 
+  // Bulk register restore. Same per-entry path as set_impl, so the same
+  // no-invalidation caveat applies; see above.
   void init_impl(
       std::array<std::pair<Register, llvm::Value*>, REGISTER_COUNT> values) {
     for (auto& [reg, val] : values) {
@@ -944,6 +953,12 @@ public:
     // Data-driven: preserve when any backedge has a different SSA value
     // from canonical. ConstantInts with the same numeric value share a
     // pointer in LLVM, so pointer equality is a sound test for constants.
+    //
+    // For non-constants this is conservative in the preserve direction: two
+    // structurally identical but distinct SSA values compare unequal and force
+    // preservation. That costs a phi that could have been avoided, which is
+    // the mild direction -- the alternative (value-equality on arbitrary IR)
+    // would need a full expression comparison on every register of every loop.
     for (const auto* src : effectiveSources) {
       if (src->vec[index] != canonical.vec[index]) {
         return true;
@@ -1062,6 +1077,11 @@ public:
         return backedgeValues.empty() ? nullptr : backedgeValues.front();
       }
       for (auto* beValue : backedgeValues) {
+        // `beValue == canonicalValue` is also a bail: a backedge that agrees
+        // with canonical contributes no variation, and a phi whose incoming
+        // values are not all distinct is a more expensive way of writing the
+        // first backedge's value. Pointer equality is sufficient here because
+        // LLVM uniques constants -- two equal constants are the same pointer.
         if (!beValue || beValue->getType() != canonicalValue->getType() ||
             beValue == canonicalValue) {
           return backedgeValues.front();
@@ -1071,6 +1091,11 @@ public:
                                        1 + backedgeValues.size(), name);
       phi->addIncoming(canonicalValue, canonicalSource);
       for (size_t i = 0; i < backedgeValues.size(); ++i) {
+        // Widening substitutes undef for the backedge value so LLVM can fold
+        // away scratch noise on that edge; see shouldPreserveGeneralizedBackedge
+        // Register for which registers qualify. The canonical incoming is never
+        // widened -- it is the value the loop is entered with, and undef-ing it
+        // would make the first iteration itself meaningless.
         phi->addIncoming(widenFirstBackedge
                              ? llvm::UndefValue::get(backedgeValues[i]->getType())
                              : backedgeValues[i],
@@ -1120,6 +1145,10 @@ public:
       for (auto* src : effectiveSources) {
         flagValues.push_back(src->vecflag[i]);
       }
+      // widenFirstBackedge is always false for flags: unlike registers, flags
+      // are never widened to undef. An undef flag would poison every conditional
+      // branch reading it, so the merge is always exact -- either a phi over
+      // the real values or a single agreed value.
       generalized.vecflag[i] =
           mergeValue(canonical.vecflag[i], flagValues, "loop_flag_phi",
                      flagPhis[i], false);
@@ -1316,6 +1345,10 @@ public:
         this->createBudgetedBasicBlock("cursor_mux_f", contPC);
     llvm::BasicBlock* bbTrue =
         this->createBudgetedBasicBlock("cursor_mux_t", contPC);
+    // Budget-exhausted fork declines the whole mux rather than forking half of
+    // it. A single-arm fork would leave the dispatch modelled as unconditional
+    // -- the lift would follow one handler and silently drop the other, which
+    // is worse than leaving the select symbolic for the generic path to handle.
     if (bbFalse == this->liftAbortBlock || bbTrue == this->liftAbortBlock) {
       return false;
     }
@@ -2570,6 +2603,12 @@ public:
     if (regIt != generalizedLoopRegisterPhis.end()) {
       for (size_t i = 0; i < REGISTER_COUNT; ++i) {
         auto* phi = regIt->second[i];
+        // Four skips, each a different non-case: no phi built for this slot;
+        // nothing in the slot to contribute; a type the phi was not built for
+        // (the phi's type is fixed at creation, and an incoming of another
+        // type would make LLVM reject the module); a phi that migrated away
+        // from this header; and an edge already recorded, which would otherwise
+        // add a duplicate incoming every time the same backedge is walked.
         if (!phi || !vec[i] || phi->getType() != vec[i]->getType() ||
             phi->getParent() != bb ||
             phi->getBasicBlockIndex(sourceBlock) >= 0) {
