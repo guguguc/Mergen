@@ -394,6 +394,39 @@ public:
       funcArgInfo(Register::RCX, I32, 0),
   };
 
+  // Name-resolved function table: 37 Win32 API names with their argument
+  // models, no byte patterns at all (bytes == nullptr, byteCount == 0).
+  //
+  // This is the complement of kBinarySignatureSpecs above, and the two differ
+  // in WHERE the name comes from:
+  //
+  //   kBinarySignatureSpecs  matched by prologue bytes, because the export
+  //                          table may not have the function (it can be
+  //                          internal). Survives a stripped image.
+  //   kNamedFunctionSpecs   keyed purely by name. Reached only when the name
+  //                          is already known -- i.e. the PE import table, or
+  //                          a resolved import thunk.
+  //
+  // So this table is not a search step. It is a lookup consulted at the point
+  // the lifter has already decided the call is external and knows what to call
+  // it (Semantics_ControlFlow.ipp:572 in the ret-to-IAT chain,
+  // Semantics_Helpers.ipp:186 in callFunctionIR, Semantics.ipp:255 for
+  // address-keyed lookups). Its job is to supply the argument model so the
+  // emitted call has a real signature instead of the conservative
+  // all-GPRs-plus-memory default.
+  //
+  // The `nullptr, 0` entries are deliberate and mean "recognise the name, do
+  // not claim to know the signature" -- GetTickCount, GetCurrentProcess and
+  // friends take no arguments, so the wide default would over-approximate and
+  // the narrow true answer is simply the empty list. Passing a genuinely empty
+  // array would also work, but nullptr makes the intent visible in the table.
+  //
+  // Arg-sharing across entries is intentional, not copy-paste: the W/A pairs
+  // (MessageBoxW/A, CreateFileW/A, GetModuleHandleW/A, LoadLibraryW/A) and the
+  // file/console pairs take identical arguments under the same ABI, so they
+  // point at one kXxxArgs array. If a future SDK diverges them (some CRT
+  // variants do for the narrow-string entry points), the two rows must be
+  // split -- a shared array silently gives both the same model.
   static inline constexpr std::array<SignatureSpec, 37> kNamedFunctionSpecs = {{
       {"MessageBoxW", nullptr, 0, kMessageBoxArgs.data(), kMessageBoxArgs.size()},
       {"MessageBoxA", nullptr, 0, kMessageBoxArgs.data(), kMessageBoxArgs.size()},
@@ -434,6 +467,23 @@ public:
       {"CharUpperA",    nullptr, 0, kCharUpperArgs.data(), kCharUpperArgs.size()},
   }};
 
+  // The name -> functioninfo map, built once on first use.
+  //
+  // Function-local static initialised by an immediately-invoked lambda, rather
+  // than a namespace-scope object, so construction happens on first lookup
+  // instead of during static init. That matters because buildFunctionInfo reads
+  // context-dependent defaults; building at static-init time would run before
+  // the LLVMContext exists.
+  //
+  // Both tables land in the SAME map. The named specs pass buildFunctionInfo
+  // without the second argument, the binary specs with it -- the flag marks a
+  // spec as byte-matched rather than name-matched, so a name resolved from the
+  // import table and the same name resolved by prologue bytes produce
+  // distinguishable functioninfo entries.
+  //
+  // emplace, not operator[]: a duplicate name across the two tables keeps the
+  // first insert rather than silently overwriting, so the tables can overlap
+  // without the later one winning by accident.
   static std::unordered_map<std::string, functioninfo>& getNamedFunctionsByName() {
     static std::unordered_map<std::string, functioninfo> functionsByName = []() {
       std::unordered_map<std::string, functioninfo> map;
@@ -449,6 +499,20 @@ public:
     return functionsByName;
   }
 
+  // Step 1: scan the raw image bytes for the prologue patterns.
+  //
+  // Takes the whole file, not the mapped view, because it is looking for byte
+  // patterns in the on-disk image -- not for values the emulated process would
+  // read. That is also why it must run before the lift: once IR is built, the
+  // original bytes are no longer the thing being consulted.
+  //
+  // Offsets are converted from file position to RVA here, so everything
+  // downstream (createOffsetMap, getFunctionInfo by address) speaks RVA and
+  // never has to think about file layout.
+  //
+  // signatureOffsets is cleared first rather than appended to: the stage is
+  // re-runnable, and a stale hit from a previous image would resolve an address
+  // in the wrong binary to a known function.
   static void search_signatures(std::vector<unsigned char>& data) {
     signatureOffsets.clear();
     if (data.empty()) {
@@ -464,6 +528,17 @@ public:
     }
   };
 
+  // Step 2: turn the name->offsets map into an address->functioninfo map.
+  //
+  // Must run after search_signatures and is what makes the results usable by
+  // address. Running it against an empty or stale signatureOffsets produces a
+  // well-formed but empty `functions` map, which looks valid and silently
+  // disables every signature-derived improvement -- the reason runSignatureStage
+  // calls both steps and does not treat either as optional.
+  //
+  // Only kBinarySignatureSpecs is walked here. The named specs need no offset
+  // map: they are looked up by name at the call site (see
+  // kNamedFunctionSpecs and getNamedFunctionsByName).
   static void createOffsetMap() {
     functions.clear();
     for (const auto& spec : kBinarySignatureSpecs) {
@@ -478,6 +553,16 @@ public:
     }
   };
 
+  // Debug-only dump of what the signature stage found.
+  //
+  // Prints every pattern in the table, including the ones with no hits -- the
+  // "end" with nothing before it is the signal that a pattern did not match
+  // this sample. That is the fastest way to tell whether signature
+  // recognition is working at all, and which specific prologue is missing.
+  //
+  // Only walks kBinarySignatureSpecs: the named specs have no offsets to show,
+  // and whether they were hit is visible in the emitted IR instead (a named
+  // `call @LoadLibraryW` rather than an inttoptr).
   static void displayMatches() {
     for (const auto& spec : kBinarySignatureSpecs) {
       std::cout << "Function Name: " << spec.name << ", Offsets: ";
@@ -491,6 +576,13 @@ public:
     }
   }
 
+  // Address lookup, served by the map createOffsetMap built. Keyed by RVA, so
+  // the caller must have normalised the address first -- a 0x140000000-base
+  // address will miss against a 0x40000000-base key and the signature-derived
+  // argument model silently degrades to the conservative default.
+  //
+  // Null means "not a recognised function", which is the overwhelmingly common
+  // case and is not an error.
   static functioninfo* getFunctionInfo(uint64_t addr) {
     auto it = functions.find(addr);
     if (it == functions.end())
@@ -498,6 +590,10 @@ public:
     return &it->second;
   };
 
+  // Name lookup, served by getNamedFunctionsByName. This is the overload that
+  // actually matters for imports: at a call site the lifter usually knows the
+  // name (from the IAT or a resolved thunk) even when it never had the
+  // address in a signature table.
   static functioninfo* getFunctionInfo(const std::string& name) {
     auto& functionsByName = getNamedFunctionsByName();
     auto it = functionsByName.find(name);
