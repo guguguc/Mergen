@@ -13,6 +13,18 @@
 #include <vector>
 #include <iostream>
 
+// What stages 1-3 produce: a configured lifter plus the PE facts about where
+// it is pointing.
+//
+// Both members are needed downstream and neither is derivable from the other.
+// The lifter knows the image (loadFile) but not the resolved start address;
+// the context knows the start address, RVA, file offset, and stack reserve,
+// but cannot lift anything. Stage 4 onward needs both, so they travel
+// together.
+//
+// unique_ptr rather than a bare object: the lifter is non-copyable in practice
+// (it holds LLVM context, IRBuilder, and a module), and the pointer makes
+// ownership explicit through every return path in prepareLifterStageContext.
 struct LifterStageContext {
   std::unique_ptr<lifterConcolic<>> lifter;
   RuntimeImageContext runtimeContext;
@@ -23,6 +35,22 @@ createConfiguredLifterForRuntime(uint8_t* fileBase, size_t fileSize,
                                 uint64_t runtimeAddress) {
   auto lifter = std::make_unique<lifterConcolic<>>();
   lifter->loadFile(fileBase);
+
+  // Diagnostic and budget knobs, read here because this is the only point
+  // where a lifter exists and nothing has lifted yet. All four are read-only
+  // observation or a bound on work -- none changes lifting semantics, only
+  // visibility or how far the lifter is allowed to go before aborting.
+  //
+  // MERGEN_MAX_BLOCK_BUDGET is a diagnostic for reproducing a budget abort at
+  // a lower threshold than the real one. It is NOT the knob to raise: a real
+  // lift that hits 4096 blocks has hit a genuine explosion (see the emergency
+  // loop-generalization bypass), and raising the ceiling converts an
+  // out-of-memory kill into an hours-long run.
+  //
+  // Invalid numeric values are ignored rather than fatal, so a typo in a
+  // diagnostic env var cannot prevent the run. That is the deliberate
+  // asymmetry with --concretize-unsafe-reads, which IS fatal because accepting
+  // it silently would produce wrong IR.
   if (const char* env = std::getenv("MERGEN_DIAG_LIFT_PROGRESS")) {
     const std::string_view value(env);
     lifter->liftProgressDiagEnabled =
@@ -35,6 +63,8 @@ createConfiguredLifterForRuntime(uint8_t* fileBase, size_t fileSize,
   if (const char* env = std::getenv("MERGEN_MAX_BLOCK_BUDGET")) {
     char* end = nullptr;
     unsigned long parsed = std::strtoul(env, &end, 10);
+    // Fully-consumed check: without it, "4096x" would parse as 4096 and the
+    // typo would go unnoticed.
     if (end != env && *end == '\0') {
       lifter->maxBasicBlockBudget = static_cast<uint32_t>(parsed);
     }
@@ -210,6 +240,12 @@ inline std::string formatAddressHex(uint64_t address) {
   return oss.str();
 }
 
+// Render a context failure with the start address attached.
+//
+// The start address is part of the message rather than left to the caller
+// because the address is what the user has to change: every one of these
+// errors means "this VA is not a valid entry", and an error that names the VA
+// can be acted on without reading the source.
 inline std::string formatRuntimeContextFailure(RuntimeImageContextError error,
                                                uint64_t runtimeAddress) {
   std::ostringstream oss;
@@ -219,16 +255,37 @@ inline std::string formatRuntimeContextFailure(RuntimeImageContextError error,
   return oss.str();
 }
 
+// Stages 1-3 in one fallible call: validate the PE, build the lifter, and
+// configure memory policy.
+//
+// The return is an optional and the error goes out through a reference rather
+// than an exception or a bool: the caller (InitFunction_and_LiftInstructions)
+// owns the exit code and the stderr message, so this function stays free of
+// both CLI concerns and of throw sites that would have to be reasoned about at
+// every step.
+//
+// `fileData` is a mutable reference, not a const one, because it is borrowed
+// rather than copied -- the lifter stores fileBase and reads it for the entire
+// lift. The caller guarantees the vector outlives the lifter (see
+// InitFunction_and_LiftInstructions, which passes the same vector twice).
 inline std::optional<LifterStageContext>
 prepareLifterStageContext(uint64_t runtimeAddress, std::vector<uint8_t>& fileData,
                          std::string& outError,
                          const std::string& memDumpPath = {}) {
+  // Empty input is checked before createRuntimeImageContext rather than
+  // relying on its DOS-magic test: fileData.data() on an empty vector is a
+  // valid-but-dangling pointer, and "the file is empty" is a more useful
+  // message than "invalid DOS magic" for the same underlying cause.
   if (fileData.empty()) {
     outError = "Input file is empty";
     return std::nullopt;
   }
 
   auto* fileBase = fileData.data();
+  // Stage 1. This is where a malformed PE is caught, and it is deliberately
+  // the first thing: every later stage dereferences NT headers without
+  // rechecking them, so proceeding past a failure here would mean reporting a
+  // crash rather than the malformed-header error that actually happened.
   auto runtimeResult =
       createRuntimeImageContext(fileBase, fileData.size(), runtimeAddress);
   if (!runtimeResult.ok()) {
@@ -236,10 +293,29 @@ prepareLifterStageContext(uint64_t runtimeAddress, std::vector<uint8_t>& fileDat
     return std::nullopt;
   }
 
+  // Stage 2. Builds the lifter and auto-outlines PE export addresses.
+  // Returns a unique_ptr rather than a reference so ownership is unambiguous
+  // on every exit path below, including the mem-dump failure.
   auto lifter = createConfiguredLifterForRuntime(fileBase, fileData.size(),
                                                  runtimeAddress);
+
+  // Copied out of the optional rather than held by reference. LifterStageContext
+  // is returned by value and outlives runtimeResult, so the copy is what makes
+  // the dangling-reference case impossible. RuntimeImageContext is a handful of
+  // scalars, so the copy costs nothing.
   auto ctx = *runtimeResult.context;
+
+  // Stage 3. Must come after the context exists, because stackReserve comes
+  // from the PE's SizeOfStackReserve and configureDefaultMemoryPolicy clamps it
+  // to [0x1000, 0x100000]. Ordering it earlier (as the note in
+  // createConfiguredLifterForRuntime says) would mean configuring with a
+  // hardcoded reserve and disagreeing with the PE afterwards.
   configureDefaultMemoryPolicy(lifter.get(), ctx.stackReserve);
+
+  // Optional memory dump: an overlay of process memory captured from a
+  // debugger run. Applied AFTER the default policy, because the dump may cover
+  // regions the PE-based policy classified as SYMBOLIC; re-running the policy
+  // afterwards is what promotes those spans to CONCRETE.
   if (!memDumpPath.empty()) {
     std::string dumpErr;
     if (!loadRuntimeMemDump(lifter->file, memDumpPath, dumpErr)) {
