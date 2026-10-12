@@ -3350,7 +3350,29 @@ void writeFunctionToFile(const std::string filename) {
     return bb;
   }
 
-  // global
+  // The IR roots. Everything the lifter emits hangs off these five, and they
+  // are created in this order by createFunction_impl / InitRegisters_impl:
+  //
+  //   context      owns every type and constant in the module; uniqued, so
+  //                Type::getInt64Ty(context) is the same object everywhere.
+  //                One context for the whole lift -- a second one would make
+  //                types from the two incompatible with each other.
+  //   M            the module: the container fnc lives in, and what
+  //                writeFunctionToFile prints.
+  //   fnc          the lifted function, named "main". Its parameter list IS
+  //                the entry machine state (16 GPR, EIP, memory base, 16 XMM);
+  //                see InitRegisters_impl. A parameter is already an unknown
+  //                value in LLVM, which is how entry registers end up symbolic
+  //                without any explicit undef being injected.
+  //   memoryAlloc  the pseudo-memory base -- one of fnc's parameters, the ptr
+  //                in the middle of the argument list. Every memory access the
+  //                lifter builds is a GEP off this, which is what makes
+  //                PromotePseudoMemory able to pattern-match all of them
+  //                uniformly. A load through any other base is invisible to
+  //                that pass.
+  //   bb           the current basic block. Distinct from blockInfo.block,
+  //                which is the block being lifted; bb is where the IRBuilder
+  //                is currently inserting.
   llvm::LLVMContext context;
   llvm::Value* memoryAlloc;
   llvm::Function* fnc;
@@ -3380,6 +3402,32 @@ protected:
 
 public:
   void finalizeIncompleteBlocks() { sealIncompleteBlocks(); }
+
+  // LLVM analysis objects, constructed in the constructor below and NEVER
+  // deleted (see the destructor).
+  //
+  // Of the nine, only three are ever read:
+  //
+  //   TLI   MergenPB.hpp:119 -- ConstantFoldInstruction needs target info to
+  //         fold a call to a known libc function.
+  //   DT    passed to the dominance helper in OperandUtils.h, which backs
+  //         comesBefore and the path solver's ordering questions.
+  //   DTU   PathSolver.ipp:1599 and getOrCreateBB -- every block insertion must
+  //         update it, or the node is unreachable in the tree and comesBefore
+  //         answers "neither dominates" for pairs that are in fact ordered.
+  //
+  // The other six (AA, PDT, MSSA, MSSAU, AC, TTI) are constructed and never
+  // queried. They are not dead by accident: they are the dependencies LLVM's
+  // own analyses reference. MemorySSA holds references to DT and AA,
+  // MemorySSAUpdater holds one to MemorySSA, DomTreeUpdater holds them to DT
+  // and PDT, AssumptionCache holds one to TTI. Deleting or not constructing any
+  // of them breaks construction of the ones that ARE used, and the destructor
+  // leaks the whole set for the same reason -- tearing them down in any order
+  // risks use-after-free inside LLVM's own teardown.
+  //
+  // So: six of these are load-bearing only by being kept alive. That is
+  // worth knowing before "cleaning up" the apparently unused ones, and before
+  // assuming MemorySSA is being used for alias reasoning -- it is not.
   AliasAnalysis* AA;
   DominatorTree* DT;
   PostDominatorTree* PDT;
@@ -3389,12 +3437,23 @@ public:
   TargetLibraryInfo* TLI;
   AssumptionCache* AC;
   TargetTransformInfo* TTI;
+
+  // Base-class constructor. Runs BEFORE any derived-class member is
+  // constructed -- the standard C++ base-first rule -- which shapes two of the
+  // decisions below.
   lifterClassBase() {
+    // Compile-time check that Derived implements what the base will call.
+    // Cheap insurance against a new strategy class that compiles but fails at
+    // the first CRTP dispatch instead of here.
     static_assert(lifterConcept<Derived, Register>,
                   "Derived should satisfy lifterConcept");
     M = new llvm::Module("lifter_module", context);
 
     createFunction();
+    // The entry block. basicBlockCount starts at 1 rather than 0 because this
+    // block exists and was not created through createBudgetedBasicBlock -- the
+    // budget has to know about it or the count under-reports by one from the
+    // very first block created.
     this->bb = llvm::BasicBlock::Create(this->context, "entry", this->fnc);
     this->basicBlockCount = 1;
 
@@ -3402,6 +3461,16 @@ public:
     // InitRegisters() is deliberately NOT called here: it writes the derived
     // class's register array, which is not constructed yet at this point. The
     // derived constructor calls it once its members exist.
+    //
+    // The same ordering hazard is why vec/vecflag are WeakTrackingVH rather
+    // than raw pointers: had the base written into a raw-pointer array before
+    // the derived member existed, that write would land in raw storage and be
+    // silently overwritten by the derived member's own construction.
+    //
+    // Analyses are built in dependency order: TLI first because AliasAnalysis
+    // and AssumptionCache both take it, then AA and DT, then the objects that
+    // reference those. Constructing them out of order passes dangling
+    // references, which LLVM does not check.
     TargetLibraryInfoImpl TLIImpl(Triple(fnc->getParent()->getTargetTriple()));
     TLI = new TargetLibraryInfo(TLIImpl);
 
@@ -3416,6 +3485,19 @@ public:
     AC = new AssumptionCache(*fnc, TTI);
   };
 
+  // Deliberately empty -- every allocation above, plus M and fnc, is leaked.
+  //
+  // This is safe ONLY because the lifter is used as a single-shot CLI: one
+  // lifter per process, process exits after the pipeline. It is NOT safe for
+  // the in-process test harness, which constructs many lifters in one run --
+  // there the leak is bounded (a few dozen analyses per suite) rather than
+  // correct, which is tolerable but worth remembering if the harness ever
+  // grows a loop.
+  //
+  // The alternative -- deleting in reverse construction order -- still
+  // breaks, because the dependencies are not a chain but a DAG: MemorySSA
+  // references DT AND AA, DomTreeUpdater references DT AND PDT, and AA
+  // references TLI. No single ordering satisfies all of them.
   ~lifterClassBase() {
     // LLVM analysis objects have interdependent destructors (MemorySSA
     // references DT and AA, MSSAU references MSSA, etc.). Deleting in any
