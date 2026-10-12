@@ -284,6 +284,14 @@ bool InitFunction_and_LiftInstructions(const uint64_t runtime_address,
                                        const std::vector<uint64_t>& outlineAddresses,
                                        const std::string& memDumpPath,
                                        const std::vector<std::pair<std::string, uint64_t>>& entryRegs) {
+  // Stages 1-3 happen inside prepareLifterStageContext: it validates the PE,
+  // builds the lifter, configures memory policy, and optionally loads a memory
+  // dump. All of it is fallible, and the failure is reported through outError
+  // rather than thrown, so the caller owns the message and the exit code.
+  //
+  // memDumpPath is threaded in here rather than read from the environment at
+  // this level: main() resolves --mem-dump vs MERGEN_MEM_DUMP, so the flag
+  // wins over the env var in one place instead of both layers deciding.
   std::string stageError;
   auto stageContext =
       prepareLifterStageContext(runtime_address, fileData, stageError,
@@ -293,16 +301,46 @@ bool InitFunction_and_LiftInstructions(const uint64_t runtime_address,
     return false;
   }
 
+  // Entry-register seeding must happen BEFORE the pipeline runs, and before
+  // the outline addresses are applied, because both affect decisions the lift
+  // loop makes on its very first instruction: a seeded register can fold a
+  // dispatch key that would otherwise go symbolic, changing which path is
+  // explored at all.
+  //
+  // Failure here (an unknown --reg name) aborts rather than warns. A silently
+  // ignored entry register produces a lift that looks clean and is wrong from
+  // the first comparison onward.
   if (!applyEntryRegisterSeeds(stageContext->lifter.get(), entryRegs)) {
     return false;
   }
 
+  // Outline addresses last, after seeding: the policy set is consulted at call
+  // sites during the lift, so ordering against seeding does not matter for
+  // correctness -- but seeding first keeps the "inputs" grouped before the
+  // "policy", which is the order that reads correctly.
+  //
+  // addAddress is additive and idempotent; the export auto-outline that ran in
+  // stage 2 already added its own addresses, and duplicates are harmless.
   for (const auto addr : outlineAddresses) {
     stageContext->lifter->inlinePolicy.addAddress(addr);
   }
 
+  // fileData is passed twice on purpose: as a raw pointer for the paged view
+  // (the lifter holds that pointer for the whole lift, so the buffer must
+  // outlive this call -- which it does, because runLifterApplication moved it
+  // in and nothing touches it afterwards) and by reference for the signature
+  // stage, which walks the on-disk bytes rather than the emulated view.
+  //
+  // The pointer/fileData pairing is the ownership contract: the caller must
+  // keep the vector alive for as long as the lifter is used. Taking a bare
+  // uint8_t* and dropping the vector would leave every later memory read
+  // pointing at freed memory.
   runLifterPipeline(stageContext->lifter.get(), stageContext->runtimeContext,
                     fileData.data(), fileData);
+
+  // Success is "no ERROR diagnostics", not "no exceptions" and not "the output
+  // file exists". See the header note: a partial lift that mislifted a block
+  // must not read as clean to an automated regression gate.
   return !stageContext->lifter->diagnostics.hasErrors();
 }
 
