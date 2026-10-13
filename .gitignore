@@ -78,3 +78,7 @@ scripts/rewrite/tmp_*.json
 /simple/themida_trace.txt
 simple/
 themida_trace.txt
+
+# build artifacts & samples
+sample/
+build_msvc_dbg/
