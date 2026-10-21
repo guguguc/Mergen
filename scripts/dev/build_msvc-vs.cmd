@@ -93,7 +93,7 @@ if defined LLVM_CMAKE_DIR if not exist "%LLVM_CMAKE_DIR%\LLVMConfig.cmake" (
     exit /b 1
 )
 if not defined LLVM_CMAKE_DIR (
-    if not defined LLVM_ROOT set "LLVM_ROOT=Z:\Downloads\llvm-18.1.8-windows-amd64-msvc17-msvcrt"
+    if not defined LLVM_ROOT set "LLVM_ROOT=D:\llvm-18.1.8-windows-amd64-msvc17-msvcrt\llvm-18.1.8-windows-amd64-msvc17-msvcrt"
     if not exist "!LLVM_ROOT!\lib\cmake\llvm\LLVMConfig.cmake" (
         echo ERROR: no LLVMConfig.cmake under "!LLVM_ROOT!\lib\cmake\llvm"
         echo        Set LLVM_ROOT or LLVM_DIR to an LLVM 18 install.
